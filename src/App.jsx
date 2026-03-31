@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend, LineChart, Line } from "recharts";
-import { Plus, Trash2, LogOut, Settings, Users, GitBranch, LayoutDashboard, FileText, ChevronDown, ChevronRight, ArrowLeft, Search, Eye, EyeOff, Edit2, Save, X, AlertTriangle, CheckCircle, Database, Shield, UserPlus, ChevronUp, Download, Calendar, Tag, Lock, Upload, Bell } from "lucide-react";
+import { Plus, Trash2, LogOut, Settings, Users, GitBranch, LayoutDashboard, FileText, ChevronDown, ChevronRight, ArrowLeft, Search, Eye, EyeOff, Edit2, Save, X, AlertTriangle, CheckCircle, Database, Shield, UserPlus, ChevronUp, Download, Calendar, Tag, Lock, Upload, Bell, Clock, CreditCard } from "lucide-react";
 
 // ─── Constants & Helpers ────────────────────────────────────────────────────
 const COLORS = ["#0f766e", "#06b6d4", "#8b5cf6", "#f59e0b", "#ef4444", "#10b981", "#ec4899", "#6366f1", "#14b8a6", "#f97316"];
@@ -244,15 +244,23 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
   const [paymentMode, setPaymentMode] = useState("");
   const [upiReference, setUpiReference] = useState("");
   const [ptpDate, setPtpDate] = useState("");
+  const [ptpTime, setPtpTime] = useState("");
   const [showWaiverModal, setShowWaiverModal] = useState(false);
   const [pendingEntry, setPendingEntry] = useState(null);
+
+  // Check if PTP date+time is in the future
+  const isPtpFuture = (() => {
+    if (!ptpDate) return false;
+    const ptpDateTime = new Date(`${ptpDate}T${ptpTime || "23:59"}`);
+    return ptpDateTime > new Date();
+  })();
 
   // Group OD calculations
   const numCust = Number(numberOfCustomers) || 0;
   const groupOdDue = Number(groupOdAmount) || 0;
   const customerShare = numCust > 0 ? Math.round(groupOdDue / numCust) : 0;
-  const groupOdPaid = Number(groupOdPaidAmount) || 0;
-  const waiver = Math.max(0, customerShare - groupOdPaid);
+  const groupOdPaid = isPtpFuture ? 0 : (Number(groupOdPaidAmount) || 0);
+  const waiver = isPtpFuture ? 0 : Math.max(0, customerShare - groupOdPaid);
 
   const handleSave = () => {
     if (!branch) { alert("Please select a branch."); return; }
@@ -261,11 +269,12 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
     if (!loanAccountNo.trim()) { alert("Please enter loan account number."); return; }
     if (numCust <= 0) { alert("Please enter the total number of customers in the group."); return; }
     if (groupOdDue <= 0) { alert("Please enter Group OD Amount Due."); return; }
-    if (groupOdPaid < 0) { alert("Paid Amount cannot be negative."); return; }
+    if (!isPtpFuture && groupOdPaid < 0) { alert("Paid Amount cannot be negative."); return; }
     if (!paymentMode) { alert("Please select a Payment Mode."); return; }
     if (paymentMode === "UPI" && !upiReference.trim()) { alert("Please enter UPI Transaction Reference."); return; }
     if (paymentMode === "Cash" && ptpDate && !isValidDate(ptpDate)) { alert("Please enter a valid PTP date."); return; }
-    if (waiver > 0 && !approvalEmailSubject.trim()) { alert("Waiver detected. Please enter the approval email subject line."); return; }
+    if (paymentMode === "Cash" && ptpDate && !ptpTime) { alert("Please enter PTP time."); return; }
+    if (!isPtpFuture && waiver > 0 && !approvalEmailSubject.trim()) { alert("Waiver detected. Please enter the approval email subject line."); return; }
 
     // Check duplicate
     const isDup = entries.some(e =>
@@ -281,15 +290,19 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
       groupOdAmount: groupOdDue,
       numberOfCustomers: numCust,
       customerShare,
-      groupOdPaidAmount: groupOdPaid,
-      groupOdWaiver: waiver,
-      totalPaidAmount: groupOdPaid,
-      waiver,
+      groupOdPaidAmount: isPtpFuture ? 0 : groupOdPaid,
+      groupOdWaiver: isPtpFuture ? 0 : waiver,
+      totalPaidAmount: isPtpFuture ? 0 : groupOdPaid,
+      waiver: isPtpFuture ? 0 : waiver,
       paymentMode,
       upiReference: paymentMode === "UPI" ? upiReference.trim() : "",
       ptpDate: paymentMode === "Cash" ? ptpDate : "",
+      ptpTime: paymentMode === "Cash" ? ptpTime : "",
+      ptpStatus: isPtpFuture ? "pending" : "na", // "pending" = awaiting payment, "paid" = settled, "na" = not applicable
+      ptpPaidDate: null,
+      ptpPaymentRef: null,
       ptpReminderSent: false,
-      waiverApproval: waiver > 0 ? { approverName: user.name, emailSubject: approvalEmailSubject.trim(), approvalDate: date } : null,
+      waiverApproval: (!isPtpFuture && waiver > 0) ? { approverName: user.name, emailSubject: approvalEmailSubject.trim(), approvalDate: date } : null,
       enteredBy: user.id, enteredByName: user.name,
     };
 
@@ -316,11 +329,41 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(entry),
     }).catch(err => console.warn("[API append]", err.message));
+
+    // Create persistent PTP notification if PTP is pending
+    if (entry.ptpStatus === "pending" && entry.ptpDate) {
+      const ptpNotif = {
+        id: generateId(),
+        type: "ptp_pending",
+        message: `PTP Pending: ${entry.customerName} (${entry.customerId}) - Branch: ${entry.branch} - PTP: ${formatDateDMY(entry.ptpDate)} ${entry.ptpTime || ""} - Customer Share: ${formatINR(entry.customerShare)}`,
+        entryId: entry.id,
+        userId: entry.enteredBy,
+        forUserId: entry.enteredBy,
+        date: new Date().toISOString(),
+        read: false,
+        ptpDate: entry.ptpDate,
+        ptpTime: entry.ptpTime,
+        persistent: true, // stays until payment is made
+      };
+      const existingNotifs = loadData(STORAGE_KEYS.notifications, []);
+      // Also notify admins
+      const allUsers = loadData(STORAGE_KEYS.users, []);
+      const adminNotifs = allUsers
+        .filter(u => (u.role === "admin" || u.role === "elevated_staff") && u.id !== entry.enteredBy)
+        .map(admin => ({
+          ...ptpNotif,
+          id: generateId(),
+          forUserId: admin.id,
+        }));
+      const allNotifs = [ptpNotif, ...adminNotifs, ...existingNotifs];
+      saveData(STORAGE_KEYS.notifications, allNotifs);
+    }
+
     // Reset form
     setCustomerName(""); setCustomerId(""); setLoanAccountNo("");
     setApprovalEmailSubject("");
     setNumberOfCustomers(""); setGroupOdAmount(""); setGroupOdPaidAmount("");
-    setPaymentMode(""); setUpiReference(""); setPtpDate("");
+    setPaymentMode(""); setUpiReference(""); setPtpDate(""); setPtpTime("");
     setPage("records");
   };
 
@@ -401,10 +444,14 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
           </div>
           {paymentMode === "Cash" && (
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">PTP Date</label>
-              <input type="date" value={ptpDate} onChange={e => setPtpDate(e.target.value)}
-                className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500" />
-              <p className="text-xs text-gray-500 mt-1">Optional - set a date when cash payment is expected</p>
+              <label className="block text-sm font-medium text-gray-700 mb-1">PTP Date & Time</label>
+              <div className="flex gap-2">
+                <input type="date" value={ptpDate} onChange={e => setPtpDate(e.target.value)}
+                  className="flex-1 px-3 py-2 border rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500" />
+                <input type="time" value={ptpTime} onChange={e => setPtpTime(e.target.value)}
+                  className="w-28 px-3 py-2 border rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500" />
+              </div>
+              <p className="text-xs text-gray-500 mt-1">Set when the customer has promised to pay</p>
             </div>
           )}
           {paymentMode === "UPI" && (
@@ -422,9 +469,17 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
               className="w-full px-3 py-2 border border-gray-200 rounded-lg bg-gray-100 text-gray-800 font-semibold cursor-default" />
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Paid Amount *</label>
-            <input type="number" min="0" value={groupOdPaidAmount} onChange={e => setGroupOdPaidAmount(e.target.value)}
-              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="e.g. 2000" />
+            <label className="block text-sm font-medium text-gray-700 mb-1">Paid Amount {isPtpFuture ? "" : "*"}</label>
+            {isPtpFuture ? (
+              <div>
+                <input readOnly value="Payment pending (PTP)"
+                  className="w-full px-3 py-2 border border-orange-300 rounded-lg bg-orange-50 text-orange-700 font-medium cursor-not-allowed" />
+                <p className="text-xs text-orange-600 mt-1 flex items-center gap-1"><Clock size={10} /> PTP is in the future — payment will be recorded later</p>
+              </div>
+            ) : (
+              <input type="number" min="0" value={groupOdPaidAmount} onChange={e => setGroupOdPaidAmount(e.target.value)}
+                className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="e.g. 2000" />
+            )}
           </div>
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Waiver (Auto)</label>
@@ -460,6 +515,80 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
   );
 }
 
+// ─── PTP Payment Modal ─────────────────────────────────────────────────────
+function PTPPaymentModal({ entry, onSave, onCancel }) {
+  const [paidAmount, setPaidAmount] = useState("");
+  const [paymentRef, setPaymentRef] = useState("");
+  const [paymentMode, setPaymentMode] = useState("Cash");
+
+  const customerShare = entry.customerShare || (entry.numberOfCustomers > 0 ? Math.round(entry.groupOdAmount / entry.numberOfCustomers) : 0);
+  const paid = Number(paidAmount) || 0;
+  const waiver = Math.max(0, customerShare - paid);
+
+  const handleSubmit = () => {
+    if (paid <= 0) { alert("Please enter a valid paid amount."); return; }
+    if (!paymentRef.trim()) { alert("Please enter a payment reference."); return; }
+    onSave({
+      groupOdPaidAmount: paid,
+      totalPaidAmount: paid,
+      groupOdWaiver: waiver,
+      waiver,
+      ptpStatus: "paid",
+      ptpPaidDate: nowDate(),
+      ptpPaymentRef: paymentRef.trim(),
+      ptpPaymentMode: paymentMode,
+    });
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+      <div className="bg-white rounded-xl shadow-2xl w-full max-w-md p-6 mx-4">
+        <div className="flex items-center gap-3 mb-4">
+          <div className="p-2 bg-teal-100 rounded-lg"><CreditCard size={24} className="text-teal-600" /></div>
+          <div>
+            <h3 className="text-lg font-bold text-gray-900">Record PTP Payment</h3>
+            <p className="text-sm text-gray-500">{entry.customerName} ({entry.customerId})</p>
+          </div>
+        </div>
+        <div className="bg-gray-50 rounded-lg p-3 mb-4 text-sm space-y-1">
+          <div className="flex justify-between"><span className="text-gray-500">Branch:</span><span className="font-medium">{entry.branch}</span></div>
+          <div className="flex justify-between"><span className="text-gray-500">Group OD Amount:</span><span className="font-medium">{formatINR(entry.groupOdAmount)}</span></div>
+          <div className="flex justify-between"><span className="text-gray-500">Customer Share:</span><span className="font-medium">{formatINR(customerShare)}</span></div>
+          <div className="flex justify-between"><span className="text-gray-500">PTP Date:</span><span className="font-medium">{formatDateDMY(entry.ptpDate)} {entry.ptpTime || ""}</span></div>
+        </div>
+        <div className="space-y-3">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Payment Mode *</label>
+            <select value={paymentMode} onChange={e => setPaymentMode(e.target.value)} className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500">
+              <option value="Cash">Cash</option>
+              <option value="UPI">UPI</option>
+            </select>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Paid Amount *</label>
+            <input type="number" min="0" value={paidAmount} onChange={e => setPaidAmount(e.target.value)}
+              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="Enter amount paid" />
+            {paid > 0 && paid < customerShare && (
+              <p className="text-xs text-amber-600 mt-1">Waiver of {formatINR(waiver)} will be applied</p>
+            )}
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Payment Reference *</label>
+            <input type="text" value={paymentRef} onChange={e => setPaymentRef(e.target.value)}
+              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="e.g. Receipt No. / UPI Ref / Cash Ref" />
+          </div>
+        </div>
+        <div className="flex gap-3 mt-6">
+          <button onClick={onCancel} className="flex-1 px-4 py-2 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50 transition-colors">Cancel</button>
+          <button onClick={handleSubmit} className="flex-1 px-4 py-2 bg-teal-600 text-white rounded-lg hover:bg-teal-700 transition-colors font-medium">
+            Record Payment
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Records Table ──────────────────────────────────────────────────────────
 function RecordsTable({ user, entries, setEntries, config, branches }) {
   const [searchTerm, setSearchTerm] = useState("");
@@ -467,8 +596,42 @@ function RecordsTable({ user, entries, setEntries, config, branches }) {
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
   const [expandedId, setExpandedId] = useState(null);
+  const [ptpPaymentEntry, setPtpPaymentEntry] = useState(null); // entry being paid
 
   const canSeeAll = user.role === "admin" || user.role === "elevated_staff";
+
+  const handlePTPPayment = (paymentData) => {
+    if (!ptpPaymentEntry) return;
+    const updated = entries.map(e =>
+      e.id === ptpPaymentEntry.id ? { ...e, ...paymentData } : e
+    );
+    setEntries(updated);
+    saveData(STORAGE_KEYS.entries, updated);
+
+    // Clear persistent PTP notifications for this entry
+    const notifs = loadData(STORAGE_KEYS.notifications, []);
+    const updatedNotifs = notifs.filter(n => !(n.entryId === ptpPaymentEntry.id && n.type === "ptp_pending"));
+    // Add a "payment received" notification
+    const paidNotif = {
+      id: generateId(),
+      type: "ptp_paid",
+      message: `PTP Payment Received: ${ptpPaymentEntry.customerName} (${ptpPaymentEntry.customerId}) - Branch: ${ptpPaymentEntry.branch} - Amount: ${formatINR(paymentData.totalPaidAmount)} - Ref: ${paymentData.ptpPaymentRef}`,
+      entryId: ptpPaymentEntry.id,
+      userId: ptpPaymentEntry.enteredBy,
+      forUserId: ptpPaymentEntry.enteredBy,
+      date: new Date().toISOString(),
+      read: false,
+      persistent: false,
+    };
+    // Also notify admins
+    const allUsers = loadData(STORAGE_KEYS.users, []);
+    const adminNotifs = allUsers
+      .filter(u => (u.role === "admin" || u.role === "elevated_staff") && u.id !== ptpPaymentEntry.enteredBy)
+      .map(admin => ({ ...paidNotif, id: generateId(), forUserId: admin.id }));
+    saveData(STORAGE_KEYS.notifications, [paidNotif, ...adminNotifs, ...updatedNotifs]);
+
+    setPtpPaymentEntry(null);
+  };
 
   const visibleEntries = useMemo(() => {
     let data = entries;
@@ -582,9 +745,19 @@ function RecordsTable({ user, entries, setEntries, config, branches }) {
                       <div className="text-xs text-gray-400">{e.customerId} | {e.loanAccountNo}</div>
                     </td>
                     <td className="px-4 py-3 text-right font-medium">{formatINR(e.groupOdAmount)}</td>
-                    <td className="px-4 py-3 text-right font-medium text-teal-700">{formatINR(getPaid(e))}</td>
+                    <td className="px-4 py-3 text-right font-medium text-teal-700">
+                      {e.ptpStatus === "pending" ? (
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-orange-100 text-orange-700 rounded-full text-xs font-medium">
+                          <Clock size={10} /> PTP
+                        </span>
+                      ) : (
+                        formatINR(getPaid(e))
+                      )}
+                    </td>
                     <td className="px-4 py-3 text-right">
-                      {e.waiver > 0 ? (
+                      {e.ptpStatus === "pending" ? (
+                        <span className="text-orange-600 text-xs">{formatDateDMY(e.ptpDate)} {e.ptpTime || ""}</span>
+                      ) : e.waiver > 0 ? (
                         <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-amber-100 text-amber-800 rounded-full text-xs font-medium">
                           <AlertTriangle size={10} /> {formatINR(e.waiver)}
                         </span>
@@ -594,6 +767,12 @@ function RecordsTable({ user, entries, setEntries, config, branches }) {
                     </td>
                     <td className="px-4 py-3 text-center">
                       <div className="flex items-center justify-center gap-2">
+                        {e.ptpStatus === "pending" && (
+                          <button onClick={(ev) => { ev.stopPropagation(); setPtpPaymentEntry(e); }}
+                            className="px-2 py-1 bg-teal-600 text-white rounded text-xs hover:bg-teal-700 flex items-center gap-1">
+                            <CreditCard size={10} /> Pay
+                          </button>
+                        )}
                         <button onClick={(ev) => { ev.stopPropagation(); setExpandedId(expandedId === e.id ? null : e.id); }}
                           className="p-1 hover:bg-gray-200 rounded">{expandedId === e.id ? <ChevronUp size={14} /> : <ChevronDown size={14} />}</button>
                         {canDelete && (
@@ -619,13 +798,22 @@ function RecordsTable({ user, entries, setEntries, config, branches }) {
                         </div>
                         {/* Payment Details */}
                         {(e.paymentMode || e.ptpDate) && (
-                          <div className="p-3 bg-blue-50 rounded-lg border border-blue-100">
-                            <p className="text-xs font-semibold text-blue-700 mb-2 uppercase tracking-wide">Payment Details</p>
+                          <div className={`p-3 rounded-lg border ${e.ptpStatus === "pending" ? "bg-orange-50 border-orange-200" : "bg-blue-50 border-blue-100"}`}>
+                            <p className={`text-xs font-semibold mb-2 uppercase tracking-wide ${e.ptpStatus === "pending" ? "text-orange-700" : "text-blue-700"}`}>Payment Details</p>
                             <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 text-sm">
-                              {e.paymentMode && <div><span className="text-gray-500">Payment Mode:</span> <span className="font-medium">{e.paymentMode}</span></div>}
+                              {e.paymentMode && <div><span className="text-gray-500">Payment Mode:</span> <span className="font-medium">{e.ptpPaymentMode || e.paymentMode}</span></div>}
                               {e.upiReference && <div><span className="text-gray-500">UPI Reference:</span> <span className="font-medium">{e.upiReference}</span></div>}
-                              {e.ptpDate && <div><span className="text-gray-500">PTP Date:</span> <span className="font-medium">{formatDateDMY(e.ptpDate)}</span></div>}
+                              {e.ptpDate && <div><span className="text-gray-500">PTP Date:</span> <span className="font-medium">{formatDateDMY(e.ptpDate)} {e.ptpTime || ""}</span></div>}
+                              {e.ptpStatus && <div><span className="text-gray-500">PTP Status:</span> <span className={`font-medium ${e.ptpStatus === "pending" ? "text-orange-600" : e.ptpStatus === "paid" ? "text-green-600" : ""}`}>{e.ptpStatus === "pending" ? "Awaiting Payment" : e.ptpStatus === "paid" ? "Paid" : "N/A"}</span></div>}
+                              {e.ptpPaidDate && <div><span className="text-gray-500">Payment Date:</span> <span className="font-medium text-green-700">{formatDateDMY(e.ptpPaidDate)}</span></div>}
+                              {e.ptpPaymentRef && <div><span className="text-gray-500">Payment Ref:</span> <span className="font-medium">{e.ptpPaymentRef}</span></div>}
                             </div>
+                            {e.ptpStatus === "pending" && (
+                              <button onClick={() => setPtpPaymentEntry(e)}
+                                className="mt-3 px-4 py-2 bg-teal-600 text-white rounded-lg text-sm hover:bg-teal-700 flex items-center gap-2">
+                                <CreditCard size={14} /> Record Payment
+                              </button>
+                            )}
                           </div>
                         )}
                         {/* Meta info */}
@@ -654,6 +842,14 @@ function RecordsTable({ user, entries, setEntries, config, branches }) {
           </table>
         </div>
       </div>
+
+      {ptpPaymentEntry && (
+        <PTPPaymentModal
+          entry={ptpPaymentEntry}
+          onSave={handlePTPPayment}
+          onCancel={() => setPtpPaymentEntry(null)}
+        />
+      )}
     </div>
   );
 }
@@ -720,13 +916,22 @@ function NotificationsPage({ user, users }) {
       ) : (
         <div className="space-y-3">
           {visibleNotifs.map(n => (
-            <div key={n.id} className={`bg-white rounded-lg border p-4 transition-colors ${n.read ? "bg-gray-50" : "bg-blue-50 border-blue-200"}`}>
+            <div key={n.id} className={`bg-white rounded-lg border p-4 transition-colors ${
+              n.type === "ptp_pending" ? "bg-orange-50 border-orange-200" :
+              n.type === "ptp_paid" ? "bg-green-50 border-green-200" :
+              n.read ? "bg-gray-50" : "bg-blue-50 border-blue-200"
+            }`}>
               <div className="flex items-start justify-between">
                 <div className="flex-1">
+                  <div className="flex items-center gap-2 mb-1">
+                    {n.type === "ptp_pending" && <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-orange-200 text-orange-800 rounded-full text-xs font-medium"><Clock size={10} /> PTP Pending</span>}
+                    {n.type === "ptp_paid" && <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-green-200 text-green-800 rounded-full text-xs font-medium"><CheckCircle size={10} /> Payment Received</span>}
+                    {n.type === "ptp_reminder" && <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-blue-200 text-blue-800 rounded-full text-xs font-medium"><Bell size={10} /> Reminder</span>}
+                  </div>
                   <p className={`text-sm ${n.read ? "text-gray-600" : "text-gray-800 font-medium"}`}>{n.message}</p>
                   <p className="text-xs text-gray-400 mt-1">{formatDateDMY(n.date.split("T")[0])} {n.date.split("T")[1]?.slice(0, 5)}</p>
                 </div>
-                {!n.read && (
+                {!n.read && n.type !== "ptp_pending" && (
                   <button onClick={() => handleMarkAsRead(n.id)} className="ml-2 px-2 py-1 bg-teal-600 text-white rounded text-xs hover:bg-teal-700">
                     Mark read
                   </button>

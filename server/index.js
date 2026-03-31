@@ -102,10 +102,38 @@ app.get("/api/health", (req, res) => {
 });
 
 // POST /api/entries/append — append a single entry (used by frontend on save)
-app.post("/api/entries/append", (req, res) => {
+app.post("/api/entries/append", async (req, res) => {
   const entries = loadJSON("entries.json", []);
   entries.unshift(req.body);
   saveJSON("entries.json", entries);
+
+  // If this is a PTP entry, send an immediate email notification
+  const entry = req.body;
+  if (entry.ptpStatus === "pending" && entry.ptpDate) {
+    const subject = `OD Pulse - New PTP Entry: ${entry.customerName} (${entry.customerId}) - ${formatDMY(entry.ptpDate)}`;
+    const html = `
+      <div style="font-family:Arial,sans-serif;max-width:600px">
+        <h2 style="color:#0f766e">OD Pulse - New PTP Entry Created</h2>
+        <p>A new Promise to Pay entry has been recorded:</p>
+        <table style="border-collapse:collapse;width:100%;font-size:14px;margin:16px 0">
+          <tr><td style="padding:8px;border:1px solid #ddd;background:#f9fafb;font-weight:600;width:40%">Customer</td><td style="padding:8px;border:1px solid #ddd">${entry.customerName} (${entry.customerId})</td></tr>
+          <tr><td style="padding:8px;border:1px solid #ddd;background:#f9fafb;font-weight:600">Loan Account</td><td style="padding:8px;border:1px solid #ddd">${entry.loanAccountNo}</td></tr>
+          <tr><td style="padding:8px;border:1px solid #ddd;background:#f9fafb;font-weight:600">Branch</td><td style="padding:8px;border:1px solid #ddd">${entry.branch}</td></tr>
+          <tr><td style="padding:8px;border:1px solid #ddd;background:#f9fafb;font-weight:600">Group OD Amount</td><td style="padding:8px;border:1px solid #ddd">Rs. ${entry.groupOdAmount}</td></tr>
+          <tr><td style="padding:8px;border:1px solid #ddd;background:#f9fafb;font-weight:600">Customer Share</td><td style="padding:8px;border:1px solid #ddd">Rs. ${entry.customerShare}</td></tr>
+          <tr><td style="padding:8px;border:1px solid #ddd;background:#f9fafb;font-weight:600">PTP Date & Time</td><td style="padding:8px;border:1px solid #ddd;color:#c2410c;font-weight:600">${formatDMY(entry.ptpDate)} ${entry.ptpTime || ""}</td></tr>
+          <tr><td style="padding:8px;border:1px solid #ddd;background:#f9fafb;font-weight:600">Recorded By</td><td style="padding:8px;border:1px solid #ddd">${entry.enteredByName || entry.enteredBy}</td></tr>
+        </table>
+        <p>Please follow up with the customer on the promised date.</p>
+        <p style="color:#888;font-size:12px">Automated notification from <a href="https://odpulse.dhanamfinance.com">OD Pulse</a></p>
+      </div>
+    `;
+    for (const recipient of REMINDER_RECIPIENTS) {
+      sendEmail(recipient, subject, html).catch(err => console.error("[PTP EMAIL]", err.message));
+    }
+    console.log(`[PTP] Immediate email sent for PTP entry: ${entry.customerName} (${entry.customerId})`);
+  }
+
   res.json({ ok: true, count: entries.length });
 });
 
