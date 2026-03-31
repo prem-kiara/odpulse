@@ -115,6 +115,32 @@ app.post("/api/ptp-check", async (req, res) => {
   res.json({ ok: true, message: "PTP check completed" });
 });
 
+// Test email endpoint
+app.post("/api/test-email", async (req, res) => {
+  const transporter = createTransporter();
+  if (!transporter) return res.status(500).json({ error: "SMTP not configured" });
+  try {
+    await transporter.sendMail({
+      from: EMAIL_FROM,
+      to: REMINDER_RECIPIENTS,
+      subject: "OD Pulse - Test Email",
+      html: `
+        <div style="font-family:Arial,sans-serif;max-width:500px">
+          <h2 style="color:#0f766e">OD Pulse - Email Test</h2>
+          <p>This is a test email from OD Pulse running on EC2.</p>
+          <p>If you received this, the PTP email reminder system is working correctly.</p>
+          <p style="color:#888;font-size:12px">Sent at ${new Date().toISOString()} from <a href="https://odpulse.dhanamfinance.com">OD Pulse</a></p>
+        </div>
+      `,
+    });
+    console.log("[EMAIL] Test email sent successfully.");
+    res.json({ ok: true, message: "Test email sent to " + REMINDER_RECIPIENTS.join(", ") });
+  } catch (err) {
+    console.error("[EMAIL] Test email failed:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Generic CRUD (wildcard — must be LAST) ──
 
 // GET /api/:collection
