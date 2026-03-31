@@ -231,7 +231,7 @@ function WaiverApprovalModal({ waiverAmount, onConfirm, onCancel }) {
 
 // ─── Entry Form ─────────────────────────────────────────────────────────────
 function EntryForm({ user, branches, entries, setEntries, setPage }) {
-  const [branch, setBranch] = useState(user.role === "staff" ? user.branch : "");
+  const [branch, setBranch] = useState(user.branch || "");
   const [date] = useState(nowDate());
   const [customerName, setCustomerName] = useState("");
   const [customerId, setCustomerId] = useState("");
@@ -385,14 +385,10 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Branch *</label>
-            {user.role === "staff" ? (
-              <input type="text" value={user.branch} disabled className="w-full px-3 py-2 border rounded-lg bg-gray-100 text-gray-600" />
-            ) : (
-              <select value={branch} onChange={e => setBranch(e.target.value)} className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500">
-                <option value="">Select Branch</option>
-                {branches.map(b => <option key={b} value={b}>{b}</option>)}
-              </select>
-            )}
+            <select value={branch} onChange={e => setBranch(e.target.value)} className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500">
+              <option value="">Select Branch</option>
+              {branches.map(b => <option key={b} value={b}>{b}</option>)}
+            </select>
           </div>
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Date</label>
@@ -1833,7 +1829,7 @@ export default function App() {
           <div className="flex items-center gap-3">
             <div className="text-right hidden sm:block">
               <p className="text-sm font-medium text-gray-700">{user.name}</p>
-              <p className="text-xs text-gray-400">{user.role === "elevated_staff" ? "MIS Staff" : user.role} • {user.branch || "Unassigned"}</p>
+              <p className="text-xs text-gray-400">{user.role === "elevated_staff" ? "MIS Staff" : user.role} • {user.branch || "All Branches"}</p>
             </div>
             <button onClick={handleLogout} className="flex items-center gap-1 px-3 py-1.5 text-sm text-red-600 hover:bg-red-50 rounded-lg transition-colors">
               <LogOut size={16} /> Logout
