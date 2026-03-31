@@ -872,16 +872,22 @@ function NotificationsPage({ user, users }) {
     ? filterUser ? notifications.filter(n => n.forUserId === filterUser).sort((a, b) => new Date(b.date) - new Date(a.date)) : notifications.sort((a, b) => new Date(b.date) - new Date(a.date))
     : notifications.filter(n => n.forUserId === user.id).sort((a, b) => new Date(b.date) - new Date(a.date));
 
-  const unreadCount = visibleNotifs.filter(n => !n.read).length;
+  const unreadCount = visibleNotifs.filter(n => !n.read && n.type !== "ptp_pending").length;
+  const pendingPtpCount = visibleNotifs.filter(n => n.type === "ptp_pending").length;
 
   const handleMarkAsRead = (id) => {
+    const notif = notifications.find(n => n.id === id);
+    if (notif && notif.type === "ptp_pending") return; // Cannot mark PTP pending as read
     const updated = notifications.map(n => n.id === id ? { ...n, read: true } : n);
     setNotifications(updated);
     saveData(STORAGE_KEYS.notifications, updated);
   };
 
   const handleMarkAllAsRead = () => {
-    const updated = notifications.map(n => visibleNotifs.find(v => v.id === n.id) ? { ...n, read: true } : n);
+    // Skip ptp_pending — those can only be cleared by recording payment
+    const updated = notifications.map(n =>
+      visibleNotifs.find(v => v.id === n.id) && n.type !== "ptp_pending" ? { ...n, read: true } : n
+    );
     setNotifications(updated);
     saveData(STORAGE_KEYS.notifications, updated);
   };
@@ -909,34 +915,51 @@ function NotificationsPage({ user, users }) {
         <div className="bg-white rounded-xl border p-8 text-center">
           <p className="text-gray-500">No notifications</p>
         </div>
-      ) : (
-        <div className="space-y-3">
-          {visibleNotifs.map(n => (
-            <div key={n.id} className={`bg-white rounded-lg border p-4 transition-colors ${
-              n.type === "ptp_pending" ? "bg-orange-50 border-orange-200" :
-              n.type === "ptp_paid" ? "bg-green-50 border-green-200" :
-              n.read ? "bg-gray-50" : "bg-blue-50 border-blue-200"
-            }`}>
-              <div className="flex items-start justify-between">
-                <div className="flex-1">
-                  <div className="flex items-center gap-2 mb-1">
-                    {n.type === "ptp_pending" && <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-orange-200 text-orange-800 rounded-full text-xs font-medium"><Clock size={10} /> PTP Pending</span>}
-                    {n.type === "ptp_paid" && <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-green-200 text-green-800 rounded-full text-xs font-medium"><CheckCircle size={10} /> Payment Received</span>}
-                    {n.type === "ptp_reminder" && <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-blue-200 text-blue-800 rounded-full text-xs font-medium"><Bell size={10} /> Reminder</span>}
-                  </div>
-                  <p className={`text-sm ${n.read ? "text-gray-600" : "text-gray-800 font-medium"}`}>{n.message}</p>
-                  <p className="text-xs text-gray-400 mt-1">{formatDateDMY(n.date.split("T")[0])} {n.date.split("T")[1]?.slice(0, 5)}</p>
+      ) : (() => {
+        const unreadNotifs = visibleNotifs.filter(n => !n.read || n.type === "ptp_pending");
+        const readNotifs = visibleNotifs.filter(n => n.read && n.type !== "ptp_pending");
+        const renderNotif = (n) => (
+          <div key={n.id} className={`bg-white rounded-lg border p-4 transition-colors ${
+            n.type === "ptp_pending" ? "bg-orange-50 border-orange-200" :
+            n.type === "ptp_paid" ? "bg-green-50 border-green-200" :
+            n.read ? "bg-gray-50 border-gray-200" : "bg-blue-50 border-blue-200"
+          }`}>
+            <div className="flex items-start justify-between">
+              <div className="flex-1">
+                <div className="flex items-center gap-2 mb-1">
+                  {n.type === "ptp_pending" && <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-orange-200 text-orange-800 rounded-full text-xs font-medium"><Clock size={10} /> PTP Pending</span>}
+                  {n.type === "ptp_paid" && <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-green-200 text-green-800 rounded-full text-xs font-medium"><CheckCircle size={10} /> Payment Received</span>}
+                  {n.type === "ptp_reminder" && <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-blue-200 text-blue-800 rounded-full text-xs font-medium"><Bell size={10} /> Reminder</span>}
                 </div>
-                {!n.read && n.type !== "ptp_pending" && (
-                  <button onClick={() => handleMarkAsRead(n.id)} className="ml-2 px-2 py-1 bg-teal-600 text-white rounded text-xs hover:bg-teal-700">
-                    Mark read
-                  </button>
-                )}
+                <p className={`text-sm ${n.read && n.type !== "ptp_pending" ? "text-gray-500" : "text-gray-800 font-medium"}`}>{n.message}</p>
+                <p className="text-xs text-gray-400 mt-1">{formatDateDMY(n.date.split("T")[0])} {n.date.split("T")[1]?.slice(0, 5)}</p>
               </div>
+              {!n.read && n.type !== "ptp_pending" && (
+                <button onClick={() => handleMarkAsRead(n.id)} className="ml-2 px-2 py-1 bg-teal-600 text-white rounded text-xs hover:bg-teal-700">
+                  Mark read
+                </button>
+              )}
             </div>
-          ))}
-        </div>
-      )}
+          </div>
+        );
+        return (
+          <div className="space-y-3">
+            {unreadNotifs.length > 0 && (
+              <>
+                <h3 className="text-sm font-semibold text-gray-700 uppercase tracking-wide">Unread / Pending</h3>
+                {unreadNotifs.map(renderNotif)}
+              </>
+            )}
+            {readNotifs.length > 0 && (
+              <>
+                {unreadNotifs.length > 0 && <hr className="my-4 border-gray-200" />}
+                <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wide">Read</h3>
+                {readNotifs.map(renderNotif)}
+              </>
+            )}
+          </div>
+        );
+      })()}
     </div>
   );
 }
@@ -946,6 +969,7 @@ function Dashboard({ user, entries, branches, config }) {
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
   const [drillBranch, setDrillBranch] = useState(null);
+  const [drillStaff, setDrillStaff] = useState(null);
 
   const visibleEntries = useMemo(() => {
     let data = entries;
@@ -976,6 +1000,19 @@ function Dashboard({ user, entries, branches, config }) {
     });
     const branchData = Object.values(byBranch).sort((a, b) => b.recovered - a.recovered);
 
+    // Staff breakdown
+    const byStaff = {};
+    visibleEntries.forEach(e => {
+      const staffName = e.enteredByName || e.enteredBy || "Unknown";
+      const staffId = e.enteredBy || "unknown";
+      if (!byStaff[staffId]) byStaff[staffId] = { staffId, staff: staffName, recovered: 0, waiver: 0, groupOD: 0, count: 0 };
+      byStaff[staffId].recovered += getEntryPaid(e);
+      byStaff[staffId].waiver += Number(e.waiver) || 0;
+      byStaff[staffId].groupOD += Number(e.groupOdAmount) || 0;
+      byStaff[staffId].count += 1;
+    });
+    const staffData = Object.values(byStaff).sort((a, b) => b.recovered - a.recovered);
+
     // Monthly trend
     const byMonth = {};
     visibleEntries.forEach(e => {
@@ -987,8 +1024,90 @@ function Dashboard({ user, entries, branches, config }) {
     });
     const monthData = Object.values(byMonth).sort((a, b) => a.month.localeCompare(b.month));
 
-    return { totalRecovered, totalGroupOD, totalWaiver, entriesWithWaiver, branchData, monthData, totalEntries: visibleEntries.length };
+    // Payment mode breakdown
+    const byPaymentMode = {};
+    visibleEntries.forEach(e => {
+      const mode = e.ptpPaymentMode || e.paymentMode || "Unknown";
+      if (!byPaymentMode[mode]) byPaymentMode[mode] = { mode, recovered: 0, waiver: 0, count: 0 };
+      byPaymentMode[mode].recovered += getEntryPaid(e);
+      byPaymentMode[mode].waiver += Number(e.waiver) || 0;
+      byPaymentMode[mode].count += 1;
+    });
+    const paymentModeData = Object.values(byPaymentMode).sort((a, b) => b.recovered - a.recovered);
+
+    return { totalRecovered, totalGroupOD, totalWaiver, entriesWithWaiver, branchData, staffData, monthData, paymentModeData, totalEntries: visibleEntries.length };
   }, [visibleEntries]);
+
+  if (drillStaff) {
+    const staffEntries = visibleEntries.filter(e => (e.enteredBy || "unknown") === drillStaff.staffId);
+    const staffRecovered = staffEntries.reduce((s, e) => s + getEntryPaid(e), 0);
+    const staffWaiver = staffEntries.reduce((s, e) => s + (Number(e.waiver) || 0), 0);
+
+    const byMonth = {};
+    staffEntries.forEach(e => {
+      const m = e.date ? e.date.substring(0, 7) : "Unknown";
+      if (!byMonth[m]) byMonth[m] = { month: m, recovered: 0, waiver: 0, count: 0 };
+      byMonth[m].recovered += getEntryPaid(e);
+      byMonth[m].waiver += Number(e.waiver) || 0;
+      byMonth[m].count += 1;
+    });
+    const mData = Object.values(byMonth).sort((a, b) => a.month.localeCompare(b.month));
+
+    return (
+      <div>
+        <button onClick={() => setDrillStaff(null)} className="flex items-center gap-1 text-teal-600 hover:text-teal-800 mb-4 text-sm font-medium">
+          <ArrowLeft size={16} /> Back to Overview
+        </button>
+        <h2 className="text-xl font-bold text-gray-900 mb-4">{drillStaff.staff} — Staff Details</h2>
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-6">
+          <div className="bg-white rounded-xl border p-4"><p className="text-xs text-gray-500">Entries</p><p className="text-2xl font-bold">{staffEntries.length}</p></div>
+          <div className="bg-white rounded-xl border p-4"><p className="text-xs text-gray-500">Recovered</p><p className="text-2xl font-bold text-teal-700">{formatLakhs(staffRecovered)}</p></div>
+          <div className="bg-white rounded-xl border p-4"><p className="text-xs text-gray-500">Waiver</p><p className="text-2xl font-bold text-amber-700">{formatLakhs(staffWaiver)}</p></div>
+        </div>
+        {mData.length > 0 && (
+          <div className="bg-white rounded-xl border p-4 mb-6">
+            <h3 className="text-sm font-semibold text-gray-700 mb-3">Monthly Trend</h3>
+            <ResponsiveContainer width="100%" height={250}>
+              <BarChart data={mData}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="month" tick={{ fontSize: 12 }} />
+                <YAxis tickFormatter={v => formatLakhs(v)} tick={{ fontSize: 11 }} />
+                <Tooltip formatter={(v) => formatINR(v)} />
+                <Legend />
+                <Bar dataKey="recovered" name="Recovered" fill="#0f766e" radius={[4, 4, 0, 0]} />
+                <Bar dataKey="waiver" name="Waiver" fill="#f59e0b" radius={[4, 4, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        )}
+        <div className="bg-white rounded-xl border overflow-hidden">
+          <h3 className="text-sm font-semibold text-gray-700 p-4 border-b">Recent Entries</h3>
+          <table className="w-full text-sm">
+            <thead className="bg-gray-50 border-b">
+              <tr>
+                <th className="text-left px-4 py-2">Date</th>
+                <th className="text-left px-4 py-2">Branch</th>
+                <th className="text-left px-4 py-2">Customer</th>
+                <th className="text-right px-4 py-2">Share Paid</th>
+                <th className="text-right px-4 py-2">Waiver</th>
+              </tr>
+            </thead>
+            <tbody>
+              {staffEntries.slice(0, 20).map(e => (
+                <tr key={e.id} className="border-b">
+                  <td className="px-4 py-2">{formatDateDMY(e.date)}</td>
+                  <td className="px-4 py-2">{e.branch}</td>
+                  <td className="px-4 py-2">{e.customerName} <span className="text-xs text-gray-400">({e.customerId})</span></td>
+                  <td className="px-4 py-2 text-right text-teal-700 font-medium">{formatINR(getEntryPaid(e))}</td>
+                  <td className="px-4 py-2 text-right">{e.waiver > 0 ? <span className="text-amber-600">{formatINR(e.waiver)}</span> : <span className="text-gray-400">—</span>}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    );
+  }
 
   if (drillBranch) {
     const branchEntries = visibleEntries.filter(e => e.branch === drillBranch);
@@ -1088,13 +1207,13 @@ function Dashboard({ user, entries, branches, config }) {
         </div>
       </div>
 
-      {/* Charts */}
+      {/* Charts Row 1: Branch & Staff */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
         {/* Branch Performance */}
         {stats.branchData.length > 0 && (
           <div className="bg-white rounded-xl border p-4">
             <h3 className="text-sm font-semibold text-gray-700 mb-3">Recovery by Branch</h3>
-            <ResponsiveContainer width="100%" height={280}>
+            <ResponsiveContainer width="100%" height={Math.max(280, stats.branchData.length * 35)}>
               <BarChart data={stats.branchData} layout="vertical">
                 <CartesianGrid strokeDasharray="3 3" />
                 <XAxis type="number" tickFormatter={v => formatLakhs(v)} tick={{ fontSize: 11 }} />
@@ -1103,35 +1222,79 @@ function Dashboard({ user, entries, branches, config }) {
                 <Legend />
                 <Bar dataKey="recovered" name="Recovered" fill="#0f766e" radius={[0, 4, 4, 0]} cursor="pointer"
                   onClick={(data) => setDrillBranch(data.branch)} />
-                <Bar dataKey="waiver" name="Waiver" fill="#f59e0b" radius={[0, 4, 4, 0]} />
+                <Bar dataKey="waiver" name="Waiver" fill="#fbbf24" radius={[0, 4, 4, 0]} />
               </BarChart>
             </ResponsiveContainer>
             <p className="text-xs text-gray-400 mt-2 text-center">Click a branch bar to drill down</p>
           </div>
         )}
 
-        {/* Monthly Trend */}
+        {/* Staff Performance */}
+        {stats.staffData.length > 0 && (
+          <div className="bg-white rounded-xl border p-4">
+            <h3 className="text-sm font-semibold text-gray-700 mb-3">Recovery by Staff</h3>
+            <ResponsiveContainer width="100%" height={Math.max(280, stats.staffData.length * 35)}>
+              <BarChart data={stats.staffData} layout="vertical">
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis type="number" tickFormatter={v => formatLakhs(v)} tick={{ fontSize: 11 }} />
+                <YAxis dataKey="staff" type="category" width={100} tick={{ fontSize: 11 }} />
+                <Tooltip formatter={(v) => formatINR(v)} />
+                <Legend />
+                <Bar dataKey="recovered" name="Recovered" fill="#6366f1" radius={[0, 4, 4, 0]} cursor="pointer"
+                  onClick={(data) => setDrillStaff(data)} />
+                <Bar dataKey="waiver" name="Waiver" fill="#a78bfa" radius={[0, 4, 4, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+            <p className="text-xs text-gray-400 mt-2 text-center">Click a staff bar to drill down</p>
+          </div>
+        )}
+      </div>
+
+      {/* Charts Row 2: Monthly Trend & Payment Mode */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
         {stats.monthData.length > 0 && (
           <div className="bg-white rounded-xl border p-4">
             <h3 className="text-sm font-semibold text-gray-700 mb-3">Monthly Recovery Trend</h3>
             <ResponsiveContainer width="100%" height={280}>
-              <LineChart data={stats.monthData}>
+              <BarChart data={stats.monthData}>
                 <CartesianGrid strokeDasharray="3 3" />
-                <XAxis dataKey="month" tick={{ fontSize: 12 }} />
+                <XAxis dataKey="month" tick={{ fontSize: 11 }} />
                 <YAxis tickFormatter={v => formatLakhs(v)} tick={{ fontSize: 11 }} />
                 <Tooltip formatter={(v) => formatINR(v)} />
                 <Legend />
-                <Line type="monotone" dataKey="recovered" name="Recovered" stroke="#0f766e" strokeWidth={2} dot={{ r: 4 }} />
-                <Line type="monotone" dataKey="waiver" name="Waiver" stroke="#f59e0b" strokeWidth={2} dot={{ r: 4 }} />
-              </LineChart>
+                <Bar dataKey="recovered" name="Recovered" fill="#f97316" radius={[4, 4, 0, 0]} />
+                <Bar dataKey="waiver" name="Waiver" fill="#fdba74" radius={[4, 4, 0, 0]} />
+              </BarChart>
             </ResponsiveContainer>
+          </div>
+        )}
+
+        {stats.paymentModeData.length > 0 && (
+          <div className="bg-white rounded-xl border p-4">
+            <h3 className="text-sm font-semibold text-gray-700 mb-3">Recovery by Payment Mode</h3>
+            <ResponsiveContainer width="100%" height={280}>
+              <BarChart data={stats.paymentModeData}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="mode" tick={{ fontSize: 11 }} />
+                <YAxis tickFormatter={v => formatLakhs(v)} tick={{ fontSize: 11 }} />
+                <Tooltip formatter={(v) => formatINR(v)} />
+                <Legend />
+                <Bar dataKey="recovered" name="Recovered" fill="#06b6d4" radius={[4, 4, 0, 0]} />
+                <Bar dataKey="waiver" name="Waiver" fill="#67e8f9" radius={[4, 4, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+            <div className="flex justify-center gap-4 mt-2 text-xs text-gray-500">
+              {stats.paymentModeData.map(p => (
+                <span key={p.mode}>{p.mode}: {p.count} entries</span>
+              ))}
+            </div>
           </div>
         )}
       </div>
 
       {/* Branch cards */}
       {stats.branchData.length > 0 && (
-        <div>
+        <div className="mb-6">
           <h3 className="text-sm font-semibold text-gray-700 mb-3">Branch Summary</h3>
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
             {stats.branchData.map(b => (
@@ -1149,6 +1312,35 @@ function Dashboard({ user, entries, branches, config }) {
                     <div className="text-right">
                       <p className="text-xs text-gray-500">Waiver</p>
                       <p className="text-sm font-bold text-amber-600">{formatLakhs(b.waiver)}</p>
+                    </div>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Staff cards */}
+      {stats.staffData.length > 0 && (
+        <div>
+          <h3 className="text-sm font-semibold text-gray-700 mb-3">Staff Summary</h3>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+            {stats.staffData.map(s => (
+              <div key={s.staffId} className="bg-white rounded-xl border p-4 hover:shadow-md transition-shadow cursor-pointer" onClick={() => setDrillStaff(s)}>
+                <div className="flex items-center justify-between mb-2">
+                  <h4 className="font-semibold text-gray-800">{s.staff}</h4>
+                  <span className="text-xs bg-indigo-50 text-indigo-700 px-2 py-0.5 rounded-full">{s.count} entries</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-xs text-gray-500">Recovered</p>
+                    <p className="text-lg font-bold text-indigo-700">{formatLakhs(s.recovered)}</p>
+                  </div>
+                  {s.waiver > 0 && (
+                    <div className="text-right">
+                      <p className="text-xs text-gray-500">Waiver</p>
+                      <p className="text-sm font-bold text-amber-600">{formatLakhs(s.waiver)}</p>
                     </div>
                   )}
                 </div>
