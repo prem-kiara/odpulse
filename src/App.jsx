@@ -1806,7 +1806,7 @@ export default function App() {
 
   const navItems = [
     { key: "dashboard", icon: LayoutDashboard, label: "Dashboard" },
-    ...(!isElevated ? [{ key: "entry", icon: Plus, label: "New Entry" }] : []),
+    { key: "entry", icon: Plus, label: "New Entry" },
     { key: "records", icon: FileText, label: "Records" },
     { key: "notifications", icon: Bell, label: "Notifications", badge: unreadNotificationsCount > 0 ? unreadNotificationsCount : null },
     ...(isAdmin ? [{ key: "admin", icon: Shield, label: "Admin" }] : []),
