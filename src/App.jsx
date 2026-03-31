@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend, LineChart, Line } from "recharts";
-import { Plus, Trash2, LogOut, Settings, Users, GitBranch, LayoutDashboard, FileText, ChevronDown, ChevronRight, ArrowLeft, Search, Eye, EyeOff, Edit2, Save, X, AlertTriangle, CheckCircle, Database, Shield, UserPlus, ChevronUp, Download, Calendar, Tag } from "lucide-react";
+import { Plus, Trash2, LogOut, Settings, Users, GitBranch, LayoutDashboard, FileText, ChevronDown, ChevronRight, ArrowLeft, Search, Eye, EyeOff, Edit2, Save, X, AlertTriangle, CheckCircle, Database, Shield, UserPlus, ChevronUp, Download, Calendar, Tag, Lock } from "lucide-react";
 
 // ─── Constants & Helpers ────────────────────────────────────────────────────
 const COLORS = ["#0f766e", "#06b6d4", "#8b5cf6", "#f59e0b", "#ef4444", "#10b981", "#ec4899", "#6366f1", "#14b8a6", "#f97316"];
@@ -42,10 +42,24 @@ const loadData = (key, fallback) => {
 };
 const saveData = (key, data) => localStorage.setItem(key, JSON.stringify(data));
 
-const DEFAULT_BRANCHES = ["Head Office", "Branch 1", "Branch 2", "Branch 3", "Branch 4", "Branch 5"];
+const DEFAULT_BRANCHES = [
+  "Head Office", "Annur", "Thondamuthur", "Kinathukadavu", "Palladam", "Ganapathy",
+  "Gobichettipalayam", "Paramathivelur", "Tiruchengode", "Kattuputhur", "Kulithalai",
+  "Rasipuram", "Ambai", "Alangulam", "Surandai", "Tenkasi", "Eral", "Tuticorin",
+  "Palayamkottai", "Rajapalayam", "Sanakarankovil", "Srivilliputhur", "Periyakulam",
+  "Chinnamanur", "Kariyapatti", "RR Nagar", "Thirupuvanam", "Valayankulam", "Checkanurani"
+];
 const DEFAULT_USERS = [
-  { id: "admin", username: "admin", password: "admin123", role: "admin", name: "Administrator", branch: "Head Office", active: true },
-  { id: "staff1", username: "staff1", password: "staff123", role: "staff", name: "Staff User 1", branch: "Branch 1", active: true },
+  { id: "admin", username: "admin", password: "admin123", role: "admin", name: "Administrator", branch: "Head Office", active: true, mustChangePassword: false },
+  { id: "u_vijila", username: "vijila", password: "Dhanam@123", role: "staff", name: "Vijila", branch: "", active: true, mustChangePassword: true },
+  { id: "u_padmapriya", username: "padmapriya", password: "Dhanam@123", role: "staff", name: "Padmapriya", branch: "", active: true, mustChangePassword: true },
+  { id: "u_sasikala", username: "sasikala", password: "Dhanam@123", role: "staff", name: "Sasikala", branch: "", active: true, mustChangePassword: true },
+  { id: "u_kaviya", username: "kaviya", password: "Dhanam@123", role: "staff", name: "Kaviya", branch: "", active: true, mustChangePassword: true },
+  { id: "u_sandhiya", username: "sandhiya", password: "Dhanam@123", role: "staff", name: "Sandhiya", branch: "", active: true, mustChangePassword: true },
+  { id: "u_poongodi", username: "poongodi", password: "Dhanam@123", role: "staff", name: "Poongodi", branch: "", active: true, mustChangePassword: true },
+  { id: "u_kersiyal", username: "kersiyal", password: "Dhanam@123", role: "staff", name: "Kersiyal", branch: "", active: true, mustChangePassword: true },
+  { id: "u_maheshwari", username: "maheshwari", password: "Dhanam@123", role: "staff", name: "Maheshwari", branch: "", active: true, mustChangePassword: true },
+  { id: "u_dinesh", username: "dinesh", password: "Dhanam@123", role: "elevated_staff", name: "Dinesh", branch: "Head Office", active: true, mustChangePassword: true },
 ];
 const DEFAULT_CONFIG = { companyName: "OD Pulse - MFI Recovery Tracker", allowStaffEdit: false, allowStaffDelete: false, staffSeeAllBranches: false };
 
@@ -432,9 +446,12 @@ function RecordsTable({ user, entries, setEntries, config, branches }) {
   const [dateTo, setDateTo] = useState("");
   const [expandedId, setExpandedId] = useState(null);
 
+  const canSeeAll = user.role === "admin" || user.role === "elevated_staff";
+
   const visibleEntries = useMemo(() => {
     let data = entries;
-    if (user.role === "staff" && !config.staffSeeAllBranches) data = data.filter(e => e.branch === user.branch);
+    // Staff sees only their own entries; elevated_staff and admin see all
+    if (user.role === "staff") data = data.filter(e => e.enteredBy === user.id);
     if (branchFilter) data = data.filter(e => e.branch === branchFilter);
     if (dateFrom) data = data.filter(e => e.date >= dateFrom);
     if (dateTo) data = data.filter(e => e.date <= dateTo);
@@ -484,7 +501,7 @@ function RecordsTable({ user, entries, setEntries, config, branches }) {
                 className="w-full pl-9 pr-3 py-2 border rounded-lg text-sm focus:ring-2 focus:ring-teal-500" placeholder="Search by name, ID, loan no..." />
             </div>
           </div>
-          {(user.role === "admin" || config.staffSeeAllBranches) && (
+          {canSeeAll && (
             <select value={branchFilter} onChange={e => setBranchFilter(e.target.value)} className="px-3 py-2 border rounded-lg text-sm">
               <option value="">All Branches</option>
               {branches.map(b => <option key={b} value={b}>{b}</option>)}
@@ -633,7 +650,8 @@ function Dashboard({ user, entries, branches, config }) {
 
   const visibleEntries = useMemo(() => {
     let data = entries;
-    if (user.role === "staff" && !config.staffSeeAllBranches) data = data.filter(e => e.branch === user.branch);
+    // Staff sees only their own entries; elevated_staff and admin see all
+    if (user.role === "staff") data = data.filter(e => e.enteredBy === user.id);
     if (dateFrom) data = data.filter(e => e.date >= dateFrom);
     if (dateTo) data = data.filter(e => e.date <= dateTo);
     return data;
@@ -847,17 +865,19 @@ function Dashboard({ user, entries, branches, config }) {
 // ─── Admin Panel ────────────────────────────────────────────────────────────
 function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig, entries, setEntries }) {
   const [tab, setTab] = useState("users");
-  const [newUser, setNewUser] = useState({ username: "", password: "", name: "", role: "staff", branch: "" });
+  const [newUser, setNewUser] = useState({ username: "", password: "Dhanam@123", name: "", role: "staff", branch: "" });
   const [newBranch, setNewBranch] = useState("");
   const [showPassId, setShowPassId] = useState(null);
+  const [editingBranch, setEditingBranch] = useState(null);
+  const [editBranchName, setEditBranchName] = useState("");
 
   const handleAddUser = () => {
     if (!newUser.username || !newUser.password || !newUser.name) { alert("Fill in all fields."); return; }
     if (users.some(u => u.username === newUser.username)) { alert("Username already exists."); return; }
-    const u = { ...newUser, id: generateId(), active: true };
+    const u = { ...newUser, id: generateId(), active: true, mustChangePassword: true };
     const updated = [...users, u];
     setUsers(updated); saveData(STORAGE_KEYS.users, updated);
-    setNewUser({ username: "", password: "", name: "", role: "staff", branch: "" });
+    setNewUser({ username: "", password: "Dhanam@123", name: "", role: "staff", branch: "" });
   };
 
   const toggleUser = (id) => {
@@ -883,6 +903,23 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
     if (!confirm(`Remove branch "${b}"?`)) return;
     const updated = branches.filter(x => x !== b);
     setBranches(updated); saveData(STORAGE_KEYS.branches, updated);
+  };
+
+  const startEditBranch = (b) => { setEditingBranch(b); setEditBranchName(b); };
+
+  const saveEditBranch = () => {
+    if (!editBranchName.trim()) return;
+    if (editBranchName.trim() !== editingBranch && branches.includes(editBranchName.trim())) { alert("Branch name already exists."); return; }
+    // Update branches list
+    const updatedBranches = branches.map(b => b === editingBranch ? editBranchName.trim() : b);
+    setBranches(updatedBranches); saveData(STORAGE_KEYS.branches, updatedBranches);
+    // Update users assigned to old branch
+    const updatedUsers = users.map(u => u.branch === editingBranch ? { ...u, branch: editBranchName.trim() } : u);
+    setUsers(updatedUsers); saveData(STORAGE_KEYS.users, updatedUsers);
+    // Update entries with old branch
+    const updatedEntries = entries.map(e => e.branch === editingBranch ? { ...e, branch: editBranchName.trim() } : e);
+    setEntries(updatedEntries); saveData(STORAGE_KEYS.entries, updatedEntries);
+    setEditingBranch(null); setEditBranchName("");
   };
 
   const handleConfigChange = (key, value) => {
@@ -917,7 +954,7 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
               <input type="text" placeholder="Password" value={newUser.password} onChange={e => setNewUser({ ...newUser, password: e.target.value })} className="px-3 py-2 border rounded-lg text-sm" />
               <input type="text" placeholder="Full Name" value={newUser.name} onChange={e => setNewUser({ ...newUser, name: e.target.value })} className="px-3 py-2 border rounded-lg text-sm" />
               <select value={newUser.role} onChange={e => setNewUser({ ...newUser, role: e.target.value })} className="px-3 py-2 border rounded-lg text-sm">
-                <option value="staff">Staff</option><option value="admin">Admin</option>
+                <option value="staff">Staff</option><option value="elevated_staff">MIS Staff (All Access)</option><option value="admin">Admin</option>
               </select>
               <select value={newUser.branch} onChange={e => setNewUser({ ...newUser, branch: e.target.value })} className="px-3 py-2 border rounded-lg text-sm">
                 <option value="">Select Branch</option>
@@ -952,7 +989,7 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
                         </button>
                       </div>
                     </td>
-                    <td className="px-4 py-3"><span className={`px-2 py-0.5 rounded-full text-xs font-medium ${u.role === "admin" ? "bg-purple-100 text-purple-700" : "bg-blue-100 text-blue-700"}`}>{u.role}</span></td>
+                    <td className="px-4 py-3"><span className={`px-2 py-0.5 rounded-full text-xs font-medium ${u.role === "admin" ? "bg-purple-100 text-purple-700" : u.role === "elevated_staff" ? "bg-amber-100 text-amber-700" : "bg-blue-100 text-blue-700"}`}>{u.role === "elevated_staff" ? "MIS Staff" : u.role}</span></td>
                     <td className="px-4 py-3">{u.branch || "—"}</td>
                     <td className="px-4 py-3 text-center">
                       <button onClick={() => toggleUser(u.id)} className={`px-2 py-0.5 rounded-full text-xs font-medium ${u.active ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"}`}>
@@ -982,8 +1019,22 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
           <div className="space-y-2">
             {branches.map(b => (
               <div key={b} className="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
-                <span className="font-medium text-sm">{b}</span>
-                <button onClick={() => removeBranch(b)} className="p-1 hover:bg-red-100 rounded text-red-500"><Trash2 size={14} /></button>
+                {editingBranch === b ? (
+                  <div className="flex items-center gap-2 flex-1 mr-2">
+                    <input type="text" value={editBranchName} onChange={e => setEditBranchName(e.target.value)}
+                      className="flex-1 px-2 py-1 border rounded text-sm focus:ring-2 focus:ring-teal-500" onKeyDown={e => e.key === "Enter" && saveEditBranch()} />
+                    <button onClick={saveEditBranch} className="p-1 hover:bg-green-100 rounded text-green-600"><Save size={14} /></button>
+                    <button onClick={() => setEditingBranch(null)} className="p-1 hover:bg-gray-200 rounded text-gray-500"><X size={14} /></button>
+                  </div>
+                ) : (
+                  <>
+                    <span className="font-medium text-sm">{b}</span>
+                    <div className="flex items-center gap-1">
+                      <button onClick={() => startEditBranch(b)} className="p-1 hover:bg-blue-100 rounded text-blue-500"><Edit2 size={14} /></button>
+                      <button onClick={() => removeBranch(b)} className="p-1 hover:bg-red-100 rounded text-red-500"><Trash2 size={14} /></button>
+                    </div>
+                  </>
+                )}
               </div>
             ))}
           </div>
@@ -1032,17 +1083,83 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
   );
 }
 
+// ─── Change Password Modal ──────────────────────────────────────────────────
+function ChangePasswordModal({ user, users, setUsers, onDone, isForced }) {
+  const [newPass, setNewPass] = useState("");
+  const [confirmPass, setConfirmPass] = useState("");
+  const [error, setError] = useState("");
+  const [showPass, setShowPass] = useState(false);
+
+  const handleChange = () => {
+    if (!newPass || newPass.length < 6) { setError("Password must be at least 6 characters."); return; }
+    if (newPass === "Dhanam@123") { setError("Please choose a different password."); return; }
+    if (newPass !== confirmPass) { setError("Passwords do not match."); return; }
+    const updated = users.map(u => u.id === user.id ? { ...u, password: newPass, mustChangePassword: false } : u);
+    setUsers(updated); saveData(STORAGE_KEYS.users, updated);
+    onDone({ ...user, password: newPass, mustChangePassword: false });
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+      <div className="bg-white rounded-xl shadow-2xl w-full max-w-md p-6 mx-4">
+        <div className="flex items-center gap-3 mb-4">
+          <div className="p-2 bg-teal-100 rounded-lg"><Lock size={24} className="text-teal-600" /></div>
+          <div>
+            <h3 className="text-lg font-bold text-gray-900">{isForced ? "Change Your Password" : "Update Password"}</h3>
+            {isForced && <p className="text-sm text-gray-500">You must set a new password before continuing</p>}
+          </div>
+        </div>
+        {error && <div className="bg-red-50 text-red-700 text-sm p-3 rounded-lg mb-4 flex items-center gap-2"><AlertTriangle size={16} /> {error}</div>}
+        <div className="space-y-3">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">New Password *</label>
+            <div className="relative">
+              <input type={showPass ? "text" : "password"} value={newPass} onChange={e => setNewPass(e.target.value)}
+                className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500 pr-10" placeholder="Min 6 characters" />
+              <button onClick={() => setShowPass(!showPass)} className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400">
+                {showPass ? <EyeOff size={16} /> : <Eye size={16} />}
+              </button>
+            </div>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Confirm Password *</label>
+            <input type={showPass ? "text" : "password"} value={confirmPass} onChange={e => setConfirmPass(e.target.value)}
+              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="Re-enter password" />
+          </div>
+        </div>
+        <div className="flex gap-3 mt-6">
+          {!isForced && <button onClick={() => onDone(null)} className="flex-1 px-4 py-2 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50">Cancel</button>}
+          <button onClick={handleChange} className={`${isForced ? "w-full" : "flex-1"} px-4 py-2 bg-teal-600 text-white rounded-lg hover:bg-teal-700 font-medium`}>
+            Set Password
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Login Screen ───────────────────────────────────────────────────────────
-function LoginScreen({ onLogin, users }) {
+function LoginScreen({ onLogin, users, setUsers }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [showPass, setShowPass] = useState(false);
+  const [pendingUser, setPendingUser] = useState(null); // user needing password change
 
   const handleLogin = () => {
     const user = users.find(u => u.username === username && u.password === password && u.active);
-    if (user) { onLogin(user); setError(""); }
-    else setError("Invalid credentials or account disabled.");
+    if (!user) { setError("Invalid credentials or account disabled."); return; }
+    if (user.mustChangePassword) {
+      setPendingUser(user);
+    } else {
+      onLogin(user);
+    }
+    setError("");
+  };
+
+  const handlePasswordChanged = (updatedUser) => {
+    if (updatedUser) onLogin(updatedUser);
+    setPendingUser(null);
   };
 
   return (
@@ -1077,6 +1194,9 @@ function LoginScreen({ onLogin, users }) {
           </button>
         </div>
       </div>
+      {pendingUser && (
+        <ChangePasswordModal user={pendingUser} users={users} setUsers={setUsers} onDone={handlePasswordChanged} isForced={true} />
+      )}
     </div>
   );
 }
@@ -1107,13 +1227,16 @@ export default function App() {
   const handleLogin = (u) => { setUser(u); setPage("dashboard"); };
   const handleLogout = () => { setUser(null); setPage("dashboard"); setSidebarOpen(false); };
 
-  if (!user) return <LoginScreen onLogin={handleLogin} users={users} />;
+  if (!user) return <LoginScreen onLogin={handleLogin} users={users} setUsers={setUsers} />;
+
+  const isAdmin = user.role === "admin";
+  const isElevated = user.role === "elevated_staff";
 
   const navItems = [
     { key: "dashboard", icon: LayoutDashboard, label: "Dashboard" },
-    { key: "entry", icon: Plus, label: "New Entry" },
+    ...(!isElevated ? [{ key: "entry", icon: Plus, label: "New Entry" }] : []),
     { key: "records", icon: FileText, label: "Records" },
-    ...(user.role === "admin" ? [{ key: "admin", icon: Shield, label: "Admin" }] : []),
+    ...(isAdmin ? [{ key: "admin", icon: Shield, label: "Admin" }] : []),
   ];
 
   return (
@@ -1133,7 +1256,7 @@ export default function App() {
           <div className="flex items-center gap-3">
             <div className="text-right hidden sm:block">
               <p className="text-sm font-medium text-gray-700">{user.name}</p>
-              <p className="text-xs text-gray-400">{user.role} • {user.branch}</p>
+              <p className="text-xs text-gray-400">{user.role === "elevated_staff" ? "MIS Staff" : user.role} • {user.branch || "Unassigned"}</p>
             </div>
             <button onClick={handleLogout} className="flex items-center gap-1 px-3 py-1.5 text-sm text-red-600 hover:bg-red-50 rounded-lg transition-colors">
               <LogOut size={16} /> Logout
