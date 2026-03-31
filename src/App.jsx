@@ -51,13 +51,26 @@ const DEFAULT_CONFIG = { companyName: "OD Pulse - MFI Recovery Tracker", allowSt
 
 // ─── CSV Export Helper ──────────────────────────────────────────────────────
 const exportToCSV = (entries, filename) => {
-  const rows = [["Date", "Time", "Branch", "Customer Name", "Customer ID", "Loan Account No.", "No. of Customers", "Group OD Amount", "Customer Share", "Pending Amount", "Waiver", "Waiver Approver", "Approval Subject", "Approval Date", "Entered By"]];
+  const getPaidCSV = (e) => e.totalPaidAmount !== undefined ? e.totalPaidAmount : (Number(e.customerShare) || 0);
+  const rows = [[
+    "Date", "Time", "Branch", "Customer Name", "Customer ID", "Loan Account No.",
+    "OD Type",
+    "Self OD Amount Due", "Self OD Paid", "Self OD Waiver",
+    "Group OD Amount Due", "No. of Customers in Group", "Customer Share (Auto)", "Group OD Paid", "Group OD Waiver",
+    "Total Paid", "Total Waiver",
+    "Waiver Approver", "Approval Subject", "Approval Date", "Entered By"
+  ]];
   entries.forEach(e => {
+    const customerShare = e.customerShare !== undefined ? e.customerShare : (e.numberOfCustomers > 0 ? Math.round(e.groupOdAmount / e.numberOfCustomers) : 0);
     rows.push([
       e.date, e.time, e.branch,
       e.customerName, e.customerId, e.loanAccountNo,
-      e.numberOfCustomers, e.groupOdAmount, e.customerShare,
-      e.pendingAmount, e.waiver,
+      e.odType || "Group OD",
+      e.selfOdAmountDue || 0, e.selfOdPaidAmount || 0, e.selfOdWaiver || 0,
+      e.groupOdAmount || 0, e.numberOfCustomers || 0, customerShare,
+      e.groupOdPaidAmount !== undefined ? e.groupOdPaidAmount : (e.customerShare || 0),
+      e.groupOdWaiver !== undefined ? e.groupOdWaiver : (e.waiver || 0),
+      getPaidCSV(e), e.waiver || 0,
       e.waiverApproval ? e.waiverApproval.approverName : "",
       e.waiverApproval ? e.waiverApproval.emailSubject : "",
       e.waiverApproval ? e.waiverApproval.approvalDate : "",
@@ -168,27 +181,48 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
   const [customerName, setCustomerName] = useState("");
   const [customerId, setCustomerId] = useState("");
   const [loanAccountNo, setLoanAccountNo] = useState("");
+  const [odType, setOdType] = useState(""); // "Self OD" | "Group OD"
+  // Self OD fields
+  const [selfOdAmountDue, setSelfOdAmountDue] = useState("");
+  const [selfOdPaidAmount, setSelfOdPaidAmount] = useState("");
+  // Group OD fields
   const [numberOfCustomers, setNumberOfCustomers] = useState("");
   const [groupOdAmount, setGroupOdAmount] = useState("");
-  const [customerShare, setCustomerShare] = useState("");
+  const [groupOdPaidAmount, setGroupOdPaidAmount] = useState("");
   const [showWaiverModal, setShowWaiverModal] = useState(false);
   const [pendingEntry, setPendingEntry] = useState(null);
 
+  // Self OD calculations
+  const selfOdDue = Number(selfOdAmountDue) || 0;
+  const selfOdPaid = Number(selfOdPaidAmount) || 0;
+  const selfOdWaiver = Math.max(0, selfOdDue - selfOdPaid);
+
+  // Group OD calculations
   const numCust = Number(numberOfCustomers) || 0;
-  const odAmt = Number(groupOdAmount) || 0;
-  const share = Number(customerShare) || 0;
-  const pendingAmount = numCust > 0 ? Math.round(odAmt / numCust) : 0;
-  const waiver = Math.max(0, pendingAmount - share);
+  const groupOdDue = Number(groupOdAmount) || 0;
+  const customerShare = numCust > 0 ? Math.round(groupOdDue / numCust) : 0; // auto-calc
+  const groupOdPaid = Number(groupOdPaidAmount) || 0;
+  const groupOdWaiver = Math.max(0, customerShare - groupOdPaid);
+
+  // Totals
+  const totalWaiver = (odType === "Self OD" ? selfOdWaiver : 0) + groupOdWaiver;
+  const totalPaidAmount = (odType === "Self OD" ? selfOdPaid : 0) + groupOdPaid;
 
   const handleSave = () => {
     if (!branch) { alert("Please select a branch."); return; }
     if (!customerName.trim()) { alert("Please enter customer name."); return; }
     if (!customerId.trim()) { alert("Please enter customer ID."); return; }
     if (!loanAccountNo.trim()) { alert("Please enter loan account number."); return; }
-    if (numCust <= 0) { alert("Please enter number of customers."); return; }
-    if (odAmt <= 0) { alert("Please enter group OD amount."); return; }
-    if (share < 0) { alert("Customer share cannot be negative."); return; }
-    if (share > pendingAmount) { alert("Customer share cannot exceed pending amount per customer."); return; }
+    if (!odType) { alert("Please select the Type of OD."); return; }
+    if (odType === "Self OD") {
+      if (selfOdDue <= 0) { alert("Please enter Self OD Amount Due."); return; }
+      if (selfOdPaid < 0) { alert("Self OD Paid Amount cannot be negative."); return; }
+      if (selfOdPaid > selfOdDue) { alert("Self OD Paid Amount cannot exceed Self OD Amount Due."); return; }
+    }
+    if (numCust <= 0) { alert("Please enter the total number of customers in the group."); return; }
+    if (groupOdDue <= 0) { alert("Please enter Group OD Amount Due."); return; }
+    if (groupOdPaid < 0) { alert("Group OD Paid Amount cannot be negative."); return; }
+    if (groupOdPaid > customerShare) { alert("Group OD Paid Amount cannot exceed the Customer Share."); return; }
 
     // Check duplicate
     const isDup = entries.some(e =>
@@ -199,13 +233,25 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
     const entry = {
       id: generateId(), date, time: nowTime(), branch,
       customerName: customerName.trim(), customerId: customerId.trim(), loanAccountNo: loanAccountNo.trim(),
-      numberOfCustomers: numCust, groupOdAmount: odAmt, customerShare: share,
-      pendingAmount, waiver,
+      odType,
+      // Self OD fields (only populated for Self OD type)
+      selfOdAmountDue: odType === "Self OD" ? selfOdDue : 0,
+      selfOdPaidAmount: odType === "Self OD" ? selfOdPaid : 0,
+      selfOdWaiver: odType === "Self OD" ? selfOdWaiver : 0,
+      // Group OD fields (always populated)
+      groupOdAmount: groupOdDue,
+      numberOfCustomers: numCust,
+      customerShare, // auto-calc: groupOdAmount / numberOfCustomers
+      groupOdPaidAmount: groupOdPaid,
+      groupOdWaiver,
+      // Totals for dashboard
+      totalPaidAmount,
+      waiver: totalWaiver,
       waiverApproval: null,
       enteredBy: user.id, enteredByName: user.name,
     };
 
-    if (waiver > 0) {
+    if (totalWaiver > 0) {
       setPendingEntry(entry);
       setShowWaiverModal(true);
     } else {
@@ -219,7 +265,9 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
     saveData(STORAGE_KEYS.entries, updated);
     // Reset form
     setCustomerName(""); setCustomerId(""); setLoanAccountNo("");
-    setNumberOfCustomers(""); setGroupOdAmount(""); setCustomerShare("");
+    setOdType("");
+    setSelfOdAmountDue(""); setSelfOdPaidAmount("");
+    setNumberOfCustomers(""); setGroupOdAmount(""); setGroupOdPaidAmount("");
     setPage("records");
   };
 
@@ -282,37 +330,86 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
       {/* Section 3: OD Details */}
       <div className="bg-white rounded-xl shadow-sm border p-5 mb-4">
         <h3 className="text-sm font-semibold text-teal-700 uppercase tracking-wide mb-4">OD Details</h3>
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">No. of Customers *</label>
-            <input type="number" min="1" value={numberOfCustomers} onChange={e => setNumberOfCustomers(e.target.value)}
-              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="e.g. 5" />
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Group OD Amount *</label>
-            <input type="number" min="0" value={groupOdAmount} onChange={e => setGroupOdAmount(e.target.value)}
-              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="e.g. 50000" />
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Customer Share (Paid) *</label>
-            <input type="number" min="0" value={customerShare} onChange={e => setCustomerShare(e.target.value)}
-              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="e.g. 8000" />
-          </div>
+
+        {/* Type of OD dropdown */}
+        <div className="mb-5">
+          <label className="block text-sm font-medium text-gray-700 mb-1">Type of OD *</label>
+          <select value={odType} onChange={e => { setOdType(e.target.value); setSelfOdAmountDue(""); setSelfOdPaidAmount(""); setNumberOfCustomers(""); setGroupOdAmount(""); setGroupOdPaidAmount(""); }}
+            className="w-full sm:w-64 px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500">
+            <option value="">Select Type</option>
+            <option value="Self OD">Self OD</option>
+            <option value="Group OD">Group OD</option>
+          </select>
         </div>
-        {/* Auto-calculated fields */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mt-4">
-          <div className="bg-gray-50 p-3 rounded-lg border border-dashed">
-            <label className="block text-xs font-medium text-gray-500 mb-1">Pending Amount (per customer)</label>
-            <p className="text-lg font-bold text-gray-800">{formatINR(pendingAmount)}</p>
-            <p className="text-xs text-gray-400">= Group OD ÷ No. of Customers</p>
-          </div>
-          <div className={`p-3 rounded-lg border border-dashed ${waiver > 0 ? "bg-amber-50 border-amber-300" : "bg-green-50 border-green-300"}`}>
-            <label className="block text-xs font-medium text-gray-500 mb-1">Waiver</label>
-            <p className={`text-lg font-bold ${waiver > 0 ? "text-amber-700" : "text-green-700"}`}>{formatINR(waiver)}</p>
-            <p className="text-xs text-gray-400">= Pending Amount − Customer Share</p>
-            {waiver > 0 && <p className="text-xs text-amber-600 mt-1 font-medium">⚠ Approval will be required</p>}
-          </div>
-        </div>
+
+        {/* ── Group OD fields (shown for both types) ── */}
+        {odType && (
+          <>
+            {/* Self OD section — only for "Self OD" type */}
+            {odType === "Self OD" && (
+              <div className="mb-5">
+                <h4 className="text-xs font-semibold text-indigo-600 uppercase tracking-wide mb-3 pb-1 border-b border-indigo-100">Section 1 — Self OD</h4>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Self OD Amount Due *</label>
+                    <input type="number" min="0" value={selfOdAmountDue} onChange={e => setSelfOdAmountDue(e.target.value)}
+                      className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="e.g. 5000" />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Paid Amount *</label>
+                    <input type="number" min="0" value={selfOdPaidAmount} onChange={e => setSelfOdPaidAmount(e.target.value)}
+                      className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="e.g. 4000" />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Waiver (Auto)</label>
+                    <input readOnly value={formatINR(selfOdWaiver)}
+                      className={`w-full px-3 py-2 border rounded-lg font-semibold cursor-default ${selfOdWaiver > 0 ? "bg-amber-50 border-amber-300 text-amber-700" : "bg-green-50 border-green-300 text-green-700"}`} />
+                    {selfOdWaiver > 0 && <p className="text-xs text-amber-600 mt-1 font-medium">⚠ Approval required</p>}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Group OD section */}
+            <div>
+              <h4 className={`text-xs font-semibold uppercase tracking-wide mb-3 pb-1 border-b ${odType === "Self OD" ? "text-indigo-600 border-indigo-100" : "text-teal-600 border-teal-100"}`}>
+                {odType === "Self OD" ? "Section 2 — Group OD" : "Group OD"}
+              </h4>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Group OD Amount Due *</label>
+                  <input type="number" min="0" value={groupOdAmount} onChange={e => setGroupOdAmount(e.target.value)}
+                    className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="e.g. 10000" />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Total No. of Customers in Group *</label>
+                  <input type="number" min="1" value={numberOfCustomers} onChange={e => setNumberOfCustomers(e.target.value)}
+                    className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="e.g. 4" />
+                </div>
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                {/* Customer Share — auto-calc */}
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Customer Share (Auto)</label>
+                  <input readOnly value={formatINR(customerShare)}
+                    className="w-full px-3 py-2 border border-gray-200 rounded-lg bg-gray-100 text-gray-800 font-semibold cursor-default" />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Paid Amount *</label>
+                  <input type="number" min="0" value={groupOdPaidAmount} onChange={e => setGroupOdPaidAmount(e.target.value)}
+                    className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="e.g. 2000" />
+                </div>
+                {/* Group OD Waiver — auto-calc */}
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Waiver (Auto)</label>
+                  <input readOnly value={formatINR(groupOdWaiver)}
+                    className={`w-full px-3 py-2 border rounded-lg font-semibold cursor-default ${groupOdWaiver > 0 ? "bg-amber-50 border-amber-300 text-amber-700" : "bg-green-50 border-green-300 text-green-700"}`} />
+                  {groupOdWaiver > 0 && <p className="text-xs text-amber-600 mt-1 font-medium">⚠ Approval required</p>}
+                </div>
+              </div>
+            </div>
+          </>
+        )}
       </div>
 
       <button onClick={handleSave}
@@ -321,7 +418,7 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
       </button>
 
       {showWaiverModal && (
-        <WaiverApprovalModal waiverAmount={waiver} onConfirm={handleWaiverConfirm} onCancel={() => { setShowWaiverModal(false); setPendingEntry(null); }} />
+        <WaiverApprovalModal waiverAmount={totalWaiver} onConfirm={handleWaiverConfirm} onCancel={() => { setShowWaiverModal(false); setPendingEntry(null); }} />
       )}
     </div>
   );
@@ -362,7 +459,9 @@ function RecordsTable({ user, entries, setEntries, config, branches }) {
     saveData(STORAGE_KEYS.entries, updated);
   };
 
-  const totalRecovered = visibleEntries.reduce((s, e) => s + (Number(e.customerShare) || 0), 0);
+  // Helper: backward compat — old entries used customerShare as paid, new entries have totalPaidAmount
+  const getPaid = (e) => e.totalPaidAmount !== undefined ? e.totalPaidAmount : (Number(e.customerShare) || 0);
+  const totalRecovered = visibleEntries.reduce((s, e) => s + getPaid(e), 0);
   const totalWaiver = visibleEntries.reduce((s, e) => s + (Number(e.waiver) || 0), 0);
 
   return (
@@ -420,16 +519,19 @@ function RecordsTable({ user, entries, setEntries, config, branches }) {
                 <th className="text-left px-4 py-3 font-semibold text-gray-600">Date</th>
                 <th className="text-left px-4 py-3 font-semibold text-gray-600">Branch</th>
                 <th className="text-left px-4 py-3 font-semibold text-gray-600">Customer</th>
+                <th className="text-left px-4 py-3 font-semibold text-gray-600">OD Type</th>
                 <th className="text-right px-4 py-3 font-semibold text-gray-600">Group OD</th>
-                <th className="text-right px-4 py-3 font-semibold text-gray-600">Share Paid</th>
+                <th className="text-right px-4 py-3 font-semibold text-gray-600">Paid</th>
                 <th className="text-right px-4 py-3 font-semibold text-gray-600">Waiver</th>
                 <th className="text-center px-4 py-3 font-semibold text-gray-600">Actions</th>
               </tr>
             </thead>
             <tbody>
               {visibleEntries.length === 0 ? (
-                <tr><td colSpan={7} className="text-center py-12 text-gray-400">No records found</td></tr>
-              ) : visibleEntries.map(e => (
+                <tr><td colSpan={8} className="text-center py-12 text-gray-400">No records found</td></tr>
+              ) : visibleEntries.map(e => {
+                const paid = getPaid(e);
+                return (
                 <React.Fragment key={e.id}>
                   <tr className="border-b hover:bg-gray-50 cursor-pointer" onClick={() => setExpandedId(expandedId === e.id ? null : e.id)}>
                     <td className="px-4 py-3">
@@ -441,8 +543,13 @@ function RecordsTable({ user, entries, setEntries, config, branches }) {
                       <div className="font-medium">{e.customerName}</div>
                       <div className="text-xs text-gray-400">{e.customerId} | {e.loanAccountNo}</div>
                     </td>
+                    <td className="px-4 py-3">
+                      {e.odType ? (
+                        <span className={`inline-block px-2 py-0.5 rounded-full text-xs font-medium ${e.odType === "Self OD" ? "bg-indigo-100 text-indigo-700" : "bg-teal-100 text-teal-700"}`}>{e.odType}</span>
+                      ) : <span className="text-gray-400 text-xs">—</span>}
+                    </td>
                     <td className="px-4 py-3 text-right font-medium">{formatINR(e.groupOdAmount)}</td>
-                    <td className="px-4 py-3 text-right font-medium text-teal-700">{formatINR(e.customerShare)}</td>
+                    <td className="px-4 py-3 text-right font-medium text-teal-700">{formatINR(getPaid(e))}</td>
                     <td className="px-4 py-3 text-right">
                       {e.waiver > 0 ? (
                         <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-amber-100 text-amber-800 rounded-full text-xs font-medium">
@@ -465,15 +572,37 @@ function RecordsTable({ user, entries, setEntries, config, branches }) {
                   </tr>
                   {expandedId === e.id && (
                     <tr className="bg-gray-50">
-                      <td colSpan={7} className="px-6 py-4">
-                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm">
-                          <div><span className="text-gray-500">Customers in Group:</span> <span className="font-medium">{e.numberOfCustomers}</span></div>
-                          <div><span className="text-gray-500">Pending/Customer:</span> <span className="font-medium">{formatINR(e.pendingAmount)}</span></div>
+                      <td colSpan={8} className="px-6 py-4 space-y-3">
+                        {/* Self OD breakdown — only for Self OD entries */}
+                        {e.odType === "Self OD" && (
+                          <div className="p-3 bg-indigo-50 rounded-lg border border-indigo-100">
+                            <p className="text-xs font-semibold text-indigo-700 mb-2 uppercase tracking-wide">Self OD</p>
+                            <div className="grid grid-cols-3 gap-3 text-sm">
+                              <div><span className="text-gray-500">Amount Due:</span> <span className="font-medium">{formatINR(e.selfOdAmountDue)}</span></div>
+                              <div><span className="text-gray-500">Paid:</span> <span className="font-medium text-teal-700">{formatINR(e.selfOdPaidAmount)}</span></div>
+                              <div><span className="text-gray-500">Waiver:</span> <span className={`font-medium ${e.selfOdWaiver > 0 ? "text-amber-600" : "text-green-600"}`}>{formatINR(e.selfOdWaiver)}</span></div>
+                            </div>
+                          </div>
+                        )}
+                        {/* Group OD breakdown */}
+                        <div className="p-3 bg-teal-50 rounded-lg border border-teal-100">
+                          <p className="text-xs font-semibold text-teal-700 mb-2 uppercase tracking-wide">Group OD</p>
+                          <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 text-sm">
+                            <div><span className="text-gray-500">Amount Due:</span> <span className="font-medium">{formatINR(e.groupOdAmount)}</span></div>
+                            <div><span className="text-gray-500">No. of Customers:</span> <span className="font-medium">{e.numberOfCustomers}</span></div>
+                            <div><span className="text-gray-500">Customer Share:</span> <span className="font-medium">{formatINR(e.customerShare || (e.numberOfCustomers > 0 ? Math.round(e.groupOdAmount / e.numberOfCustomers) : 0))}</span></div>
+                            <div><span className="text-gray-500">Paid:</span> <span className="font-medium text-teal-700">{formatINR(e.groupOdPaidAmount !== undefined ? e.groupOdPaidAmount : e.customerShare)}</span></div>
+                            <div><span className="text-gray-500">Waiver:</span> <span className={`font-medium ${(e.groupOdWaiver || e.waiver) > 0 ? "text-amber-600" : "text-green-600"}`}>{formatINR(e.groupOdWaiver !== undefined ? e.groupOdWaiver : e.waiver)}</span></div>
+                          </div>
+                        </div>
+                        {/* Meta info */}
+                        <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 text-sm">
                           <div><span className="text-gray-500">Entered By:</span> <span className="font-medium">{e.enteredByName || e.enteredBy}</span></div>
                           <div><span className="text-gray-500">Entry Time:</span> <span className="font-medium">{e.date} {e.time}</span></div>
+                          <div><span className="text-gray-500">Total Paid:</span> <span className="font-medium text-teal-700">{formatINR(paid)}</span></div>
                         </div>
                         {e.waiverApproval && (
-                          <div className="mt-3 p-3 bg-amber-50 rounded-lg border border-amber-200">
+                          <div className="p-3 bg-amber-50 rounded-lg border border-amber-200">
                             <p className="text-xs font-semibold text-amber-800 mb-2">Waiver Approval Details</p>
                             <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-sm">
                               <div><span className="text-gray-500">Approver:</span> <span className="font-medium">{e.waiverApproval.approverName}</span></div>
@@ -486,7 +615,8 @@ function RecordsTable({ user, entries, setEntries, config, branches }) {
                     </tr>
                   )}
                 </React.Fragment>
-              ))}
+                );
+              })}
             </tbody>
           </table>
         </div>
@@ -509,8 +639,11 @@ function Dashboard({ user, entries, branches, config }) {
     return data;
   }, [entries, user, config, dateFrom, dateTo]);
 
+  // Helper: backward compat — old entries used customerShare as paid, new entries have totalPaidAmount
+  const getEntryPaid = (e) => e.totalPaidAmount !== undefined ? e.totalPaidAmount : (Number(e.customerShare) || 0);
+
   const stats = useMemo(() => {
-    const totalRecovered = visibleEntries.reduce((s, e) => s + (Number(e.customerShare) || 0), 0);
+    const totalRecovered = visibleEntries.reduce((s, e) => s + getEntryPaid(e), 0);
     const totalGroupOD = visibleEntries.reduce((s, e) => s + (Number(e.groupOdAmount) || 0), 0);
     const totalWaiver = visibleEntries.reduce((s, e) => s + (Number(e.waiver) || 0), 0);
     const entriesWithWaiver = visibleEntries.filter(e => (Number(e.waiver) || 0) > 0).length;
@@ -519,7 +652,7 @@ function Dashboard({ user, entries, branches, config }) {
     const byBranch = {};
     visibleEntries.forEach(e => {
       if (!byBranch[e.branch]) byBranch[e.branch] = { branch: e.branch, recovered: 0, waiver: 0, groupOD: 0, count: 0 };
-      byBranch[e.branch].recovered += Number(e.customerShare) || 0;
+      byBranch[e.branch].recovered += getEntryPaid(e);
       byBranch[e.branch].waiver += Number(e.waiver) || 0;
       byBranch[e.branch].groupOD += Number(e.groupOdAmount) || 0;
       byBranch[e.branch].count += 1;
@@ -531,7 +664,7 @@ function Dashboard({ user, entries, branches, config }) {
     visibleEntries.forEach(e => {
       const m = e.date ? e.date.substring(0, 7) : "Unknown";
       if (!byMonth[m]) byMonth[m] = { month: m, recovered: 0, waiver: 0, count: 0 };
-      byMonth[m].recovered += Number(e.customerShare) || 0;
+      byMonth[m].recovered += getEntryPaid(e);
       byMonth[m].waiver += Number(e.waiver) || 0;
       byMonth[m].count += 1;
     });
@@ -542,14 +675,14 @@ function Dashboard({ user, entries, branches, config }) {
 
   if (drillBranch) {
     const branchEntries = visibleEntries.filter(e => e.branch === drillBranch);
-    const branchRecovered = branchEntries.reduce((s, e) => s + (Number(e.customerShare) || 0), 0);
+    const branchRecovered = branchEntries.reduce((s, e) => s + getEntryPaid(e), 0);
     const branchWaiver = branchEntries.reduce((s, e) => s + (Number(e.waiver) || 0), 0);
 
     const byMonth = {};
     branchEntries.forEach(e => {
       const m = e.date ? e.date.substring(0, 7) : "Unknown";
       if (!byMonth[m]) byMonth[m] = { month: m, recovered: 0, waiver: 0, count: 0 };
-      byMonth[m].recovered += Number(e.customerShare) || 0;
+      byMonth[m].recovered += getEntryPaid(e);
       byMonth[m].waiver += Number(e.waiver) || 0;
       byMonth[m].count += 1;
     });
@@ -599,7 +732,7 @@ function Dashboard({ user, entries, branches, config }) {
                 <tr key={e.id} className="border-b">
                   <td className="px-4 py-2">{e.date}</td>
                   <td className="px-4 py-2">{e.customerName} <span className="text-xs text-gray-400">({e.customerId})</span></td>
-                  <td className="px-4 py-2 text-right text-teal-700 font-medium">{formatINR(e.customerShare)}</td>
+                  <td className="px-4 py-2 text-right text-teal-700 font-medium">{formatINR(getEntryPaid(e))}</td>
                   <td className="px-4 py-2 text-right">{e.waiver > 0 ? <span className="text-amber-600">{formatINR(e.waiver)}</span> : <span className="text-gray-400">—</span>}</td>
                 </tr>
               ))}
