@@ -5,7 +5,8 @@ import { Plus, Trash2, LogOut, Settings, Users, GitBranch, LayoutDashboard, File
 // ─── Constants & Helpers ────────────────────────────────────────────────────
 const COLORS = ["#0f766e", "#06b6d4", "#8b5cf6", "#f59e0b", "#ef4444", "#10b981", "#ec4899", "#6366f1", "#14b8a6", "#f97316"];
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-const STORAGE_KEYS = { entries: "odpulse_entries", users: "odpulse_users", branches: "odpulse_branches", config: "odpulse_config" };
+const STORAGE_KEYS = { entries: "odpulse_entries", users: "odpulse_users", branches: "odpulse_branches", config: "odpulse_config", version: "odpulse_version" };
+const APP_VERSION = 2; // bump this to force re-seed users & branches
 
 const formatINR = (num) => {
   if (!num && num !== 0) return "Rs. 0";
@@ -1212,13 +1213,23 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
   useEffect(() => {
-    const savedUsers = loadData(STORAGE_KEYS.users, null);
-    if (!savedUsers) { saveData(STORAGE_KEYS.users, DEFAULT_USERS); setUsers(DEFAULT_USERS); }
-    else setUsers(savedUsers);
+    const savedVersion = loadData(STORAGE_KEYS.version, 0);
+    const needsMigration = savedVersion < APP_VERSION;
 
-    const savedBranches = loadData(STORAGE_KEYS.branches, null);
-    if (!savedBranches) { saveData(STORAGE_KEYS.branches, DEFAULT_BRANCHES); setBranches(DEFAULT_BRANCHES); }
-    else setBranches(savedBranches);
+    if (needsMigration) {
+      // Force re-seed users and branches on version bump
+      saveData(STORAGE_KEYS.users, DEFAULT_USERS); setUsers(DEFAULT_USERS);
+      saveData(STORAGE_KEYS.branches, DEFAULT_BRANCHES); setBranches(DEFAULT_BRANCHES);
+      saveData(STORAGE_KEYS.version, APP_VERSION);
+    } else {
+      const savedUsers = loadData(STORAGE_KEYS.users, null);
+      if (!savedUsers) { saveData(STORAGE_KEYS.users, DEFAULT_USERS); setUsers(DEFAULT_USERS); }
+      else setUsers(savedUsers);
+
+      const savedBranches = loadData(STORAGE_KEYS.branches, null);
+      if (!savedBranches) { saveData(STORAGE_KEYS.branches, DEFAULT_BRANCHES); setBranches(DEFAULT_BRANCHES); }
+      else setBranches(savedBranches);
+    }
 
     setConfig(loadData(STORAGE_KEYS.config, DEFAULT_CONFIG));
     setEntries(loadData(STORAGE_KEYS.entries, []));
