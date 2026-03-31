@@ -1,12 +1,12 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend, LineChart, Line } from "recharts";
-import { Plus, Trash2, LogOut, Settings, Users, GitBranch, LayoutDashboard, FileText, ChevronDown, ChevronRight, ArrowLeft, Search, Eye, EyeOff, Edit2, Save, X, AlertTriangle, CheckCircle, Database, Shield, UserPlus, ChevronUp, Download, Calendar, Tag, Lock, Upload } from "lucide-react";
+import { Plus, Trash2, LogOut, Settings, Users, GitBranch, LayoutDashboard, FileText, ChevronDown, ChevronRight, ArrowLeft, Search, Eye, EyeOff, Edit2, Save, X, AlertTriangle, CheckCircle, Database, Shield, UserPlus, ChevronUp, Download, Calendar, Tag, Lock, Upload, Bell } from "lucide-react";
 
 // ─── Constants & Helpers ────────────────────────────────────────────────────
 const COLORS = ["#0f766e", "#06b6d4", "#8b5cf6", "#f59e0b", "#ef4444", "#10b981", "#ec4899", "#6366f1", "#14b8a6", "#f97316"];
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-const STORAGE_KEYS = { entries: "odpulse_entries", users: "odpulse_users", branches: "odpulse_branches", config: "odpulse_config", version: "odpulse_version" };
-const APP_VERSION = 2; // bump this to force re-seed users & branches
+const STORAGE_KEYS = { entries: "odpulse_entries", users: "odpulse_users", branches: "odpulse_branches", config: "odpulse_config", version: "odpulse_version", notifications: "odpulse_notifications" };
+const APP_VERSION = 3; // bump this to force re-seed users & branches
 
 const formatINR = (num) => {
   if (!num && num !== 0) return "Rs. 0";
@@ -42,11 +42,44 @@ const formatDateDMY = (isoDate) => {
   return `${d}-${m}-${y}`;
 };
 
+// ─── API + localStorage helpers ────────────────────────────────────────────
+const API_BASE = "/api";
+
 const loadData = (key, fallback) => {
   try { const d = localStorage.getItem(key); return d ? JSON.parse(d) : fallback; }
   catch { return fallback; }
 };
-const saveData = (key, data) => localStorage.setItem(key, JSON.stringify(data));
+
+const saveData = (key, data) => {
+  localStorage.setItem(key, JSON.stringify(data));
+  // Fire-and-forget sync to server
+  const collectionMap = {
+    [STORAGE_KEYS.entries]: "entries",
+    [STORAGE_KEYS.users]: "users",
+    [STORAGE_KEYS.branches]: "branches",
+    [STORAGE_KEYS.config]: "config",
+    [STORAGE_KEYS.notifications]: "notifications",
+  };
+  const collection = collectionMap[key];
+  if (collection) {
+    fetch(`${API_BASE}/${collection}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(data),
+    }).catch(err => console.warn("[API sync]", err.message));
+  }
+};
+
+const fetchAPI = async (collection, fallback) => {
+  try {
+    const res = await fetch(`${API_BASE}/${collection}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  } catch (err) {
+    console.warn(`[API fetch ${collection}]`, err.message);
+    return null; // signal to use localStorage fallback
+  }
+};
 
 const DEFAULT_BRANCHES = [
   "Head Office", "Annur", "Thondamuthur", "Kinathukadavu", "Palladam", "Ganapathy",
@@ -78,6 +111,7 @@ const exportToCSV = (entries, filename) => {
     "Self OD Amount Due", "Self OD Paid", "Self OD Waiver",
     "Group OD Amount Due", "No. of Customers in Group", "Customer Share (Auto)", "Group OD Paid", "Group OD Waiver",
     "Total Paid", "Total Waiver",
+    "Payment Mode", "UPI Reference", "PTP Date",
     "Waiver Approver", "Approval Subject", "Approval Date", "Recorded By"
   ]];
   entries.forEach(e => {
@@ -91,6 +125,7 @@ const exportToCSV = (entries, filename) => {
       e.groupOdPaidAmount !== undefined ? e.groupOdPaidAmount : (e.customerShare || 0),
       e.groupOdWaiver !== undefined ? e.groupOdWaiver : (e.waiver || 0),
       getPaidCSV(e), e.waiver || 0,
+      e.paymentMode || "", e.upiReference || "", e.ptpDate || "",
       e.waiverApproval ? e.waiverApproval.approverName : "",
       e.waiverApproval ? e.waiverApproval.emailSubject : "",
       e.waiverApproval ? e.waiverApproval.approvalDate : "",
@@ -201,50 +236,36 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
   const [customerName, setCustomerName] = useState("");
   const [customerId, setCustomerId] = useState("");
   const [loanAccountNo, setLoanAccountNo] = useState("");
-  const [odType, setOdType] = useState(""); // "Self OD" | "Group OD"
-  // Self OD fields
-  const [selfOdAmountDue, setSelfOdAmountDue] = useState("");
-  const [selfOdPaidAmount, setSelfOdPaidAmount] = useState("");
   // Group OD fields
   const [numberOfCustomers, setNumberOfCustomers] = useState("");
   const [groupOdAmount, setGroupOdAmount] = useState("");
   const [groupOdPaidAmount, setGroupOdPaidAmount] = useState("");
   const [approvalEmailSubject, setApprovalEmailSubject] = useState("");
+  const [paymentMode, setPaymentMode] = useState("");
+  const [upiReference, setUpiReference] = useState("");
+  const [ptpDate, setPtpDate] = useState("");
   const [showWaiverModal, setShowWaiverModal] = useState(false);
   const [pendingEntry, setPendingEntry] = useState(null);
-
-  // Self OD calculations
-  const selfOdDue = Number(selfOdAmountDue) || 0;
-  const selfOdPaid = Number(selfOdPaidAmount) || 0;
-  const selfOdWaiver = Math.max(0, selfOdDue - selfOdPaid);
 
   // Group OD calculations
   const numCust = Number(numberOfCustomers) || 0;
   const groupOdDue = Number(groupOdAmount) || 0;
-  const customerShare = numCust > 0 ? Math.round(groupOdDue / numCust) : 0; // auto-calc
+  const customerShare = numCust > 0 ? Math.round(groupOdDue / numCust) : 0;
   const groupOdPaid = Number(groupOdPaidAmount) || 0;
-  const groupOdWaiver = Math.max(0, customerShare - groupOdPaid);
-
-  // Totals
-  const totalWaiver = (odType === "Self OD" ? selfOdWaiver : 0) + groupOdWaiver;
-  const totalPaidAmount = (odType === "Self OD" ? selfOdPaid : 0) + groupOdPaid;
+  const waiver = Math.max(0, customerShare - groupOdPaid);
 
   const handleSave = () => {
     if (!branch) { alert("Please select a branch."); return; }
     if (!customerName.trim()) { alert("Please enter customer name."); return; }
     if (!customerId.trim()) { alert("Please enter customer ID."); return; }
     if (!loanAccountNo.trim()) { alert("Please enter loan account number."); return; }
-    if (!odType) { alert("Please select the Type of OD."); return; }
-    if (odType === "Self OD") {
-      if (selfOdDue <= 0) { alert("Please enter Self OD Amount Due."); return; }
-      if (selfOdPaid < 0) { alert("Self OD Paid Amount cannot be negative."); return; }
-      if (selfOdPaid > selfOdDue) { alert("Self OD Paid Amount cannot exceed Self OD Amount Due."); return; }
-    }
     if (numCust <= 0) { alert("Please enter the total number of customers in the group."); return; }
     if (groupOdDue <= 0) { alert("Please enter Group OD Amount Due."); return; }
-    if (groupOdPaid < 0) { alert("Group OD Paid Amount cannot be negative."); return; }
-    if (groupOdPaid > customerShare) { alert("Group OD Paid Amount cannot exceed the Customer Share."); return; }
-    if (totalWaiver > 0 && !approvalEmailSubject.trim()) { alert("Waiver detected. Please enter the approval email subject line."); return; }
+    if (groupOdPaid < 0) { alert("Paid Amount cannot be negative."); return; }
+    if (!paymentMode) { alert("Please select a Payment Mode."); return; }
+    if (paymentMode === "UPI" && !upiReference.trim()) { alert("Please enter UPI Transaction Reference."); return; }
+    if (paymentMode === "Cash" && ptpDate && !isValidDate(ptpDate)) { alert("Please enter a valid PTP date."); return; }
+    if (waiver > 0 && !approvalEmailSubject.trim()) { alert("Waiver detected. Please enter the approval email subject line."); return; }
 
     // Check duplicate
     const isDup = entries.some(e =>
@@ -255,25 +276,24 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
     const entry = {
       id: generateId(), date, time: nowTime(), branch,
       customerName: customerName.trim(), customerId: customerId.trim(), loanAccountNo: loanAccountNo.trim(),
-      odType,
-      // Self OD fields (only populated for Self OD type)
-      selfOdAmountDue: odType === "Self OD" ? selfOdDue : 0,
-      selfOdPaidAmount: odType === "Self OD" ? selfOdPaid : 0,
-      selfOdWaiver: odType === "Self OD" ? selfOdWaiver : 0,
-      // Group OD fields (always populated)
+      odType: "Group OD",
+      selfOdAmountDue: 0, selfOdPaidAmount: 0, selfOdWaiver: 0,
       groupOdAmount: groupOdDue,
       numberOfCustomers: numCust,
-      customerShare, // auto-calc: groupOdAmount / numberOfCustomers
+      customerShare,
       groupOdPaidAmount: groupOdPaid,
-      groupOdWaiver,
-      // Totals for dashboard
-      totalPaidAmount,
-      waiver: totalWaiver,
-      waiverApproval: totalWaiver > 0 ? { approverName: user.name, emailSubject: approvalEmailSubject.trim(), approvalDate: date } : null,
+      groupOdWaiver: waiver,
+      totalPaidAmount: groupOdPaid,
+      waiver,
+      paymentMode,
+      upiReference: paymentMode === "UPI" ? upiReference.trim() : "",
+      ptpDate: paymentMode === "Cash" ? ptpDate : "",
+      ptpReminderSent: false,
+      waiverApproval: waiver > 0 ? { approverName: user.name, emailSubject: approvalEmailSubject.trim(), approvalDate: date } : null,
       enteredBy: user.id, enteredByName: user.name,
     };
 
-    if (totalWaiver > 0) {
+    if (waiver > 0) {
       setPendingEntry(entry);
       setShowWaiverModal(true);
     } else {
@@ -281,15 +301,26 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
     }
   };
 
+  const isValidDate = (dateStr) => {
+    const d = new Date(dateStr);
+    return d instanceof Date && !isNaN(d);
+  };
+
   const saveEntry = (entry) => {
     const updated = [entry, ...entries];
     setEntries(updated);
     saveData(STORAGE_KEYS.entries, updated);
+    // Also append to server (more efficient than full replace for single entries)
+    fetch(`${API_BASE}/entries/append`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(entry),
+    }).catch(err => console.warn("[API append]", err.message));
     // Reset form
     setCustomerName(""); setCustomerId(""); setLoanAccountNo("");
-    setOdType(""); setApprovalEmailSubject("");
-    setSelfOdAmountDue(""); setSelfOdPaidAmount("");
+    setApprovalEmailSubject("");
     setNumberOfCustomers(""); setGroupOdAmount(""); setGroupOdPaidAmount("");
+    setPaymentMode(""); setUpiReference(""); setPtpDate("");
     setPage("records");
   };
 
@@ -349,100 +380,82 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
         </div>
       </div>
 
-      {/* Section 3: OD Details */}
+      {/* Section 3: Group OD Details (formerly OD Details) */}
       <div className="bg-white rounded-xl shadow-sm border p-5 mb-4">
-        <h3 className="text-sm font-semibold text-teal-700 uppercase tracking-wide mb-4">OD Details</h3>
-
-        {/* Type of OD dropdown */}
-        <div className="mb-5">
-          <label className="block text-sm font-medium text-gray-700 mb-1">Type of OD *</label>
-          <select value={odType} onChange={e => { setOdType(e.target.value); setSelfOdAmountDue(""); setSelfOdPaidAmount(""); setNumberOfCustomers(""); setGroupOdAmount(""); setGroupOdPaidAmount(""); }}
-            className="w-full sm:w-64 px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500">
-            <option value="">Select Type</option>
-            <option value="Self OD">Self OD</option>
-            <option value="Group OD">Group OD</option>
-          </select>
+        <h3 className="text-sm font-semibold text-teal-700 uppercase tracking-wide mb-4">Group OD Details</h3>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Total Amount Due *</label>
+            <input type="number" min="0" value={groupOdAmount} onChange={e => setGroupOdAmount(e.target.value)}
+              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="e.g. 10000" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Group Size *</label>
+            <input type="number" min="1" value={numberOfCustomers} onChange={e => setNumberOfCustomers(e.target.value)}
+              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="e.g. 4" />
+          </div>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Customer Share</label>
+            <input readOnly value={formatINR(customerShare)}
+              className="w-full px-3 py-2 border border-gray-200 rounded-lg bg-gray-100 text-gray-800 font-semibold cursor-default" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Paid Amount *</label>
+            <input type="number" min="0" value={groupOdPaidAmount} onChange={e => setGroupOdPaidAmount(e.target.value)}
+              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="e.g. 2000" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Waiver (Auto)</label>
+            <input readOnly value={formatINR(waiver)}
+              className={`w-full px-3 py-2 border rounded-lg font-semibold cursor-default ${waiver > 0 ? "bg-amber-50 border-amber-300 text-amber-700" : "bg-green-50 border-green-300 text-green-700"}`} />
+            {waiver > 0 && <p className="text-xs text-amber-600 mt-1 font-medium">Approval required</p>}
+          </div>
         </div>
 
-        {/* ── Group OD fields (shown for both types) ── */}
-        {odType && (
-          <>
-            {/* Self OD section — only for "Self OD" type */}
-            {odType === "Self OD" && (
-              <div className="mb-5">
-                <h4 className="text-xs font-semibold text-indigo-600 uppercase tracking-wide mb-3 pb-1 border-b border-indigo-100">Self OD</h4>
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Self OD Amount Due *</label>
-                    <input type="number" min="0" value={selfOdAmountDue} onChange={e => setSelfOdAmountDue(e.target.value)}
-                      className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="e.g. 5000" />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Paid Amount *</label>
-                    <input type="number" min="0" value={selfOdPaidAmount} onChange={e => setSelfOdPaidAmount(e.target.value)}
-                      className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="e.g. 4000" />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Waiver (Auto)</label>
-                    <input readOnly value={formatINR(selfOdWaiver)}
-                      className={`w-full px-3 py-2 border rounded-lg font-semibold cursor-default ${selfOdWaiver > 0 ? "bg-amber-50 border-amber-300 text-amber-700" : "bg-green-50 border-green-300 text-green-700"}`} />
-                    {selfOdWaiver > 0 && <p className="text-xs text-amber-600 mt-1 font-medium">Approval required</p>}
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {/* Group OD section */}
-            <div>
-              <h4 className={`text-xs font-semibold uppercase tracking-wide mb-3 pb-1 border-b ${odType === "Self OD" ? "text-indigo-600 border-indigo-100" : "text-teal-600 border-teal-100"}`}>
-                Group OD
-              </h4>
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Group OD Amount Due *</label>
-                  <input type="number" min="0" value={groupOdAmount} onChange={e => setGroupOdAmount(e.target.value)}
-                    className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="e.g. 10000" />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Total No. of Customers in Group *</label>
-                  <input type="number" min="1" value={numberOfCustomers} onChange={e => setNumberOfCustomers(e.target.value)}
-                    className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="e.g. 4" />
-                </div>
-              </div>
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-                {/* Customer Share — auto-calc */}
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Customer Share (Auto)</label>
-                  <input readOnly value={formatINR(customerShare)}
-                    className="w-full px-3 py-2 border border-gray-200 rounded-lg bg-gray-100 text-gray-800 font-semibold cursor-default" />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Paid Amount *</label>
-                  <input type="number" min="0" value={groupOdPaidAmount} onChange={e => setGroupOdPaidAmount(e.target.value)}
-                    className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="e.g. 2000" />
-                </div>
-                {/* Group OD Waiver — auto-calc */}
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Waiver (Auto)</label>
-                  <input readOnly value={formatINR(groupOdWaiver)}
-                    className={`w-full px-3 py-2 border rounded-lg font-semibold cursor-default ${groupOdWaiver > 0 ? "bg-amber-50 border-amber-300 text-amber-700" : "bg-green-50 border-green-300 text-green-700"}`} />
-                  {groupOdWaiver > 0 && <p className="text-xs text-amber-600 mt-1 font-medium">Approval required</p>}
-                </div>
-              </div>
-            </div>
-          </>
-        )}
-
-        {/* Inline Approval Email Subject — shown when any waiver > 0 */}
-        {totalWaiver > 0 && (
+        {/* Inline Approval Email Subject — shown when waiver > 0 */}
+        {waiver > 0 && (
           <div className="mt-4 p-4 bg-amber-50 rounded-lg border border-amber-200">
             <div className="flex items-center gap-2 mb-2">
               <AlertTriangle size={16} className="text-amber-600" />
-              <p className="text-sm font-semibold text-amber-800">Waiver of {formatINR(totalWaiver)} requires approval</p>
+              <p className="text-sm font-semibold text-amber-800">Waiver of {formatINR(waiver)} requires approval</p>
             </div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Approval Email Subject *</label>
             <input type="text" value={approvalEmailSubject} onChange={e => setApprovalEmailSubject(e.target.value)}
               className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-amber-500 focus:border-amber-500" placeholder="e.g. OD Waiver Approval - Branch Name - Customer Name" />
+          </div>
+        )}
+      </div>
+
+      {/* Section 4: Payment Mode */}
+      <div className="bg-white rounded-xl shadow-sm border p-5 mb-4">
+        <h3 className="text-sm font-semibold text-teal-700 uppercase tracking-wide mb-4">Payment Details</h3>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Payment Mode *</label>
+            <select value={paymentMode} onChange={e => setPaymentMode(e.target.value)} className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500">
+              <option value="">Select</option>
+              <option value="Cash">Cash</option>
+              <option value="UPI">UPI</option>
+            </select>
+          </div>
+        </div>
+
+        {paymentMode === "UPI" && (
+          <div className="p-4 bg-blue-50 rounded-lg border border-blue-200 mb-4">
+            <label className="block text-sm font-medium text-gray-700 mb-1">UPI Transaction Reference *</label>
+            <input type="text" value={upiReference} onChange={e => setUpiReference(e.target.value)}
+              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500" placeholder="e.g. UPI_TRANS_12345" />
+          </div>
+        )}
+
+        {paymentMode === "Cash" && (
+          <div className="p-4 bg-green-50 rounded-lg border border-green-200">
+            <label className="block text-sm font-medium text-gray-700 mb-1">Promise to Pay (PTP) Date</label>
+            <input type="date" value={ptpDate} onChange={e => setPtpDate(e.target.value)}
+              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500" />
+            <p className="text-xs text-gray-500 mt-1">Optional - set a date when the cash payment is expected</p>
           </div>
         )}
       </div>
@@ -453,7 +466,7 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
       </button>
 
       {showWaiverModal && (
-        <WaiverApprovalModal waiverAmount={totalWaiver} onConfirm={handleWaiverConfirm} onCancel={() => { setShowWaiverModal(false); setPendingEntry(null); }} />
+        <WaiverApprovalModal waiverAmount={waiver} onConfirm={handleWaiverConfirm} onCancel={() => { setShowWaiverModal(false); setPendingEntry(null); }} />
       )}
     </div>
   );
@@ -557,7 +570,6 @@ function RecordsTable({ user, entries, setEntries, config, branches }) {
                 <th className="text-left px-4 py-3 font-semibold text-gray-600">Date</th>
                 <th className="text-left px-4 py-3 font-semibold text-gray-600">Branch</th>
                 <th className="text-left px-4 py-3 font-semibold text-gray-600">Customer</th>
-                <th className="text-left px-4 py-3 font-semibold text-gray-600">OD Type</th>
                 <th className="text-right px-4 py-3 font-semibold text-gray-600">Group OD</th>
                 <th className="text-right px-4 py-3 font-semibold text-gray-600">Paid</th>
                 <th className="text-right px-4 py-3 font-semibold text-gray-600">Waiver</th>
@@ -566,7 +578,7 @@ function RecordsTable({ user, entries, setEntries, config, branches }) {
             </thead>
             <tbody>
               {visibleEntries.length === 0 ? (
-                <tr><td colSpan={8} className="text-center py-12 text-gray-400">No records found</td></tr>
+                <tr><td colSpan={7} className="text-center py-12 text-gray-400">No records found</td></tr>
               ) : visibleEntries.map(e => {
                 const paid = getPaid(e);
                 return (
@@ -580,11 +592,6 @@ function RecordsTable({ user, entries, setEntries, config, branches }) {
                     <td className="px-4 py-3">
                       <div className="font-medium">{e.customerName}</div>
                       <div className="text-xs text-gray-400">{e.customerId} | {e.loanAccountNo}</div>
-                    </td>
-                    <td className="px-4 py-3">
-                      {e.odType ? (
-                        <span className={`inline-block px-2 py-0.5 rounded-full text-xs font-medium ${e.odType === "Self OD" ? "bg-indigo-100 text-indigo-700" : "bg-teal-100 text-teal-700"}`}>{e.odType}</span>
-                      ) : <span className="text-gray-400 text-xs">—</span>}
                     </td>
                     <td className="px-4 py-3 text-right font-medium">{formatINR(e.groupOdAmount)}</td>
                     <td className="px-4 py-3 text-right font-medium text-teal-700">{formatINR(getPaid(e))}</td>
@@ -610,18 +617,7 @@ function RecordsTable({ user, entries, setEntries, config, branches }) {
                   </tr>
                   {expandedId === e.id && (
                     <tr className="bg-gray-50">
-                      <td colSpan={8} className="px-6 py-4 space-y-3">
-                        {/* Self OD breakdown — only for Self OD entries */}
-                        {e.odType === "Self OD" && (
-                          <div className="p-3 bg-indigo-50 rounded-lg border border-indigo-100">
-                            <p className="text-xs font-semibold text-indigo-700 mb-2 uppercase tracking-wide">Self OD</p>
-                            <div className="grid grid-cols-3 gap-3 text-sm">
-                              <div><span className="text-gray-500">Amount Due:</span> <span className="font-medium">{formatINR(e.selfOdAmountDue)}</span></div>
-                              <div><span className="text-gray-500">Paid:</span> <span className="font-medium text-teal-700">{formatINR(e.selfOdPaidAmount)}</span></div>
-                              <div><span className="text-gray-500">Waiver:</span> <span className={`font-medium ${e.selfOdWaiver > 0 ? "text-amber-600" : "text-green-600"}`}>{formatINR(e.selfOdWaiver)}</span></div>
-                            </div>
-                          </div>
-                        )}
+                      <td colSpan={7} className="px-6 py-4 space-y-3">
                         {/* Group OD breakdown */}
                         <div className="p-3 bg-teal-50 rounded-lg border border-teal-100">
                           <p className="text-xs font-semibold text-teal-700 mb-2 uppercase tracking-wide">Group OD</p>
@@ -633,6 +629,17 @@ function RecordsTable({ user, entries, setEntries, config, branches }) {
                             <div><span className="text-gray-500">Waiver:</span> <span className={`font-medium ${(e.groupOdWaiver || e.waiver) > 0 ? "text-amber-600" : "text-green-600"}`}>{formatINR(e.groupOdWaiver !== undefined ? e.groupOdWaiver : e.waiver)}</span></div>
                           </div>
                         </div>
+                        {/* Payment Details */}
+                        {(e.paymentMode || e.ptpDate) && (
+                          <div className="p-3 bg-blue-50 rounded-lg border border-blue-100">
+                            <p className="text-xs font-semibold text-blue-700 mb-2 uppercase tracking-wide">Payment Details</p>
+                            <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 text-sm">
+                              {e.paymentMode && <div><span className="text-gray-500">Payment Mode:</span> <span className="font-medium">{e.paymentMode}</span></div>}
+                              {e.upiReference && <div><span className="text-gray-500">UPI Reference:</span> <span className="font-medium">{e.upiReference}</span></div>}
+                              {e.ptpDate && <div><span className="text-gray-500">PTP Date:</span> <span className="font-medium">{formatDateDMY(e.ptpDate)}</span></div>}
+                            </div>
+                          </div>
+                        )}
                         {/* Meta info */}
                         <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 text-sm">
                           <div><span className="text-gray-500">Entered By:</span> <span className="font-medium">{e.enteredByName || e.enteredBy}</span></div>
@@ -659,6 +666,88 @@ function RecordsTable({ user, entries, setEntries, config, branches }) {
           </table>
         </div>
       </div>
+    </div>
+  );
+}
+
+// ─── Notifications Page ─────────────────────────────────────────────────────
+function NotificationsPage({ user, users }) {
+  const [notifications, setNotifications] = useState([]);
+  const [filterUser, setFilterUser] = useState("");
+
+  useEffect(() => {
+    // Try API first, fall back to localStorage
+    fetchAPI("notifications", []).then(apiData => {
+      if (apiData !== null && apiData.length > 0) {
+        setNotifications(apiData);
+        localStorage.setItem(STORAGE_KEYS.notifications, JSON.stringify(apiData));
+      } else {
+        setNotifications(loadData(STORAGE_KEYS.notifications, []));
+      }
+    });
+  }, []);
+
+  const isAdminOrElevated = user.role === "admin" || user.role === "elevated_staff";
+  const visibleNotifs = isAdminOrElevated
+    ? filterUser ? notifications.filter(n => n.forUserId === filterUser).sort((a, b) => new Date(b.date) - new Date(a.date)) : notifications.sort((a, b) => new Date(b.date) - new Date(a.date))
+    : notifications.filter(n => n.forUserId === user.id).sort((a, b) => new Date(b.date) - new Date(a.date));
+
+  const unreadCount = visibleNotifs.filter(n => !n.read).length;
+
+  const handleMarkAsRead = (id) => {
+    const updated = notifications.map(n => n.id === id ? { ...n, read: true } : n);
+    setNotifications(updated);
+    saveData(STORAGE_KEYS.notifications, updated);
+  };
+
+  const handleMarkAllAsRead = () => {
+    const updated = notifications.map(n => visibleNotifs.find(v => v.id === n.id) ? { ...n, read: true } : n);
+    setNotifications(updated);
+    saveData(STORAGE_KEYS.notifications, updated);
+  };
+
+  return (
+    <div>
+      <h2 className="text-xl font-bold text-gray-900 mb-6 flex items-center gap-2"><Bell size={22} className="text-teal-600" /> Notifications</h2>
+
+      {isAdminOrElevated && (
+        <div className="mb-4 flex gap-2">
+          <select value={filterUser} onChange={e => setFilterUser(e.target.value)} className="px-3 py-2 border rounded-lg text-sm">
+            <option value="">All Users</option>
+            {users.filter(u => u.role === "staff").map(u => <option key={u.id} value={u.id}>{u.name}</option>)}
+          </select>
+        </div>
+      )}
+
+      {unreadCount > 0 && (
+        <button onClick={handleMarkAllAsRead} className="mb-4 px-4 py-2 bg-teal-100 text-teal-700 rounded-lg text-sm hover:bg-teal-200 transition-colors">
+          Mark all as read
+        </button>
+      )}
+
+      {visibleNotifs.length === 0 ? (
+        <div className="bg-white rounded-xl border p-8 text-center">
+          <p className="text-gray-500">No notifications</p>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          {visibleNotifs.map(n => (
+            <div key={n.id} className={`bg-white rounded-lg border p-4 transition-colors ${n.read ? "bg-gray-50" : "bg-blue-50 border-blue-200"}`}>
+              <div className="flex items-start justify-between">
+                <div className="flex-1">
+                  <p className={`text-sm ${n.read ? "text-gray-600" : "text-gray-800 font-medium"}`}>{n.message}</p>
+                  <p className="text-xs text-gray-400 mt-1">{formatDateDMY(n.date.split("T")[0])} {n.date.split("T")[1]?.slice(0, 5)}</p>
+                </div>
+                {!n.read && (
+                  <button onClick={() => handleMarkAsRead(n.id)} className="ml-2 px-2 py-1 bg-teal-600 text-white rounded text-xs hover:bg-teal-700">
+                    Mark read
+                  </button>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -1049,6 +1138,9 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
         const totalWaiver = (odType === "Self OD" ? selfOdWaiver : 0) + groupOdWaiver;
         const approvalSubject = (r["Approval Subject"] || r["Waiver Approval Subject"] || "").trim();
         const recordedBy = (r["Recorded By"] || r["Entered By"] || r.recordedBy || "").trim();
+        const paymentMode = (r["Payment Mode"] || r.paymentMode || "").trim();
+        const upiReference = (r["UPI Reference"] || r.upiReference || "").trim();
+        const ptpDate = (r["PTP Date"] || r.ptpDate || "").trim();
 
         newEntries.push({
           id: generateId(), date: rawDate, time: (r.Time || r.time || "00:00").trim(), branch,
@@ -1058,6 +1150,7 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
           selfOdWaiver: odType === "Self OD" ? selfOdWaiver : 0,
           groupOdAmount, numberOfCustomers, customerShare, groupOdPaidAmount, groupOdWaiver,
           totalPaidAmount, waiver: totalWaiver,
+          paymentMode, upiReference, ptpDate, ptpReminderSent: false,
           waiverApproval: totalWaiver > 0 && approvalSubject ? { approverName: (r["Waiver Approver"] || "Bulk Upload").trim(), emailSubject: approvalSubject, approvalDate: rawDate } : null,
           enteredBy: recordedBy || "admin", enteredByName: recordedBy || "Bulk Upload",
         });
@@ -1184,7 +1277,7 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
           {/* Bulk Upload Entries */}
           <div className="bg-white rounded-xl border p-5">
             <h3 className="font-semibold text-gray-800 mb-2 flex items-center gap-2"><Upload size={18} className="text-teal-600" /> Bulk Upload Entries (Historical Data)</h3>
-            <p className="text-sm text-gray-500 mb-3">Upload a CSV file with columns: Date, Branch, Customer Name, Customer ID, Loan Account No., OD Type, Self OD Amount Due, Self OD Paid, Group OD Amount Due, No. of Customers, Group OD Paid, Time, Recorded By, Approval Subject, Waiver Approver</p>
+            <p className="text-sm text-gray-500 mb-3">Upload a CSV file with columns: Date, Branch, Customer Name, Customer ID, Loan Account No., OD Type, Self OD Amount Due, Self OD Paid, Group OD Amount Due, No. of Customers, Group OD Paid, Time, Recorded By, Approval Subject, Waiver Approver, Payment Mode, UPI Reference, PTP Date</p>
             <p className="text-xs text-gray-400 mb-3">Date format: dd-mm-yyyy or yyyy-mm-dd. OD Type: "Self OD" or "Group OD". Waivers are auto-calculated. "Recorded By" captures who collected the payment.</p>
             <label className="inline-flex items-center gap-2 px-4 py-2 bg-teal-600 text-white rounded-lg text-sm hover:bg-teal-700 cursor-pointer transition-colors">
               <Upload size={14} /> Choose CSV File
@@ -1217,7 +1310,7 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
             <h3 className="font-semibold text-gray-800 mb-3">Download CSV Templates</h3>
             <div className="flex flex-wrap gap-3">
               <button onClick={() => {
-                const csv = "Date,Branch,Customer Name,Customer ID,Loan Account No.,OD Type,Self OD Amount Due,Self OD Paid,Group OD Amount Due,No. of Customers,Group OD Paid,Time,Recorded By,Approval Subject,Waiver Approver\n01-04-2025,Annur,Sample Customer,CUST001,LA001,Group OD,0,0,50000,5,8000,10:30,Vijila,,";
+                const csv = "Date,Branch,Customer Name,Customer ID,Loan Account No.,OD Type,Self OD Amount Due,Self OD Paid,Group OD Amount Due,No. of Customers,Group OD Paid,Time,Recorded By,Approval Subject,Waiver Approver,Payment Mode,UPI Reference,PTP Date\n01-04-2025,Annur,Sample Customer,CUST001,LA001,Group OD,0,0,50000,5,8000,10:30,Vijila,,,Cash,,";
                 const blob = new Blob([csv], { type: "text/csv" });
                 const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "entries-template.csv"; a.click();
               }} className="px-3 py-2 bg-gray-100 text-gray-700 rounded-lg text-sm hover:bg-gray-200 transition-colors flex items-center gap-1">
@@ -1411,28 +1504,103 @@ export default function App() {
   const [branches, setBranches] = useState([]);
   const [config, setConfig] = useState(DEFAULT_CONFIG);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [notifications, setNotifications] = useState([]);
 
   useEffect(() => {
-    const savedVersion = loadData(STORAGE_KEYS.version, 0);
-    const needsMigration = savedVersion < APP_VERSION;
+    // Try to load from API first, fall back to localStorage
+    const initData = async () => {
+      // Fetch all collections from server in parallel
+      const [apiEntries, apiUsers, apiBranches, apiConfig, apiNotifications] = await Promise.all([
+        fetchAPI("entries", []),
+        fetchAPI("users", []),
+        fetchAPI("branches", []),
+        fetchAPI("config", DEFAULT_CONFIG),
+        fetchAPI("notifications", []),
+      ]);
 
-    if (needsMigration) {
-      // Force re-seed users and branches on version bump
-      saveData(STORAGE_KEYS.users, DEFAULT_USERS); setUsers(DEFAULT_USERS);
-      saveData(STORAGE_KEYS.branches, DEFAULT_BRANCHES); setBranches(DEFAULT_BRANCHES);
-      saveData(STORAGE_KEYS.version, APP_VERSION);
-    } else {
-      const savedUsers = loadData(STORAGE_KEYS.users, null);
-      if (!savedUsers) { saveData(STORAGE_KEYS.users, DEFAULT_USERS); setUsers(DEFAULT_USERS); }
-      else setUsers(savedUsers);
+      // Determine if API is available (at least one non-null response)
+      const apiAvailable = apiEntries !== null || apiUsers !== null;
 
-      const savedBranches = loadData(STORAGE_KEYS.branches, null);
-      if (!savedBranches) { saveData(STORAGE_KEYS.branches, DEFAULT_BRANCHES); setBranches(DEFAULT_BRANCHES); }
-      else setBranches(savedBranches);
-    }
+      // ── Users ──
+      let finalUsers;
+      if (apiAvailable && apiUsers && apiUsers.length > 0) {
+        finalUsers = apiUsers;
+        localStorage.setItem(STORAGE_KEYS.users, JSON.stringify(finalUsers));
+      } else {
+        const savedVersion = loadData(STORAGE_KEYS.version, 0);
+        if (savedVersion < APP_VERSION) {
+          finalUsers = DEFAULT_USERS;
+          saveData(STORAGE_KEYS.users, DEFAULT_USERS);
+          saveData(STORAGE_KEYS.version, APP_VERSION);
+        } else {
+          finalUsers = loadData(STORAGE_KEYS.users, DEFAULT_USERS);
+        }
+      }
+      setUsers(finalUsers);
 
-    setConfig(loadData(STORAGE_KEYS.config, DEFAULT_CONFIG));
-    setEntries(loadData(STORAGE_KEYS.entries, []));
+      // ── Branches ──
+      let finalBranches;
+      if (apiAvailable && apiBranches && apiBranches.length > 0) {
+        finalBranches = apiBranches;
+        localStorage.setItem(STORAGE_KEYS.branches, JSON.stringify(finalBranches));
+      } else {
+        const savedVersion = loadData(STORAGE_KEYS.version, 0);
+        if (savedVersion < APP_VERSION) {
+          finalBranches = DEFAULT_BRANCHES;
+          saveData(STORAGE_KEYS.branches, DEFAULT_BRANCHES);
+        } else {
+          finalBranches = loadData(STORAGE_KEYS.branches, DEFAULT_BRANCHES);
+        }
+      }
+      setBranches(finalBranches);
+
+      // ── Config ──
+      const finalConfig = (apiAvailable && apiConfig && apiConfig.companyName) ? apiConfig : loadData(STORAGE_KEYS.config, DEFAULT_CONFIG);
+      setConfig(finalConfig);
+      localStorage.setItem(STORAGE_KEYS.config, JSON.stringify(finalConfig));
+
+      // ── Entries ──
+      let allEntries;
+      if (apiAvailable && apiEntries !== null) {
+        // Merge: API is source of truth, but if localStorage has entries not on server, push them up
+        const localEntries = loadData(STORAGE_KEYS.entries, []);
+        if (apiEntries.length === 0 && localEntries.length > 0) {
+          // First time connecting — migrate localStorage entries to server
+          allEntries = localEntries;
+          fetch(`${API_BASE}/entries`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(localEntries),
+          }).catch(err => console.warn("[API migrate entries]", err.message));
+        } else {
+          allEntries = apiEntries;
+        }
+        localStorage.setItem(STORAGE_KEYS.entries, JSON.stringify(allEntries));
+      } else {
+        allEntries = loadData(STORAGE_KEYS.entries, []);
+      }
+      setEntries(allEntries);
+
+      // ── Notifications ──
+      const finalNotifications = (apiAvailable && apiNotifications !== null) ? apiNotifications : loadData(STORAGE_KEYS.notifications, []);
+      setNotifications(finalNotifications);
+      localStorage.setItem(STORAGE_KEYS.notifications, JSON.stringify(finalNotifications));
+
+      // If we loaded from localStorage but API is now available, push everything up
+      if (apiAvailable && apiEntries !== null && apiEntries.length === 0 && loadData(STORAGE_KEYS.users, []).length > 0) {
+        // Migrate all local data to server
+        const migrateCollections = { users: finalUsers, branches: finalBranches, config: finalConfig, notifications: finalNotifications };
+        for (const [col, data] of Object.entries(migrateCollections)) {
+          fetch(`${API_BASE}/${col}`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(data),
+          }).catch(err => console.warn(`[API migrate ${col}]`, err.message));
+        }
+      }
+    };
+
+    initData();
   }, []);
 
   const handleLogin = (u) => { setUser(u); setPage("dashboard"); };
@@ -1443,10 +1611,15 @@ export default function App() {
   const isAdmin = user.role === "admin";
   const isElevated = user.role === "elevated_staff";
 
+  const unreadNotificationsCount = notifications.filter(n =>
+    (user.role === "admin" || user.role === "elevated_staff" ? true : n.forUserId === user.id) && !n.read
+  ).length;
+
   const navItems = [
     { key: "dashboard", icon: LayoutDashboard, label: "Dashboard" },
     ...(!isElevated ? [{ key: "entry", icon: Plus, label: "New Entry" }] : []),
     { key: "records", icon: FileText, label: "Records" },
+    { key: "notifications", icon: Bell, label: "Notifications", badge: unreadNotificationsCount > 0 ? unreadNotificationsCount : null },
     ...(isAdmin ? [{ key: "admin", icon: Shield, label: "Admin" }] : []),
   ];
 
@@ -1482,8 +1655,9 @@ export default function App() {
           <nav className="p-3 space-y-1">
             {navItems.map(item => (
               <button key={item.key} onClick={() => { setPage(item.key); setSidebarOpen(false); }}
-                className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${page === item.key ? "bg-teal-50 text-teal-700" : "text-gray-600 hover:bg-gray-50"}`}>
+                className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors relative ${page === item.key ? "bg-teal-50 text-teal-700" : "text-gray-600 hover:bg-gray-50"}`}>
                 <item.icon size={18} /> {item.label}
+                {item.badge && <span className="absolute right-2 top-1/2 -translate-y-1/2 inline-flex items-center justify-center w-5 h-5 bg-red-600 text-white text-xs font-bold rounded-full">{item.badge}</span>}
               </button>
             ))}
           </nav>
@@ -1497,6 +1671,7 @@ export default function App() {
           {page === "dashboard" && <Dashboard user={user} entries={entries} branches={branches} config={config} />}
           {page === "entry" && <EntryForm user={user} branches={branches} entries={entries} setEntries={setEntries} setPage={setPage} />}
           {page === "records" && <RecordsTable user={user} entries={entries} setEntries={setEntries} config={config} branches={branches} />}
+          {page === "notifications" && <NotificationsPage user={user} users={users} />}
           {page === "admin" && user.role === "admin" && <AdminPanel users={users} setUsers={setUsers} branches={branches} setBranches={setBranches} config={config} setConfig={setConfig} entries={entries} setEntries={setEntries} />}
         </main>
       </div>
