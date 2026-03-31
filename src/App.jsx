@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend, LineChart, Line } from "recharts";
-import { Plus, Trash2, LogOut, Settings, Users, GitBranch, LayoutDashboard, FileText, ChevronDown, ChevronRight, ArrowLeft, Search, Eye, EyeOff, Edit2, Save, X, AlertTriangle, CheckCircle, Database, Shield, UserPlus, ChevronUp, Download, Calendar, Tag, Lock } from "lucide-react";
+import { Plus, Trash2, LogOut, Settings, Users, GitBranch, LayoutDashboard, FileText, ChevronDown, ChevronRight, ArrowLeft, Search, Eye, EyeOff, Edit2, Save, X, AlertTriangle, CheckCircle, Database, Shield, UserPlus, ChevronUp, Download, Calendar, Tag, Lock, Upload } from "lucide-react";
 
 // ─── Constants & Helpers ────────────────────────────────────────────────────
 const COLORS = ["#0f766e", "#06b6d4", "#8b5cf6", "#f59e0b", "#ef4444", "#10b981", "#ec4899", "#6366f1", "#14b8a6", "#f97316"];
@@ -36,6 +36,11 @@ const formatLakhs = (num) => {
 const generateId = () => Date.now().toString(36) + Math.random().toString(36).substr(2, 9);
 const nowDate = () => new Date().toISOString().split("T")[0];
 const nowTime = () => new Date().toTimeString().slice(0, 5);
+const formatDateDMY = (isoDate) => {
+  if (!isoDate) return "";
+  const [y, m, d] = isoDate.split("-");
+  return `${d}-${m}-${y}`;
+};
 
 const loadData = (key, fallback) => {
   try { const d = localStorage.getItem(key); return d ? JSON.parse(d) : fallback; }
@@ -204,6 +209,7 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
   const [numberOfCustomers, setNumberOfCustomers] = useState("");
   const [groupOdAmount, setGroupOdAmount] = useState("");
   const [groupOdPaidAmount, setGroupOdPaidAmount] = useState("");
+  const [approvalEmailSubject, setApprovalEmailSubject] = useState("");
   const [showWaiverModal, setShowWaiverModal] = useState(false);
   const [pendingEntry, setPendingEntry] = useState(null);
 
@@ -238,6 +244,7 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
     if (groupOdDue <= 0) { alert("Please enter Group OD Amount Due."); return; }
     if (groupOdPaid < 0) { alert("Group OD Paid Amount cannot be negative."); return; }
     if (groupOdPaid > customerShare) { alert("Group OD Paid Amount cannot exceed the Customer Share."); return; }
+    if (totalWaiver > 0 && !approvalEmailSubject.trim()) { alert("Waiver detected. Please enter the approval email subject line."); return; }
 
     // Check duplicate
     const isDup = entries.some(e =>
@@ -262,7 +269,7 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
       // Totals for dashboard
       totalPaidAmount,
       waiver: totalWaiver,
-      waiverApproval: null,
+      waiverApproval: totalWaiver > 0 ? { approverName: user.name, emailSubject: approvalEmailSubject.trim(), approvalDate: date } : null,
       enteredBy: user.id, enteredByName: user.name,
     };
 
@@ -280,7 +287,7 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
     saveData(STORAGE_KEYS.entries, updated);
     // Reset form
     setCustomerName(""); setCustomerId(""); setLoanAccountNo("");
-    setOdType("");
+    setOdType(""); setApprovalEmailSubject("");
     setSelfOdAmountDue(""); setSelfOdPaidAmount("");
     setNumberOfCustomers(""); setGroupOdAmount(""); setGroupOdPaidAmount("");
     setPage("records");
@@ -363,7 +370,7 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
             {/* Self OD section — only for "Self OD" type */}
             {odType === "Self OD" && (
               <div className="mb-5">
-                <h4 className="text-xs font-semibold text-indigo-600 uppercase tracking-wide mb-3 pb-1 border-b border-indigo-100">Section 1 — Self OD</h4>
+                <h4 className="text-xs font-semibold text-indigo-600 uppercase tracking-wide mb-3 pb-1 border-b border-indigo-100">Self OD</h4>
                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-1">Self OD Amount Due *</label>
@@ -379,7 +386,7 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
                     <label className="block text-sm font-medium text-gray-700 mb-1">Waiver (Auto)</label>
                     <input readOnly value={formatINR(selfOdWaiver)}
                       className={`w-full px-3 py-2 border rounded-lg font-semibold cursor-default ${selfOdWaiver > 0 ? "bg-amber-50 border-amber-300 text-amber-700" : "bg-green-50 border-green-300 text-green-700"}`} />
-                    {selfOdWaiver > 0 && <p className="text-xs text-amber-600 mt-1 font-medium">⚠ Approval required</p>}
+                    {selfOdWaiver > 0 && <p className="text-xs text-amber-600 mt-1 font-medium">Approval required</p>}
                   </div>
                 </div>
               </div>
@@ -388,7 +395,7 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
             {/* Group OD section */}
             <div>
               <h4 className={`text-xs font-semibold uppercase tracking-wide mb-3 pb-1 border-b ${odType === "Self OD" ? "text-indigo-600 border-indigo-100" : "text-teal-600 border-teal-100"}`}>
-                {odType === "Self OD" ? "Section 2 — Group OD" : "Group OD"}
+                Group OD
               </h4>
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
                 <div>
@@ -419,11 +426,24 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
                   <label className="block text-sm font-medium text-gray-700 mb-1">Waiver (Auto)</label>
                   <input readOnly value={formatINR(groupOdWaiver)}
                     className={`w-full px-3 py-2 border rounded-lg font-semibold cursor-default ${groupOdWaiver > 0 ? "bg-amber-50 border-amber-300 text-amber-700" : "bg-green-50 border-green-300 text-green-700"}`} />
-                  {groupOdWaiver > 0 && <p className="text-xs text-amber-600 mt-1 font-medium">⚠ Approval required</p>}
+                  {groupOdWaiver > 0 && <p className="text-xs text-amber-600 mt-1 font-medium">Approval required</p>}
                 </div>
               </div>
             </div>
           </>
+        )}
+
+        {/* Inline Approval Email Subject — shown when any waiver > 0 */}
+        {totalWaiver > 0 && (
+          <div className="mt-4 p-4 bg-amber-50 rounded-lg border border-amber-200">
+            <div className="flex items-center gap-2 mb-2">
+              <AlertTriangle size={16} className="text-amber-600" />
+              <p className="text-sm font-semibold text-amber-800">Waiver of {formatINR(totalWaiver)} requires approval</p>
+            </div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Approval Email Subject *</label>
+            <input type="text" value={approvalEmailSubject} onChange={e => setApprovalEmailSubject(e.target.value)}
+              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-amber-500 focus:border-amber-500" placeholder="e.g. OD Waiver Approval - Branch Name - Customer Name" />
+          </div>
         )}
       </div>
 
@@ -553,7 +573,7 @@ function RecordsTable({ user, entries, setEntries, config, branches }) {
                 <React.Fragment key={e.id}>
                   <tr className="border-b hover:bg-gray-50 cursor-pointer" onClick={() => setExpandedId(expandedId === e.id ? null : e.id)}>
                     <td className="px-4 py-3">
-                      <div className="font-medium">{e.date}</div>
+                      <div className="font-medium">{formatDateDMY(e.date)}</div>
                       <div className="text-xs text-gray-400">{e.time}</div>
                     </td>
                     <td className="px-4 py-3">{e.branch}</td>
@@ -616,7 +636,7 @@ function RecordsTable({ user, entries, setEntries, config, branches }) {
                         {/* Meta info */}
                         <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 text-sm">
                           <div><span className="text-gray-500">Entered By:</span> <span className="font-medium">{e.enteredByName || e.enteredBy}</span></div>
-                          <div><span className="text-gray-500">Entry Time:</span> <span className="font-medium">{e.date} {e.time}</span></div>
+                          <div><span className="text-gray-500">Entry Time:</span> <span className="font-medium">{formatDateDMY(e.date)} {e.time}</span></div>
                           <div><span className="text-gray-500">Total Paid:</span> <span className="font-medium text-teal-700">{formatINR(paid)}</span></div>
                         </div>
                         {e.waiverApproval && (
@@ -749,7 +769,7 @@ function Dashboard({ user, entries, branches, config }) {
             <tbody>
               {branchEntries.slice(0, 20).map(e => (
                 <tr key={e.id} className="border-b">
-                  <td className="px-4 py-2">{e.date}</td>
+                  <td className="px-4 py-2">{formatDateDMY(e.date)}</td>
                   <td className="px-4 py-2">{e.customerName} <span className="text-xs text-gray-400">({e.customerId})</span></td>
                   <td className="px-4 py-2 text-right text-teal-700 font-medium">{formatINR(getEntryPaid(e))}</td>
                   <td className="px-4 py-2 text-right">{e.waiver > 0 ? <span className="text-amber-600">{formatINR(e.waiver)}</span> : <span className="text-gray-400">—</span>}</td>
@@ -934,11 +954,127 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
     setEntries([]); saveData(STORAGE_KEYS.entries, []);
   };
 
+  // ── Bulk Upload Parsers ──
+  const parseCSV = (text) => {
+    const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
+    if (lines.length < 2) return [];
+    const headers = lines[0].split(",").map(h => h.replace(/^"|"$/g, "").trim());
+    return lines.slice(1).map(line => {
+      const vals = [];
+      let current = ""; let inQuote = false;
+      for (const ch of line) {
+        if (ch === '"') { inQuote = !inQuote; }
+        else if (ch === "," && !inQuote) { vals.push(current.trim()); current = ""; }
+        else { current += ch; }
+      }
+      vals.push(current.trim());
+      const obj = {};
+      headers.forEach((h, i) => { obj[h] = vals[i] || ""; });
+      return obj;
+    });
+  };
+
+  const handleBulkBranches = (e) => {
+    const file = e.target.files[0]; if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const rows = parseCSV(ev.target.result);
+      const nameKey = Object.keys(rows[0] || {}).find(k => k.toLowerCase().includes("branch") || k.toLowerCase().includes("name")) || Object.keys(rows[0] || {})[0];
+      if (!nameKey) { alert("Could not find a branch name column."); return; }
+      const newBranches = rows.map(r => r[nameKey]?.trim()).filter(Boolean);
+      const unique = [...new Set([...branches, ...newBranches])];
+      setBranches(unique); saveData(STORAGE_KEYS.branches, unique);
+      alert(`Added ${unique.length - branches.length} new branches. Total: ${unique.length}`);
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
+  const handleBulkUsers = (e) => {
+    const file = e.target.files[0]; if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const rows = parseCSV(ev.target.result);
+      let added = 0;
+      const updated = [...users];
+      rows.forEach(r => {
+        const username = (r.username || r.Username || "").trim();
+        const name = (r.name || r.Name || r["Full Name"] || "").trim();
+        const role = (r.role || r.Role || "staff").trim();
+        const branch = (r.branch || r.Branch || "").trim();
+        const password = (r.password || r.Password || "Dhanam@123").trim();
+        if (!username || !name) return;
+        if (updated.some(u => u.username === username)) return;
+        updated.push({ id: generateId(), username, password, name, role, branch, active: true, mustChangePassword: true });
+        added++;
+      });
+      setUsers(updated); saveData(STORAGE_KEYS.users, updated);
+      alert(`Added ${added} new users. Total: ${updated.length}`);
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
+  const handleBulkEntries = (e) => {
+    const file = e.target.files[0]; if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const rows = parseCSV(ev.target.result);
+      let added = 0;
+      const newEntries = [];
+      rows.forEach(r => {
+        const customerName = (r["Customer Name"] || r.customerName || "").trim();
+        const customerId = (r["Customer ID"] || r.customerId || "").trim();
+        const loanAccountNo = (r["Loan Account No"] || r["Loan Account No."] || r.loanAccountNo || "").trim();
+        const branch = (r.Branch || r.branch || "").trim();
+        if (!customerName || !customerId || !branch) return;
+        // Parse date: accept dd-mm-yyyy, dd/mm/yyyy, or yyyy-mm-dd
+        let rawDate = (r.Date || r.date || "").trim();
+        if (rawDate.includes("/")) rawDate = rawDate.replace(/\//g, "-");
+        if (/^\d{2}-\d{2}-\d{4}$/.test(rawDate)) {
+          const [d, m, y] = rawDate.split("-");
+          rawDate = `${y}-${m}-${d}`;
+        }
+        if (!rawDate) rawDate = nowDate();
+        const odType = (r["OD Type"] || r.odType || "Group OD").trim();
+        const selfOdAmountDue = Number(r["Self OD Amount Due"] || r.selfOdAmountDue || 0);
+        const selfOdPaidAmount = Number(r["Self OD Paid"] || r.selfOdPaidAmount || 0);
+        const selfOdWaiver = Math.max(0, selfOdAmountDue - selfOdPaidAmount);
+        const groupOdAmount = Number(r["Group OD Amount Due"] || r["Group OD Amount"] || r.groupOdAmount || 0);
+        const numberOfCustomers = Number(r["No. of Customers"] || r["No. of Customers in Group"] || r.numberOfCustomers || 1);
+        const customerShare = numberOfCustomers > 0 ? Math.round(groupOdAmount / numberOfCustomers) : 0;
+        const groupOdPaidAmount = Number(r["Group OD Paid"] || r.groupOdPaidAmount || 0);
+        const groupOdWaiver = Math.max(0, customerShare - groupOdPaidAmount);
+        const totalPaidAmount = (odType === "Self OD" ? selfOdPaidAmount : 0) + groupOdPaidAmount;
+        const totalWaiver = (odType === "Self OD" ? selfOdWaiver : 0) + groupOdWaiver;
+        const approvalSubject = (r["Approval Subject"] || r["Waiver Approval Subject"] || "").trim();
+
+        newEntries.push({
+          id: generateId(), date: rawDate, time: (r.Time || r.time || "00:00").trim(), branch,
+          customerName, customerId, loanAccountNo, odType,
+          selfOdAmountDue: odType === "Self OD" ? selfOdAmountDue : 0,
+          selfOdPaidAmount: odType === "Self OD" ? selfOdPaidAmount : 0,
+          selfOdWaiver: odType === "Self OD" ? selfOdWaiver : 0,
+          groupOdAmount, numberOfCustomers, customerShare, groupOdPaidAmount, groupOdWaiver,
+          totalPaidAmount, waiver: totalWaiver,
+          waiverApproval: totalWaiver > 0 && approvalSubject ? { approverName: (r["Waiver Approver"] || "Bulk Upload").trim(), emailSubject: approvalSubject, approvalDate: rawDate } : null,
+          enteredBy: "admin", enteredByName: "Bulk Upload",
+        });
+        added++;
+      });
+      const allEntries = [...newEntries, ...entries];
+      setEntries(allEntries); saveData(STORAGE_KEYS.entries, allEntries);
+      alert(`Imported ${added} entries. Total: ${allEntries.length}`);
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
   return (
     <div>
       <h2 className="text-xl font-bold text-gray-900 mb-4 flex items-center gap-2"><Settings size={22} className="text-teal-600" /> Admin Panel</h2>
-      <div className="flex gap-2 mb-6">
-        {[{ key: "users", icon: Users, label: "Users" }, { key: "branches", icon: GitBranch, label: "Branches" }, { key: "settings", icon: Settings, label: "Settings" }].map(t => (
+      <div className="flex flex-wrap gap-2 mb-6">
+        {[{ key: "users", icon: Users, label: "Users" }, { key: "branches", icon: GitBranch, label: "Branches" }, { key: "bulk", icon: Upload, label: "Bulk Upload" }, { key: "settings", icon: Settings, label: "Settings" }].map(t => (
           <button key={t.key} onClick={() => setTab(t.key)}
             className={`flex items-center gap-1.5 px-4 py-2 rounded-lg text-sm font-medium transition-colors ${tab === t.key ? "bg-teal-600 text-white" : "bg-white text-gray-600 border hover:bg-gray-50"}`}>
             <t.icon size={16} /> {t.label}
@@ -1038,6 +1174,69 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
                 )}
               </div>
             ))}
+          </div>
+        </div>
+      )}
+
+      {tab === "bulk" && (
+        <div className="space-y-4">
+          {/* Bulk Upload Entries */}
+          <div className="bg-white rounded-xl border p-5">
+            <h3 className="font-semibold text-gray-800 mb-2 flex items-center gap-2"><Upload size={18} className="text-teal-600" /> Bulk Upload Entries (Historical Data)</h3>
+            <p className="text-sm text-gray-500 mb-3">Upload a CSV file with columns: Date, Branch, Customer Name, Customer ID, Loan Account No., OD Type, Self OD Amount Due, Self OD Paid, Group OD Amount Due, No. of Customers, Group OD Paid, Time, Approval Subject, Waiver Approver</p>
+            <p className="text-xs text-gray-400 mb-3">Date format: dd-mm-yyyy or yyyy-mm-dd. OD Type: "Self OD" or "Group OD". Waivers are auto-calculated.</p>
+            <label className="inline-flex items-center gap-2 px-4 py-2 bg-teal-600 text-white rounded-lg text-sm hover:bg-teal-700 cursor-pointer transition-colors">
+              <Upload size={14} /> Choose CSV File
+              <input type="file" accept=".csv" onChange={handleBulkEntries} className="hidden" />
+            </label>
+          </div>
+
+          {/* Bulk Upload Branches */}
+          <div className="bg-white rounded-xl border p-5">
+            <h3 className="font-semibold text-gray-800 mb-2 flex items-center gap-2"><GitBranch size={18} className="text-teal-600" /> Bulk Upload Branches</h3>
+            <p className="text-sm text-gray-500 mb-3">Upload a CSV with a "Branch" or "Name" column. Duplicates are automatically skipped.</p>
+            <label className="inline-flex items-center gap-2 px-4 py-2 bg-teal-600 text-white rounded-lg text-sm hover:bg-teal-700 cursor-pointer transition-colors">
+              <Upload size={14} /> Choose CSV File
+              <input type="file" accept=".csv" onChange={handleBulkBranches} className="hidden" />
+            </label>
+          </div>
+
+          {/* Bulk Upload Users */}
+          <div className="bg-white rounded-xl border p-5">
+            <h3 className="font-semibold text-gray-800 mb-2 flex items-center gap-2"><Users size={18} className="text-teal-600" /> Bulk Upload Users</h3>
+            <p className="text-sm text-gray-500 mb-3">Upload a CSV with columns: username, name, role (staff/elevated_staff/admin), branch, password (optional, defaults to Dhanam@123). Existing usernames are skipped.</p>
+            <label className="inline-flex items-center gap-2 px-4 py-2 bg-teal-600 text-white rounded-lg text-sm hover:bg-teal-700 cursor-pointer transition-colors">
+              <Upload size={14} /> Choose CSV File
+              <input type="file" accept=".csv" onChange={handleBulkUsers} className="hidden" />
+            </label>
+          </div>
+
+          {/* Download Templates */}
+          <div className="bg-white rounded-xl border p-5">
+            <h3 className="font-semibold text-gray-800 mb-3">Download CSV Templates</h3>
+            <div className="flex flex-wrap gap-3">
+              <button onClick={() => {
+                const csv = "Date,Branch,Customer Name,Customer ID,Loan Account No.,OD Type,Self OD Amount Due,Self OD Paid,Group OD Amount Due,No. of Customers,Group OD Paid,Time,Approval Subject,Waiver Approver\n01-04-2025,Annur,Sample Customer,CUST001,LA001,Group OD,0,0,50000,5,8000,10:30,,";
+                const blob = new Blob([csv], { type: "text/csv" });
+                const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "entries-template.csv"; a.click();
+              }} className="px-3 py-2 bg-gray-100 text-gray-700 rounded-lg text-sm hover:bg-gray-200 transition-colors flex items-center gap-1">
+                <Download size={14} /> Entries Template
+              </button>
+              <button onClick={() => {
+                const csv = "Branch\nNew Branch 1\nNew Branch 2";
+                const blob = new Blob([csv], { type: "text/csv" });
+                const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "branches-template.csv"; a.click();
+              }} className="px-3 py-2 bg-gray-100 text-gray-700 rounded-lg text-sm hover:bg-gray-200 transition-colors flex items-center gap-1">
+                <Download size={14} /> Branches Template
+              </button>
+              <button onClick={() => {
+                const csv = "username,name,role,branch,password\njohn,John Doe,staff,Annur,Dhanam@123";
+                const blob = new Blob([csv], { type: "text/csv" });
+                const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "users-template.csv"; a.click();
+              }} className="px-3 py-2 bg-gray-100 text-gray-700 rounded-lg text-sm hover:bg-gray-200 transition-colors flex items-center gap-1">
+                <Download size={14} /> Users Template
+              </button>
+            </div>
           </div>
         </div>
       )}
