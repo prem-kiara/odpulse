@@ -78,7 +78,7 @@ const exportToCSV = (entries, filename) => {
     "Self OD Amount Due", "Self OD Paid", "Self OD Waiver",
     "Group OD Amount Due", "No. of Customers in Group", "Customer Share (Auto)", "Group OD Paid", "Group OD Waiver",
     "Total Paid", "Total Waiver",
-    "Waiver Approver", "Approval Subject", "Approval Date", "Entered By"
+    "Waiver Approver", "Approval Subject", "Approval Date", "Recorded By"
   ]];
   entries.forEach(e => {
     const customerShare = e.customerShare !== undefined ? e.customerShare : (e.numberOfCustomers > 0 ? Math.round(e.groupOdAmount / e.numberOfCustomers) : 0);
@@ -1048,6 +1048,7 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
         const totalPaidAmount = (odType === "Self OD" ? selfOdPaidAmount : 0) + groupOdPaidAmount;
         const totalWaiver = (odType === "Self OD" ? selfOdWaiver : 0) + groupOdWaiver;
         const approvalSubject = (r["Approval Subject"] || r["Waiver Approval Subject"] || "").trim();
+        const recordedBy = (r["Recorded By"] || r["Entered By"] || r.recordedBy || "").trim();
 
         newEntries.push({
           id: generateId(), date: rawDate, time: (r.Time || r.time || "00:00").trim(), branch,
@@ -1058,7 +1059,7 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
           groupOdAmount, numberOfCustomers, customerShare, groupOdPaidAmount, groupOdWaiver,
           totalPaidAmount, waiver: totalWaiver,
           waiverApproval: totalWaiver > 0 && approvalSubject ? { approverName: (r["Waiver Approver"] || "Bulk Upload").trim(), emailSubject: approvalSubject, approvalDate: rawDate } : null,
-          enteredBy: "admin", enteredByName: "Bulk Upload",
+          enteredBy: recordedBy || "admin", enteredByName: recordedBy || "Bulk Upload",
         });
         added++;
       });
@@ -1183,8 +1184,8 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
           {/* Bulk Upload Entries */}
           <div className="bg-white rounded-xl border p-5">
             <h3 className="font-semibold text-gray-800 mb-2 flex items-center gap-2"><Upload size={18} className="text-teal-600" /> Bulk Upload Entries (Historical Data)</h3>
-            <p className="text-sm text-gray-500 mb-3">Upload a CSV file with columns: Date, Branch, Customer Name, Customer ID, Loan Account No., OD Type, Self OD Amount Due, Self OD Paid, Group OD Amount Due, No. of Customers, Group OD Paid, Time, Approval Subject, Waiver Approver</p>
-            <p className="text-xs text-gray-400 mb-3">Date format: dd-mm-yyyy or yyyy-mm-dd. OD Type: "Self OD" or "Group OD". Waivers are auto-calculated.</p>
+            <p className="text-sm text-gray-500 mb-3">Upload a CSV file with columns: Date, Branch, Customer Name, Customer ID, Loan Account No., OD Type, Self OD Amount Due, Self OD Paid, Group OD Amount Due, No. of Customers, Group OD Paid, Time, Recorded By, Approval Subject, Waiver Approver</p>
+            <p className="text-xs text-gray-400 mb-3">Date format: dd-mm-yyyy or yyyy-mm-dd. OD Type: "Self OD" or "Group OD". Waivers are auto-calculated. "Recorded By" captures who collected the payment.</p>
             <label className="inline-flex items-center gap-2 px-4 py-2 bg-teal-600 text-white rounded-lg text-sm hover:bg-teal-700 cursor-pointer transition-colors">
               <Upload size={14} /> Choose CSV File
               <input type="file" accept=".csv" onChange={handleBulkEntries} className="hidden" />
@@ -1216,7 +1217,7 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
             <h3 className="font-semibold text-gray-800 mb-3">Download CSV Templates</h3>
             <div className="flex flex-wrap gap-3">
               <button onClick={() => {
-                const csv = "Date,Branch,Customer Name,Customer ID,Loan Account No.,OD Type,Self OD Amount Due,Self OD Paid,Group OD Amount Due,No. of Customers,Group OD Paid,Time,Approval Subject,Waiver Approver\n01-04-2025,Annur,Sample Customer,CUST001,LA001,Group OD,0,0,50000,5,8000,10:30,,";
+                const csv = "Date,Branch,Customer Name,Customer ID,Loan Account No.,OD Type,Self OD Amount Due,Self OD Paid,Group OD Amount Due,No. of Customers,Group OD Paid,Time,Recorded By,Approval Subject,Waiver Approver\n01-04-2025,Annur,Sample Customer,CUST001,LA001,Group OD,0,0,50000,5,8000,10:30,Vijila,,";
                 const blob = new Blob([csv], { type: "text/csv" });
                 const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "entries-template.csv"; a.click();
               }} className="px-3 py-2 bg-gray-100 text-gray-700 rounded-lg text-sm hover:bg-gray-200 transition-colors flex items-center gap-1">
