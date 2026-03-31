@@ -6,7 +6,7 @@ import { Plus, Trash2, LogOut, Settings, Users, GitBranch, LayoutDashboard, File
 const COLORS = ["#0f766e", "#06b6d4", "#8b5cf6", "#f59e0b", "#ef4444", "#10b981", "#ec4899", "#6366f1", "#14b8a6", "#f97316"];
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 const STORAGE_KEYS = { entries: "odpulse_entries", users: "odpulse_users", branches: "odpulse_branches", config: "odpulse_config", version: "odpulse_version", notifications: "odpulse_notifications" };
-const APP_VERSION = 3; // bump this to force re-seed users & branches
+const APP_VERSION = 4; // bump this to force re-seed users & branches
 
 const formatINR = (num) => {
   if (!num && num !== 0) return "Rs. 0";
