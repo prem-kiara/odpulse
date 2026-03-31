@@ -81,29 +81,7 @@ const COLLECTIONS = {
   notifications: "notifications.json",
 };
 
-// GET /api/:collection
-app.get("/api/:collection", (req, res) => {
-  const file = COLLECTIONS[req.params.collection];
-  if (!file) return res.status(404).json({ error: "Unknown collection" });
-  const fallback = req.params.collection === "config" ? DEFAULT_CONFIG : [];
-  res.json(loadJSON(file, fallback));
-});
-
-// POST /api/:collection — full replace
-app.post("/api/:collection", (req, res) => {
-  const file = COLLECTIONS[req.params.collection];
-  if (!file) return res.status(404).json({ error: "Unknown collection" });
-  saveJSON(file, req.body);
-  res.json({ ok: true, count: Array.isArray(req.body) ? req.body.length : 1 });
-});
-
-// POST /api/entries/append — append a single entry (used by frontend on save)
-app.post("/api/entries/append", (req, res) => {
-  const entries = loadJSON("entries.json", []);
-  entries.unshift(req.body);
-  saveJSON("entries.json", entries);
-  res.json({ ok: true, count: entries.length });
-});
+// ── Specific routes FIRST (before the generic :collection wildcard) ──
 
 // Health check
 app.get("/api/health", (req, res) => {
@@ -121,6 +99,38 @@ app.get("/api/health", (req, res) => {
       notifications: loadJSON("notifications.json", []).length,
     }
   });
+});
+
+// POST /api/entries/append — append a single entry (used by frontend on save)
+app.post("/api/entries/append", (req, res) => {
+  const entries = loadJSON("entries.json", []);
+  entries.unshift(req.body);
+  saveJSON("entries.json", entries);
+  res.json({ ok: true, count: entries.length });
+});
+
+// Manual PTP reminder trigger
+app.post("/api/ptp-check", async (req, res) => {
+  await checkPTPReminders();
+  res.json({ ok: true, message: "PTP check completed" });
+});
+
+// ── Generic CRUD (wildcard — must be LAST) ──
+
+// GET /api/:collection
+app.get("/api/:collection", (req, res) => {
+  const file = COLLECTIONS[req.params.collection];
+  if (!file) return res.status(404).json({ error: "Unknown collection" });
+  const fallback = req.params.collection === "config" ? DEFAULT_CONFIG : [];
+  res.json(loadJSON(file, fallback));
+});
+
+// POST /api/:collection — full replace
+app.post("/api/:collection", (req, res) => {
+  const file = COLLECTIONS[req.params.collection];
+  if (!file) return res.status(404).json({ error: "Unknown collection" });
+  saveJSON(file, req.body);
+  res.json({ ok: true, count: Array.isArray(req.body) ? req.body.length : 1 });
 });
 
 // ─── Email Config ───────────────────────────────────────────────────────────
@@ -303,12 +313,6 @@ cron.schedule("0 19 * * *", () => { checkPTPReminders(); });
 
 // Also run on server start (catches up after restarts)
 setTimeout(() => { checkPTPReminders(); }, 5000);
-
-// ─── Manual trigger endpoint ────────────────────────────────────────────────
-app.post("/api/ptp-check", async (req, res) => {
-  await checkPTPReminders();
-  res.json({ ok: true, message: "PTP check completed" });
-});
 
 // ─── Start server ───────────────────────────────────────────────────────────
 app.listen(PORT, () => {
