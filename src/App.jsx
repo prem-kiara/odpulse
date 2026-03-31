@@ -162,18 +162,19 @@ const getDateRangePresets = () => {
 
 function DateRangeFilter({ dateFrom, dateTo, setDateFrom, setDateTo }) {
   const presets = getDateRangePresets();
+  const [activePreset, setActivePreset] = useState(null);
   return (
     <div className="flex flex-wrap items-center gap-2">
       <Calendar size={16} className="text-teal-600" />
       {presets.map(p => (
-        <button key={p.label} onClick={() => { setDateFrom(p.from); setDateTo(p.to); }}
-          className={`px-2 py-1 text-xs rounded-full border transition-all ${dateFrom === p.from && dateTo === p.to ? "bg-teal-600 text-white border-teal-600" : "bg-white text-gray-600 border-gray-300 hover:border-teal-400"}`}>
+        <button key={p.label} onClick={() => { setDateFrom(p.from); setDateTo(p.to); setActivePreset(p.label); }}
+          className={`px-2 py-1 text-xs rounded-full border transition-all ${activePreset === p.label && dateFrom === p.from && dateTo === p.to ? "bg-teal-600 text-white border-teal-600" : "bg-white text-gray-600 border-gray-300 hover:border-teal-400"}`}>
           {p.label}
         </button>
       ))}
-      <input type="date" value={dateFrom} onChange={e => setDateFrom(e.target.value)} className="px-2 py-1 text-xs border rounded" />
+      <input type="date" value={dateFrom} onChange={e => { setDateFrom(e.target.value); setActivePreset(null); }} className="px-2 py-1 text-xs border rounded" />
       <span className="text-xs text-gray-400">to</span>
-      <input type="date" value={dateTo} onChange={e => setDateTo(e.target.value)} className="px-2 py-1 text-xs border rounded" />
+      <input type="date" value={dateTo} onChange={e => { setDateTo(e.target.value); setActivePreset(null); }} className="px-2 py-1 text-xs border rounded" />
     </div>
   );
 }
@@ -332,30 +333,27 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
 
     // Create persistent PTP notification if PTP is pending
     if (entry.ptpStatus === "pending" && entry.ptpDate) {
-      const ptpNotif = {
+      const existingNotifs = loadData(STORAGE_KEYS.notifications, []);
+      // Collect unique recipient IDs (entry creator + admins/elevated, no duplicates)
+      const allUsers = loadData(STORAGE_KEYS.users, []);
+      const recipientIds = new Set();
+      recipientIds.add(entry.enteredBy);
+      allUsers.filter(u => u.role === "admin" || u.role === "elevated_staff").forEach(u => recipientIds.add(u.id));
+
+      const ptpNotifs = [...recipientIds].map(userId => ({
         id: generateId(),
         type: "ptp_pending",
         message: `PTP Pending: ${entry.customerName} (${entry.customerId}) - Branch: ${entry.branch} - PTP: ${formatDateDMY(entry.ptpDate)} ${entry.ptpTime || ""} - Customer Share: ${formatINR(entry.customerShare)}`,
         entryId: entry.id,
         userId: entry.enteredBy,
-        forUserId: entry.enteredBy,
+        forUserId: userId,
         date: new Date().toISOString(),
         read: false,
         ptpDate: entry.ptpDate,
         ptpTime: entry.ptpTime,
-        persistent: true, // stays until payment is made
-      };
-      const existingNotifs = loadData(STORAGE_KEYS.notifications, []);
-      // Also notify admins
-      const allUsers = loadData(STORAGE_KEYS.users, []);
-      const adminNotifs = allUsers
-        .filter(u => (u.role === "admin" || u.role === "elevated_staff") && u.id !== entry.enteredBy)
-        .map(admin => ({
-          ...ptpNotif,
-          id: generateId(),
-          forUserId: admin.id,
-        }));
-      const allNotifs = [ptpNotif, ...adminNotifs, ...existingNotifs];
+        persistent: true,
+      }));
+      const allNotifs = [...ptpNotifs, ...existingNotifs];
       saveData(STORAGE_KEYS.notifications, allNotifs);
     }
 
@@ -586,9 +584,13 @@ function PTPPaymentModal({ entry, onSave, onCancel }) {
 }
 
 // ─── Records Table ──────────────────────────────────────────────────────────
-function RecordsTable({ user, entries, setEntries, config, branches }) {
+function RecordsTable({ user, entries, setEntries, config, branches, notifications, setNotifications }) {
   const [searchTerm, setSearchTerm] = useState("");
   const [branchFilter, setBranchFilter] = useState("");
+  const [paymentModeFilter, setPaymentModeFilter] = useState("");
+  const [ptpStatusFilter, setPtpStatusFilter] = useState("");
+  const [sortField, setSortField] = useState("date");
+  const [sortDir, setSortDir] = useState("desc");
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
   const [expandedId, setExpandedId] = useState(null);
@@ -605,35 +607,49 @@ function RecordsTable({ user, entries, setEntries, config, branches }) {
     saveData(STORAGE_KEYS.entries, updated);
 
     // Clear persistent PTP notifications for this entry
-    const notifs = loadData(STORAGE_KEYS.notifications, []);
-    const updatedNotifs = notifs.filter(n => !(n.entryId === ptpPaymentEntry.id && n.type === "ptp_pending"));
-    // Add a "payment received" notification
-    const paidNotif = {
+    const updatedNotifs = notifications.filter(n => !(n.entryId === ptpPaymentEntry.id && n.type === "ptp_pending"));
+
+    // Collect unique recipient IDs (entry creator + admins/elevated, no duplicates)
+    const allUsers = loadData(STORAGE_KEYS.users, []);
+    const recipientIds = new Set();
+    // Always notify the original entry creator
+    recipientIds.add(ptpPaymentEntry.enteredBy);
+    // Notify all admins and elevated staff
+    allUsers.filter(u => u.role === "admin" || u.role === "elevated_staff").forEach(u => recipientIds.add(u.id));
+
+    const paidNotifs = [...recipientIds].map(userId => ({
       id: generateId(),
       type: "ptp_paid",
       message: `PTP Payment Received: ${ptpPaymentEntry.customerName} (${ptpPaymentEntry.customerId}) - Branch: ${ptpPaymentEntry.branch} - Amount: ${formatINR(paymentData.totalPaidAmount)} - Ref: ${paymentData.ptpPaymentRef}`,
       entryId: ptpPaymentEntry.id,
       userId: ptpPaymentEntry.enteredBy,
-      forUserId: ptpPaymentEntry.enteredBy,
+      forUserId: userId,
       date: new Date().toISOString(),
       read: false,
       persistent: false,
-    };
-    // Also notify admins
-    const allUsers = loadData(STORAGE_KEYS.users, []);
-    const adminNotifs = allUsers
-      .filter(u => (u.role === "admin" || u.role === "elevated_staff") && u.id !== ptpPaymentEntry.enteredBy)
-      .map(admin => ({ ...paidNotif, id: generateId(), forUserId: admin.id }));
-    saveData(STORAGE_KEYS.notifications, [paidNotif, ...adminNotifs, ...updatedNotifs]);
+    }));
+
+    const newNotifs = [...paidNotifs, ...updatedNotifs];
+    setNotifications(newNotifs);
+    saveData(STORAGE_KEYS.notifications, newNotifs);
 
     setPtpPaymentEntry(null);
   };
+
+  // Helper: backward compat — old entries used customerShare as paid, new entries have totalPaidAmount
+  const getPaid = (e) => e.totalPaidAmount !== undefined ? e.totalPaidAmount : (Number(e.customerShare) || 0);
 
   const visibleEntries = useMemo(() => {
     let data = entries;
     // Staff sees only their own entries; elevated_staff and admin see all
     if (user.role === "staff") data = data.filter(e => e.enteredBy === user.id);
     if (branchFilter) data = data.filter(e => e.branch === branchFilter);
+    if (paymentModeFilter) data = data.filter(e => (e.ptpPaymentMode || e.paymentMode || "") === paymentModeFilter);
+    if (ptpStatusFilter) {
+      if (ptpStatusFilter === "pending") data = data.filter(e => e.ptpStatus === "pending");
+      else if (ptpStatusFilter === "paid") data = data.filter(e => e.ptpStatus === "paid");
+      else if (ptpStatusFilter === "na") data = data.filter(e => !e.ptpStatus || e.ptpStatus === "na");
+    }
     if (dateFrom) data = data.filter(e => e.date >= dateFrom);
     if (dateTo) data = data.filter(e => e.date <= dateTo);
     if (searchTerm) {
@@ -642,11 +658,23 @@ function RecordsTable({ user, entries, setEntries, config, branches }) {
         (e.customerName || "").toLowerCase().includes(s) ||
         (e.customerId || "").toLowerCase().includes(s) ||
         (e.loanAccountNo || "").toLowerCase().includes(s) ||
-        (e.branch || "").toLowerCase().includes(s)
+        (e.branch || "").toLowerCase().includes(s) ||
+        (e.enteredByName || "").toLowerCase().includes(s)
       );
     }
+    // Sorting
+    data = [...data].sort((a, b) => {
+      let cmp = 0;
+      if (sortField === "date") cmp = (a.date || "").localeCompare(b.date || "");
+      else if (sortField === "paid") cmp = getPaid(a) - getPaid(b);
+      else if (sortField === "waiver") cmp = (Number(a.waiver) || 0) - (Number(b.waiver) || 0);
+      else if (sortField === "groupod") cmp = (Number(a.groupOdAmount) || 0) - (Number(b.groupOdAmount) || 0);
+      else if (sortField === "branch") cmp = (a.branch || "").localeCompare(b.branch || "");
+      else if (sortField === "customer") cmp = (a.customerName || "").localeCompare(b.customerName || "");
+      return sortDir === "desc" ? -cmp : cmp;
+    });
     return data;
-  }, [entries, user, config, branchFilter, dateFrom, dateTo, searchTerm]);
+  }, [entries, user, config, branchFilter, paymentModeFilter, ptpStatusFilter, dateFrom, dateTo, searchTerm, sortField, sortDir]);
 
   const canDelete = user.role === "admin" || config.allowStaffDelete;
 
@@ -657,8 +685,6 @@ function RecordsTable({ user, entries, setEntries, config, branches }) {
     saveData(STORAGE_KEYS.entries, updated);
   };
 
-  // Helper: backward compat — old entries used customerShare as paid, new entries have totalPaidAmount
-  const getPaid = (e) => e.totalPaidAmount !== undefined ? e.totalPaidAmount : (Number(e.customerShare) || 0);
   const totalRecovered = visibleEntries.reduce((s, e) => s + getPaid(e), 0);
   const totalWaiver = visibleEntries.reduce((s, e) => s + (Number(e.waiver) || 0), 0);
 
@@ -688,6 +714,17 @@ function RecordsTable({ user, entries, setEntries, config, branches }) {
               {branches.map(b => <option key={b} value={b}>{b}</option>)}
             </select>
           )}
+          <select value={paymentModeFilter} onChange={e => setPaymentModeFilter(e.target.value)} className="px-3 py-2 border rounded-lg text-sm">
+            <option value="">All Payment Modes</option>
+            <option value="Cash">Cash</option>
+            <option value="UPI">UPI</option>
+          </select>
+          <select value={ptpStatusFilter} onChange={e => setPtpStatusFilter(e.target.value)} className="px-3 py-2 border rounded-lg text-sm">
+            <option value="">All Status</option>
+            <option value="pending">PTP Pending</option>
+            <option value="paid">PTP Paid</option>
+            <option value="na">Regular (No PTP)</option>
+          </select>
         </div>
         <DateRangeFilter dateFrom={dateFrom} dateTo={dateTo} setDateFrom={setDateFrom} setDateTo={setDateTo} />
       </div>
@@ -714,18 +751,26 @@ function RecordsTable({ user, entries, setEntries, config, branches }) {
           <table className="w-full text-sm">
             <thead className="bg-gray-50 border-b">
               <tr>
-                <th className="text-left px-4 py-3 font-semibold text-gray-600">Date</th>
-                <th className="text-left px-4 py-3 font-semibold text-gray-600">Branch</th>
-                <th className="text-left px-4 py-3 font-semibold text-gray-600">Customer</th>
-                <th className="text-right px-4 py-3 font-semibold text-gray-600">Group OD</th>
-                <th className="text-right px-4 py-3 font-semibold text-gray-600">Paid</th>
-                <th className="text-right px-4 py-3 font-semibold text-gray-600">Waiver</th>
+                {[
+                  { key: "date", label: "Date", align: "left" },
+                  { key: "branch", label: "Branch", align: "left" },
+                  { key: "customer", label: "Customer", align: "left" },
+                  { key: "groupod", label: "Group OD", align: "right" },
+                  { key: "paid", label: "Paid", align: "right" },
+                  { key: "waiver", label: "Waiver", align: "right" },
+                ].map(col => (
+                  <th key={col.key} className={`text-${col.align} px-4 py-3 font-semibold text-gray-600 cursor-pointer hover:text-teal-700 select-none`}
+                    onClick={() => { if (sortField === col.key) setSortDir(sortDir === "desc" ? "asc" : "desc"); else { setSortField(col.key); setSortDir("desc"); } }}>
+                    {col.label} {sortField === col.key ? (sortDir === "desc" ? "↓" : "↑") : ""}
+                  </th>
+                ))}
+                <th className="text-left px-4 py-3 font-semibold text-gray-600">Mode</th>
                 <th className="text-center px-4 py-3 font-semibold text-gray-600">Actions</th>
               </tr>
             </thead>
             <tbody>
               {visibleEntries.length === 0 ? (
-                <tr><td colSpan={7} className="text-center py-12 text-gray-400">No records found</td></tr>
+                <tr><td colSpan={8} className="text-center py-12 text-gray-400">No records found</td></tr>
               ) : visibleEntries.map(e => {
                 const paid = getPaid(e);
                 return (
@@ -761,6 +806,13 @@ function RecordsTable({ user, entries, setEntries, config, branches }) {
                         <span className="text-green-600 text-xs">No waiver</span>
                       )}
                     </td>
+                    <td className="px-4 py-3 text-left">
+                      <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${
+                        (e.ptpPaymentMode || e.paymentMode) === "UPI" ? "bg-blue-100 text-blue-700" :
+                        (e.ptpPaymentMode || e.paymentMode) === "Cash" ? "bg-green-100 text-green-700" :
+                        "bg-gray-100 text-gray-500"
+                      }`}>{e.ptpPaymentMode || e.paymentMode || "—"}</span>
+                    </td>
                     <td className="px-4 py-3 text-center">
                       <div className="flex items-center justify-center gap-2">
                         {e.ptpStatus === "pending" && (
@@ -780,7 +832,7 @@ function RecordsTable({ user, entries, setEntries, config, branches }) {
                   </tr>
                   {expandedId === e.id && (
                     <tr className="bg-gray-50">
-                      <td colSpan={7} className="px-6 py-4 space-y-3">
+                      <td colSpan={8} className="px-6 py-4 space-y-3">
                         {/* Group OD breakdown */}
                         <div className="p-3 bg-teal-50 rounded-lg border border-teal-100">
                           <p className="text-xs font-semibold text-teal-700 mb-2 uppercase tracking-wide">Group OD</p>
@@ -851,21 +903,8 @@ function RecordsTable({ user, entries, setEntries, config, branches }) {
 }
 
 // ─── Notifications Page ─────────────────────────────────────────────────────
-function NotificationsPage({ user, users }) {
-  const [notifications, setNotifications] = useState([]);
+function NotificationsPage({ user, users, notifications, setNotifications }) {
   const [filterUser, setFilterUser] = useState("");
-
-  useEffect(() => {
-    // Try API first, fall back to localStorage
-    fetchAPI("notifications", []).then(apiData => {
-      if (apiData !== null && apiData.length > 0) {
-        setNotifications(apiData);
-        localStorage.setItem(STORAGE_KEYS.notifications, JSON.stringify(apiData));
-      } else {
-        setNotifications(loadData(STORAGE_KEYS.notifications, []));
-      }
-    });
-  }, []);
 
   const isAdminOrElevated = user.role === "admin" || user.role === "elevated_staff";
   const visibleNotifs = isAdminOrElevated
@@ -970,6 +1009,7 @@ function Dashboard({ user, entries, branches, config }) {
   const [dateTo, setDateTo] = useState("");
   const [drillBranch, setDrillBranch] = useState(null);
   const [drillStaff, setDrillStaff] = useState(null);
+  const [drillPanel, setDrillPanel] = useState(null); // "entries" | "recovered" | "waiver" | "groupod"
 
   const visibleEntries = useMemo(() => {
     let data = entries;
@@ -1027,7 +1067,7 @@ function Dashboard({ user, entries, branches, config }) {
     // Payment mode breakdown
     const byPaymentMode = {};
     visibleEntries.forEach(e => {
-      const mode = e.ptpPaymentMode || e.paymentMode || "Unknown";
+      const mode = e.ptpPaymentMode || e.paymentMode || "Not Specified";
       if (!byPaymentMode[mode]) byPaymentMode[mode] = { mode, recovered: 0, waiver: 0, count: 0 };
       byPaymentMode[mode].recovered += getEntryPaid(e);
       byPaymentMode[mode].waiver += Number(e.waiver) || 0;
@@ -1037,6 +1077,98 @@ function Dashboard({ user, entries, branches, config }) {
 
     return { totalRecovered, totalGroupOD, totalWaiver, entriesWithWaiver, branchData, staffData, monthData, paymentModeData, totalEntries: visibleEntries.length };
   }, [visibleEntries]);
+
+  if (drillPanel) {
+    // Determine which entries to show and what columns to highlight
+    let panelTitle = "All Entries";
+    let panelEntries = visibleEntries;
+    let highlightField = null;
+    if (drillPanel === "recovered") { panelTitle = "Recovery Details"; highlightField = "paid"; }
+    else if (drillPanel === "waiver") { panelTitle = "Waiver Details"; panelEntries = visibleEntries.filter(e => (Number(e.waiver) || 0) > 0); highlightField = "waiver"; }
+    else if (drillPanel === "groupod") { panelTitle = "Group OD Details"; highlightField = "groupod"; }
+
+    // Group by branch for summary
+    const byBranch = {};
+    panelEntries.forEach(e => {
+      if (!byBranch[e.branch]) byBranch[e.branch] = { branch: e.branch, entries: 0, recovered: 0, waiver: 0, groupOD: 0 };
+      byBranch[e.branch].entries += 1;
+      byBranch[e.branch].recovered += getEntryPaid(e);
+      byBranch[e.branch].waiver += Number(e.waiver) || 0;
+      byBranch[e.branch].groupOD += Number(e.groupOdAmount) || 0;
+    });
+    const branchSummary = Object.values(byBranch).sort((a, b) => b.recovered - a.recovered);
+
+    return (
+      <div>
+        <button onClick={() => setDrillPanel(null)} className="flex items-center gap-1 text-teal-600 hover:text-teal-800 mb-4 text-sm font-medium">
+          <ArrowLeft size={16} /> Back to Dashboard
+        </button>
+        <h2 className="text-xl font-bold text-gray-900 mb-4">{panelTitle}</h2>
+        <div className="grid grid-cols-1 sm:grid-cols-4 gap-4 mb-6">
+          <div className="bg-white rounded-xl border p-4"><p className="text-xs text-gray-500">Total Entries</p><p className="text-2xl font-bold">{panelEntries.length}</p></div>
+          <div className="bg-white rounded-xl border p-4"><p className="text-xs text-gray-500">Total Recovered</p><p className="text-2xl font-bold text-teal-700">{formatLakhs(panelEntries.reduce((s, e) => s + getEntryPaid(e), 0))}</p></div>
+          <div className="bg-white rounded-xl border p-4"><p className="text-xs text-gray-500">Total Waiver</p><p className="text-2xl font-bold text-amber-700">{formatLakhs(panelEntries.reduce((s, e) => s + (Number(e.waiver) || 0), 0))}</p></div>
+          <div className="bg-white rounded-xl border p-4"><p className="text-xs text-gray-500">Group OD Total</p><p className="text-2xl font-bold text-gray-600">{formatLakhs(panelEntries.reduce((s, e) => s + (Number(e.groupOdAmount) || 0), 0))}</p></div>
+        </div>
+
+        {/* Branch-wise breakdown */}
+        <div className="bg-white rounded-xl border overflow-hidden mb-6">
+          <h3 className="text-sm font-semibold text-gray-700 p-4 border-b">Branch-wise Breakdown</h3>
+          <table className="w-full text-sm">
+            <thead className="bg-gray-50 border-b">
+              <tr>
+                <th className="text-left px-4 py-2">Branch</th>
+                <th className="text-right px-4 py-2">Entries</th>
+                <th className="text-right px-4 py-2">Recovered</th>
+                <th className="text-right px-4 py-2">Waiver</th>
+                <th className="text-right px-4 py-2">Group OD</th>
+              </tr>
+            </thead>
+            <tbody>
+              {branchSummary.map(b => (
+                <tr key={b.branch} className="border-b hover:bg-gray-50 cursor-pointer" onClick={() => { setDrillPanel(null); setDrillBranch(b.branch); }}>
+                  <td className="px-4 py-2 font-medium">{b.branch}</td>
+                  <td className="px-4 py-2 text-right">{b.entries}</td>
+                  <td className={`px-4 py-2 text-right font-medium ${highlightField === "paid" ? "text-teal-700" : ""}`}>{formatINR(b.recovered)}</td>
+                  <td className={`px-4 py-2 text-right font-medium ${highlightField === "waiver" ? "text-amber-700" : ""}`}>{b.waiver > 0 ? formatINR(b.waiver) : "—"}</td>
+                  <td className={`px-4 py-2 text-right font-medium ${highlightField === "groupod" ? "text-gray-700" : ""}`}>{formatINR(b.groupOD)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        {/* Recent entries */}
+        <div className="bg-white rounded-xl border overflow-hidden">
+          <h3 className="text-sm font-semibold text-gray-700 p-4 border-b">Recent Entries ({Math.min(panelEntries.length, 25)} of {panelEntries.length})</h3>
+          <table className="w-full text-sm">
+            <thead className="bg-gray-50 border-b">
+              <tr>
+                <th className="text-left px-4 py-2">Date</th>
+                <th className="text-left px-4 py-2">Branch</th>
+                <th className="text-left px-4 py-2">Customer</th>
+                <th className="text-right px-4 py-2">Paid</th>
+                <th className="text-right px-4 py-2">Waiver</th>
+                <th className="text-left px-4 py-2">Payment Mode</th>
+              </tr>
+            </thead>
+            <tbody>
+              {panelEntries.slice(0, 25).map(e => (
+                <tr key={e.id} className="border-b">
+                  <td className="px-4 py-2">{formatDateDMY(e.date)}</td>
+                  <td className="px-4 py-2">{e.branch}</td>
+                  <td className="px-4 py-2">{e.customerName} <span className="text-xs text-gray-400">({e.customerId})</span></td>
+                  <td className="px-4 py-2 text-right text-teal-700 font-medium">{formatINR(getEntryPaid(e))}</td>
+                  <td className="px-4 py-2 text-right">{e.waiver > 0 ? <span className="text-amber-600">{formatINR(e.waiver)}</span> : <span className="text-gray-400">—</span>}</td>
+                  <td className="px-4 py-2">{e.ptpPaymentMode || e.paymentMode || "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    );
+  }
 
   if (drillStaff) {
     const staffEntries = visibleEntries.filter(e => (e.enteredBy || "unknown") === drillStaff.staffId);
@@ -1186,71 +1318,31 @@ function Dashboard({ user, entries, branches, config }) {
       </div>
       <div className="mb-4"><DateRangeFilter dateFrom={dateFrom} dateTo={dateTo} setDateFrom={setDateFrom} setDateTo={setDateTo} /></div>
 
-      {/* KPI Cards */}
+      {/* KPI Cards — clickable */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-        <div className="bg-white rounded-xl border p-4">
+        <div className="bg-white rounded-xl border p-4 cursor-pointer hover:shadow-md transition-shadow" onClick={() => setDrillPanel("entries")}>
           <p className="text-xs text-gray-500 mb-1">Total Entries</p>
           <p className="text-2xl font-bold text-gray-800">{stats.totalEntries}</p>
+          <p className="text-xs text-teal-600 mt-1">View details →</p>
         </div>
-        <div className="bg-white rounded-xl border p-4">
+        <div className="bg-white rounded-xl border p-4 cursor-pointer hover:shadow-md transition-shadow" onClick={() => setDrillPanel("recovered")}>
           <p className="text-xs text-gray-500 mb-1">Total Recovered</p>
           <p className="text-2xl font-bold text-teal-700">{formatLakhs(stats.totalRecovered)}</p>
+          <p className="text-xs text-teal-600 mt-1">View details →</p>
         </div>
-        <div className="bg-white rounded-xl border p-4">
+        <div className="bg-white rounded-xl border p-4 cursor-pointer hover:shadow-md transition-shadow" onClick={() => setDrillPanel("waiver")}>
           <p className="text-xs text-gray-500 mb-1">Total Waiver</p>
           <p className="text-2xl font-bold text-amber-700">{formatLakhs(stats.totalWaiver)}</p>
-          <p className="text-xs text-gray-400">{stats.entriesWithWaiver} entries</p>
+          <p className="text-xs text-gray-400">{stats.entriesWithWaiver} entries · <span className="text-teal-600">View details →</span></p>
         </div>
-        <div className="bg-white rounded-xl border p-4">
+        <div className="bg-white rounded-xl border p-4 cursor-pointer hover:shadow-md transition-shadow" onClick={() => setDrillPanel("groupod")}>
           <p className="text-xs text-gray-500 mb-1">Group OD Total</p>
           <p className="text-2xl font-bold text-gray-600">{formatLakhs(stats.totalGroupOD)}</p>
+          <p className="text-xs text-teal-600 mt-1">View details →</p>
         </div>
       </div>
 
-      {/* Charts Row 1: Branch & Staff */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
-        {/* Branch Performance */}
-        {stats.branchData.length > 0 && (
-          <div className="bg-white rounded-xl border p-4">
-            <h3 className="text-sm font-semibold text-gray-700 mb-3">Recovery by Branch</h3>
-            <ResponsiveContainer width="100%" height={Math.max(280, stats.branchData.length * 35)}>
-              <BarChart data={stats.branchData} layout="vertical">
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis type="number" tickFormatter={v => formatLakhs(v)} tick={{ fontSize: 11 }} />
-                <YAxis dataKey="branch" type="category" width={100} tick={{ fontSize: 11 }} />
-                <Tooltip formatter={(v) => formatINR(v)} />
-                <Legend />
-                <Bar dataKey="recovered" name="Recovered" fill="#0f766e" radius={[0, 4, 4, 0]} cursor="pointer"
-                  onClick={(data) => setDrillBranch(data.branch)} />
-                <Bar dataKey="waiver" name="Waiver" fill="#fbbf24" radius={[0, 4, 4, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-            <p className="text-xs text-gray-400 mt-2 text-center">Click a branch bar to drill down</p>
-          </div>
-        )}
-
-        {/* Staff Performance */}
-        {stats.staffData.length > 0 && (
-          <div className="bg-white rounded-xl border p-4">
-            <h3 className="text-sm font-semibold text-gray-700 mb-3">Recovery by Staff</h3>
-            <ResponsiveContainer width="100%" height={Math.max(280, stats.staffData.length * 35)}>
-              <BarChart data={stats.staffData} layout="vertical">
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis type="number" tickFormatter={v => formatLakhs(v)} tick={{ fontSize: 11 }} />
-                <YAxis dataKey="staff" type="category" width={100} tick={{ fontSize: 11 }} />
-                <Tooltip formatter={(v) => formatINR(v)} />
-                <Legend />
-                <Bar dataKey="recovered" name="Recovered" fill="#6366f1" radius={[0, 4, 4, 0]} cursor="pointer"
-                  onClick={(data) => setDrillStaff(data)} />
-                <Bar dataKey="waiver" name="Waiver" fill="#a78bfa" radius={[0, 4, 4, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-            <p className="text-xs text-gray-400 mt-2 text-center">Click a staff bar to drill down</p>
-          </div>
-        )}
-      </div>
-
-      {/* Charts Row 2: Monthly Trend & Payment Mode */}
+      {/* Charts: Monthly Trend & Payment Mode */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
         {stats.monthData.length > 0 && (
           <div className="bg-white rounded-xl border p-4">
@@ -1258,7 +1350,7 @@ function Dashboard({ user, entries, branches, config }) {
             <ResponsiveContainer width="100%" height={280}>
               <BarChart data={stats.monthData}>
                 <CartesianGrid strokeDasharray="3 3" />
-                <XAxis dataKey="month" tick={{ fontSize: 11 }} />
+                <XAxis dataKey="month" tick={{ fontSize: 11 }} tickFormatter={v => { const [y, m] = v.split("-"); return MONTHS[parseInt(m, 10) - 1] + " " + y; }} />
                 <YAxis tickFormatter={v => formatLakhs(v)} tick={{ fontSize: 11 }} />
                 <Tooltip formatter={(v) => formatINR(v)} />
                 <Legend />
@@ -1498,30 +1590,64 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
         const loanAccountNo = (r["Loan Account No"] || r["Loan Account No."] || r.loanAccountNo || "").trim();
         const branch = (r.Branch || r.branch || "").trim();
         if (!customerName || !customerId || !branch) return;
-        // Parse date: accept dd-mm-yyyy, dd/mm/yyyy, or yyyy-mm-dd
+
+        // Parse date: accept dd-mm-yyyy, dd/mm/yyyy, mm/dd/yyyy, yyyy-mm-dd, or dd.mm.yyyy
         let rawDate = (r.Date || r.date || "").trim();
-        if (rawDate.includes("/")) rawDate = rawDate.replace(/\//g, "-");
-        if (/^\d{2}-\d{2}-\d{4}$/.test(rawDate)) {
-          const [d, m, y] = rawDate.split("-");
-          rawDate = `${y}-${m}-${d}`;
+        // Replace . or / separators with -
+        rawDate = rawDate.replace(/[./]/g, "-");
+        // dd-mm-yyyy → yyyy-mm-dd
+        if (/^\d{1,2}-\d{1,2}-\d{4}$/.test(rawDate)) {
+          const parts = rawDate.split("-");
+          const d = parts[0].padStart(2, "0");
+          const m = parts[1].padStart(2, "0");
+          const y = parts[2];
+          // Validate: if first part > 12, it's dd-mm-yyyy; if second part > 12, it's mm-dd-yyyy
+          if (Number(d) > 12) {
+            rawDate = `${y}-${m}-${d}`;
+          } else if (Number(m) > 12) {
+            rawDate = `${y}-${d}-${m}`;
+          } else {
+            // Assume dd-mm-yyyy (Indian format)
+            rawDate = `${y}-${m}-${d}`;
+          }
+        }
+        // Validate the resulting date
+        if (rawDate && !/^\d{4}-\d{2}-\d{2}$/.test(rawDate)) rawDate = "";
+        if (rawDate) {
+          const testDate = new Date(rawDate + "T00:00:00");
+          if (isNaN(testDate.getTime())) rawDate = "";
         }
         if (!rawDate) rawDate = nowDate();
+
         const odType = (r["OD Type"] || r.odType || "Group OD").trim();
         const selfOdAmountDue = Number(r["Self OD Amount Due"] || r.selfOdAmountDue || 0);
         const selfOdPaidAmount = Number(r["Self OD Paid"] || r.selfOdPaidAmount || 0);
-        const selfOdWaiver = Math.max(0, selfOdAmountDue - selfOdPaidAmount);
+        const selfOdWaiver = Number(r["Self OD Waiver"] || r.selfOdWaiver || Math.max(0, selfOdAmountDue - selfOdPaidAmount));
         const groupOdAmount = Number(r["Group OD Amount Due"] || r["Group OD Amount"] || r.groupOdAmount || 0);
         const numberOfCustomers = Number(r["No. of Customers"] || r["No. of Customers in Group"] || r.numberOfCustomers || 1);
-        const customerShare = numberOfCustomers > 0 ? Math.round(groupOdAmount / numberOfCustomers) : 0;
+        const customerShare = Number(r["Customer Share (Auto)"] || r["Customer Share"] || (numberOfCustomers > 0 ? Math.round(groupOdAmount / numberOfCustomers) : 0));
         const groupOdPaidAmount = Number(r["Group OD Paid"] || r.groupOdPaidAmount || 0);
-        const groupOdWaiver = Math.max(0, customerShare - groupOdPaidAmount);
-        const totalPaidAmount = (odType === "Self OD" ? selfOdPaidAmount : 0) + groupOdPaidAmount;
-        const totalWaiver = (odType === "Self OD" ? selfOdWaiver : 0) + groupOdWaiver;
+        const groupOdWaiver = Number(r["Group OD Waiver"] || r.groupOdWaiver || Math.max(0, customerShare - groupOdPaidAmount));
+
+        // Check for explicit Total Paid / Total Waiver columns first
+        const totalPaidAmount = Number(r["Total Paid"] || r.totalPaidAmount || ((odType === "Self OD" ? selfOdPaidAmount : 0) + groupOdPaidAmount));
+        const totalWaiver = Number(r["Total Waiver"] || r.waiver || ((odType === "Self OD" ? selfOdWaiver : 0) + groupOdWaiver));
+
         const approvalSubject = (r["Approval Subject"] || r["Waiver Approval Subject"] || "").trim();
-        const recordedBy = (r["Recorded By"] || r["Entered By"] || r.recordedBy || "").trim();
+        const recordedBy = (r["Recorded By"] || r["Entered By"] || r["Recorded By"] || r.recordedBy || "").trim();
         const paymentMode = (r["Payment Mode"] || r.paymentMode || "").trim();
         const upiReference = (r["UPI Reference"] || r.upiReference || "").trim();
-        const ptpDate = (r["PTP Date"] || r.ptpDate || "").trim();
+
+        // PTP date also needs parsing
+        let ptpDateRaw = (r["PTP Date"] || r.ptpDate || "").trim();
+        if (ptpDateRaw) {
+          ptpDateRaw = ptpDateRaw.replace(/[./]/g, "-");
+          if (/^\d{1,2}-\d{1,2}-\d{4}$/.test(ptpDateRaw)) {
+            const parts = ptpDateRaw.split("-");
+            ptpDateRaw = `${parts[2]}-${parts[1].padStart(2, "0")}-${parts[0].padStart(2, "0")}`;
+          }
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(ptpDateRaw)) ptpDateRaw = "";
+        }
 
         newEntries.push({
           id: generateId(), date: rawDate, time: (r.Time || r.time || "00:00").trim(), branch,
@@ -1531,7 +1657,7 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
           selfOdWaiver: odType === "Self OD" ? selfOdWaiver : 0,
           groupOdAmount, numberOfCustomers, customerShare, groupOdPaidAmount, groupOdWaiver,
           totalPaidAmount, waiver: totalWaiver,
-          paymentMode, upiReference, ptpDate, ptpReminderSent: false,
+          paymentMode, upiReference, ptpDate: ptpDateRaw, ptpReminderSent: false,
           waiverApproval: totalWaiver > 0 && approvalSubject ? { approverName: (r["Waiver Approver"] || "Bulk Upload").trim(), emailSubject: approvalSubject, approvalDate: rawDate } : null,
           enteredBy: recordedBy || "admin", enteredByName: recordedBy || "Bulk Upload",
         });
@@ -1993,7 +2119,7 @@ export default function App() {
   const isElevated = user.role === "elevated_staff";
 
   const unreadNotificationsCount = notifications.filter(n =>
-    (user.role === "admin" || user.role === "elevated_staff" ? true : n.forUserId === user.id) && !n.read
+    (user.role === "admin" || user.role === "elevated_staff" ? true : n.forUserId === user.id) && (!n.read || n.type === "ptp_pending")
   ).length;
 
   const navItems = [
@@ -2051,8 +2177,8 @@ export default function App() {
         <main className="flex-1 p-4 lg:p-6 min-h-[calc(100vh-60px)]">
           {page === "dashboard" && <Dashboard user={user} entries={entries} branches={branches} config={config} />}
           {page === "entry" && <EntryForm user={user} branches={branches} entries={entries} setEntries={setEntries} setPage={setPage} />}
-          {page === "records" && <RecordsTable user={user} entries={entries} setEntries={setEntries} config={config} branches={branches} />}
-          {page === "notifications" && <NotificationsPage user={user} users={users} />}
+          {page === "records" && <RecordsTable user={user} entries={entries} setEntries={setEntries} config={config} branches={branches} notifications={notifications} setNotifications={setNotifications} />}
+          {page === "notifications" && <NotificationsPage user={user} users={users} notifications={notifications} setNotifications={setNotifications} />}
           {page === "admin" && user.role === "admin" && <AdminPanel users={users} setUsers={setUsers} branches={branches} setBranches={setBranches} config={config} setConfig={setConfig} entries={entries} setEntries={setEntries} />}
         </main>
       </div>
