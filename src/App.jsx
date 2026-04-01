@@ -1446,7 +1446,7 @@ function Dashboard({ user, entries, branches, config }) {
 }
 
 // ─── Admin Panel ────────────────────────────────────────────────────────────
-function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig, entries, setEntries }) {
+function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig, entries, setEntries, notifications, setNotifications }) {
   const [tab, setTab] = useState("users");
   const [newUser, setNewUser] = useState({ username: "", password: "Dhanam@123", name: "", role: "staff", branch: "" });
   const [newBranch, setNewBranch] = useState("");
@@ -1511,9 +1511,10 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
   };
 
   const resetAllData = () => {
-    if (!confirm("This will delete ALL entries. Are you sure?")) return;
+    if (!confirm("This will delete ALL entries and notifications. Users and branches will be kept. Are you sure?")) return;
     if (!confirm("This action cannot be undone. Proceed?")) return;
     setEntries([]); saveData(STORAGE_KEYS.entries, []);
+    setNotifications([]); saveData(STORAGE_KEYS.notifications, []);
   };
 
   // ── Bulk Upload Parsers ──
@@ -2179,7 +2180,7 @@ export default function App() {
           {page === "entry" && <EntryForm user={user} branches={branches} entries={entries} setEntries={setEntries} setPage={setPage} />}
           {page === "records" && <RecordsTable user={user} entries={entries} setEntries={setEntries} config={config} branches={branches} notifications={notifications} setNotifications={setNotifications} />}
           {page === "notifications" && <NotificationsPage user={user} users={users} notifications={notifications} setNotifications={setNotifications} />}
-          {page === "admin" && user.role === "admin" && <AdminPanel users={users} setUsers={setUsers} branches={branches} setBranches={setBranches} config={config} setConfig={setConfig} entries={entries} setEntries={setEntries} />}
+          {page === "admin" && user.role === "admin" && <AdminPanel users={users} setUsers={setUsers} branches={branches} setBranches={setBranches} config={config} setConfig={setConfig} entries={entries} setEntries={setEntries} notifications={notifications} setNotifications={setNotifications} />}
         </main>
       </div>
     </div>
