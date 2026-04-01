@@ -1515,6 +1515,8 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
     if (!confirm("This action cannot be undone. Proceed?")) return;
     setEntries([]); saveData(STORAGE_KEYS.entries, []);
     setNotifications([]); saveData(STORAGE_KEYS.notifications, []);
+    // Mark that this was a deliberate reset so migration logic doesn't re-upload stale localStorage
+    localStorage.setItem("odpulse_reset_ts", Date.now().toString());
   };
 
   // ── Bulk Upload Parsers ──
@@ -2070,19 +2072,8 @@ export default function App() {
       // ── Entries ──
       let allEntries;
       if (apiAvailable && apiEntries !== null) {
-        // Merge: API is source of truth, but if localStorage has entries not on server, push them up
-        const localEntries = loadData(STORAGE_KEYS.entries, []);
-        if (apiEntries.length === 0 && localEntries.length > 0) {
-          // First time connecting — migrate localStorage entries to server
-          allEntries = localEntries;
-          fetch(`${API_BASE}/entries`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(localEntries),
-          }).catch(err => console.warn("[API migrate entries]", err.message));
-        } else {
-          allEntries = apiEntries;
-        }
+        // API is the source of truth — always use server data
+        allEntries = apiEntries;
         localStorage.setItem(STORAGE_KEYS.entries, JSON.stringify(allEntries));
       } else {
         allEntries = loadData(STORAGE_KEYS.entries, []);
@@ -2094,18 +2085,8 @@ export default function App() {
       setNotifications(finalNotifications);
       localStorage.setItem(STORAGE_KEYS.notifications, JSON.stringify(finalNotifications));
 
-      // If we loaded from localStorage but API is now available, push everything up
-      if (apiAvailable && apiEntries !== null && apiEntries.length === 0 && loadData(STORAGE_KEYS.users, []).length > 0) {
-        // Migrate all local data to server
-        const migrateCollections = { users: finalUsers, branches: finalBranches, config: finalConfig, notifications: finalNotifications };
-        for (const [col, data] of Object.entries(migrateCollections)) {
-          fetch(`${API_BASE}/${col}`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(data),
-          }).catch(err => console.warn(`[API migrate ${col}]`, err.message));
-        }
-      }
+      // Clear stale reset flag if present
+      localStorage.removeItem("odpulse_reset_ts");
     };
 
     initData();
