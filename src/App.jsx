@@ -323,8 +323,9 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
   const saveEntry = (entry) => {
     const updated = [entry, ...entries];
     setEntries(updated);
-    saveData(STORAGE_KEYS.entries, updated);
-    // Also append to server (more efficient than full replace for single entries)
+    // Save to localStorage only (don't fire full-array POST to server)
+    localStorage.setItem(STORAGE_KEYS.entries, JSON.stringify(updated));
+    // Use append endpoint for server (avoids duplicate from full-array sync)
     fetch(`${API_BASE}/entries/append`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
