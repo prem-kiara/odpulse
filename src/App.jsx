@@ -1623,22 +1623,32 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
         }
         if (!rawDate) rawDate = nowDate();
 
+        // Helper: strip commas from numbers (e.g. "4,400" → 4400)
+        const num = (v) => Number(String(v || 0).replace(/,/g, "")) || 0;
+
         const odType = (r["OD Type"] || r.odType || "Group OD").trim();
-        const selfOdAmountDue = Number(r["Self OD Amount Due"] || r.selfOdAmountDue || 0);
-        const selfOdPaidAmount = Number(r["Self OD Paid"] || r.selfOdPaidAmount || 0);
-        const selfOdWaiver = Number(r["Self OD Waiver"] || r.selfOdWaiver || Math.max(0, selfOdAmountDue - selfOdPaidAmount));
-        const groupOdAmount = Number(r["Group OD Amount Due"] || r["Group OD Amount"] || r.groupOdAmount || 0);
-        const numberOfCustomers = Number(r["No. of Customers"] || r["No. of Customers in Group"] || r.numberOfCustomers || 1);
-        const customerShare = Number(r["Customer Share (Auto)"] || r["Customer Share"] || (numberOfCustomers > 0 ? Math.round(groupOdAmount / numberOfCustomers) : 0));
-        const groupOdPaidAmount = Number(r["Group OD Paid"] || r.groupOdPaidAmount || 0);
-        const groupOdWaiver = Number(r["Group OD Waiver"] || r.groupOdWaiver || Math.max(0, customerShare - groupOdPaidAmount));
+        const selfOdAmountDue = num(r["Self OD Amount Due"] || r.selfOdAmountDue);
+        const selfOdPaidAmount = num(r["Self OD Paid"] || r.selfOdPaidAmount);
+        const selfOdWaiver = num(r["Self OD Waiver"] || r.selfOdWaiver) || Math.max(0, selfOdAmountDue - selfOdPaidAmount);
+        const groupOdAmount = num(r["Group OD Amount Due"] || r["Group OD Amount"] || r.groupOdAmount);
+        const numberOfCustomers = num(r["No. of Customers"] || r["No. of Customers in Group"] || r.numberOfCustomers) || 1;
+        const customerShare = num(r["Customer Share (Auto)"] || r["Customer Share"]) || (numberOfCustomers > 0 ? Math.round(groupOdAmount / numberOfCustomers) : 0);
+        const groupOdPaidAmount = num(r["Group OD Paid"] || r.groupOdPaidAmount);
+        const groupOdWaiver = num(r["Group OD Waiver"] || r.groupOdWaiver) || Math.max(0, customerShare - groupOdPaidAmount);
 
         // Check for explicit Total Paid / Total Waiver columns first
-        const totalPaidAmount = Number(r["Total Paid"] || r.totalPaidAmount || ((odType === "Self OD" ? selfOdPaidAmount : 0) + groupOdPaidAmount));
-        const totalWaiver = Number(r["Total Waiver"] || r.waiver || ((odType === "Self OD" ? selfOdWaiver : 0) + groupOdWaiver));
+        const totalPaidAmount = num(r["Total Paid"] || r.totalPaidAmount) || ((odType === "Self OD" ? selfOdPaidAmount : 0) + groupOdPaidAmount);
+        const totalWaiver = num(r["Total Waiver"] || r.waiver) || ((odType === "Self OD" ? selfOdWaiver : 0) + groupOdWaiver);
 
         const approvalSubject = (r["Approval Subject"] || r["Waiver Approval Subject"] || "").trim();
-        const recordedBy = (r["Recorded By"] || r["Entered By"] || r["Recorded By"] || r.recordedBy || "").trim();
+        const recordedByRaw = (r["Recorded By"] || r["Entered By"] || r.recordedBy || "").trim();
+        // Match recorded-by name to an actual user ID
+        const matchedUser = recordedByRaw ? users.find(u =>
+          u.name.toLowerCase() === recordedByRaw.toLowerCase() ||
+          u.username.toLowerCase() === recordedByRaw.toLowerCase()
+        ) : null;
+        const enteredById = matchedUser ? matchedUser.id : (recordedByRaw || "admin");
+        const enteredByName = matchedUser ? matchedUser.name : (recordedByRaw || "Bulk Upload");
         const paymentMode = (r["Payment Mode"] || r.paymentMode || "").trim();
         const upiReference = (r["UPI Reference"] || r.upiReference || "").trim();
 
@@ -1663,7 +1673,7 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
           totalPaidAmount, waiver: totalWaiver,
           paymentMode, upiReference, ptpDate: ptpDateRaw, ptpReminderSent: false,
           waiverApproval: totalWaiver > 0 && approvalSubject ? { approverName: (r["Waiver Approver"] || "Bulk Upload").trim(), emailSubject: approvalSubject, approvalDate: rawDate } : null,
-          enteredBy: recordedBy || "admin", enteredByName: recordedBy || "Bulk Upload",
+          enteredBy: enteredById, enteredByName: enteredByName,
         });
         added++;
       });
