@@ -1522,7 +1522,9 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
 
   // ── Bulk Upload Parsers ──
   const parseCSV = (text) => {
-    const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
+    // Strip UTF-8 BOM and normalize CRLF → LF so headers/cells never carry stray bytes
+    const cleaned = text.replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n");
+    const lines = cleaned.split("\n").map(l => l.trim()).filter(Boolean);
     if (lines.length < 2) return [];
     const headers = lines[0].split(",").map(h => h.replace(/^"|"$/g, "").trim());
     return lines.slice(1).map(line => {
@@ -1595,10 +1597,16 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
         const branch = (r.Branch || r.branch || "").trim();
         if (!customerName || !customerId || !branch) return;
 
-        // Parse date: accept dd-mm-yyyy, dd/mm/yyyy, mm/dd/yyyy, yyyy-mm-dd, or dd.mm.yyyy
+        // Parse date: accept dd-mm-yyyy, dd/mm/yyyy, dd-mm-yy, dd/mm/yy, mm/dd/yyyy, yyyy-mm-dd, dd.mm.yyyy
         let rawDate = (r.Date || r.date || "").trim();
         // Replace . or / separators with -
         rawDate = rawDate.replace(/[./]/g, "-");
+        // Expand 2-digit year (Excel auto-format quirk: "3-3-26" → "3-3-2026")
+        if (/^\d{1,2}-\d{1,2}-\d{2}$/.test(rawDate)) {
+          const p = rawDate.split("-");
+          p[2] = "20" + p[2];
+          rawDate = p.join("-");
+        }
         // dd-mm-yyyy → yyyy-mm-dd
         if (/^\d{1,2}-\d{1,2}-\d{4}$/.test(rawDate)) {
           const parts = rawDate.split("-");
@@ -1662,6 +1670,12 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
         let ptpDateRaw = (r["PTP Date"] || r.ptpDate || "").trim();
         if (ptpDateRaw) {
           ptpDateRaw = ptpDateRaw.replace(/[./]/g, "-");
+          // Expand 2-digit year (e.g. "3-3-26" → "3-3-2026")
+          if (/^\d{1,2}-\d{1,2}-\d{2}$/.test(ptpDateRaw)) {
+            const p = ptpDateRaw.split("-");
+            p[2] = "20" + p[2];
+            ptpDateRaw = p.join("-");
+          }
           if (/^\d{1,2}-\d{1,2}-\d{4}$/.test(ptpDateRaw)) {
             const parts = ptpDateRaw.split("-");
             ptpDateRaw = `${parts[2]}-${parts[1].padStart(2, "0")}-${parts[0].padStart(2, "0")}`;
