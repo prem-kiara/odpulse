@@ -1623,8 +1623,14 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
         }
         if (!rawDate) rawDate = nowDate();
 
-        // Helper: strip commas from numbers (e.g. "4,400" → 4400)
-        const num = (v) => Number(String(v || 0).replace(/,/g, "")) || 0;
+        // Helper: strip commas, currency symbols (₹/$/€/£), and any stray non-numeric bytes
+        // (handles mangled UTF-8 rupee like "�7800" from Excel exports).
+        const num = (v) => {
+          if (v === null || v === undefined || v === "") return 0;
+          const cleaned = String(v).replace(/[^\d.\-]/g, "");
+          const n = Number(cleaned);
+          return isNaN(n) ? 0 : n;
+        };
 
         const odType = (r["OD Type"] || r.odType || "Group OD").trim();
         const selfOdAmountDue = num(r["Self OD Amount Due"] || r.selfOdAmountDue);
