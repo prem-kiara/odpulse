@@ -119,8 +119,12 @@ app.post("/api/entries/append", async (req, res) => {
           <tr><td style="padding:8px;border:1px solid #ddd;background:#f9fafb;font-weight:600;width:40%">Customer</td><td style="padding:8px;border:1px solid #ddd">${entry.customerName} (${entry.customerId})</td></tr>
           <tr><td style="padding:8px;border:1px solid #ddd;background:#f9fafb;font-weight:600">Loan Account</td><td style="padding:8px;border:1px solid #ddd">${entry.loanAccountNo}</td></tr>
           <tr><td style="padding:8px;border:1px solid #ddd;background:#f9fafb;font-weight:600">Branch</td><td style="padding:8px;border:1px solid #ddd">${entry.branch}</td></tr>
-          <tr><td style="padding:8px;border:1px solid #ddd;background:#f9fafb;font-weight:600">Group OD Amount</td><td style="padding:8px;border:1px solid #ddd">Rs. ${entry.groupOdAmount}</td></tr>
-          <tr><td style="padding:8px;border:1px solid #ddd;background:#f9fafb;font-weight:600">Customer Share</td><td style="padding:8px;border:1px solid #ddd">Rs. ${entry.customerShare}</td></tr>
+          <tr><td style="padding:8px;border:1px solid #ddd;background:#f9fafb;font-weight:600">OD Type</td><td style="padding:8px;border:1px solid #ddd">${entry.odType || "Group OD"}</td></tr>
+          ${entry.odType === "Individual OD"
+            ? `<tr><td style="padding:8px;border:1px solid #ddd;background:#f9fafb;font-weight:600">OD Amount Due</td><td style="padding:8px;border:1px solid #ddd">Rs. ${entry.amountDue || 0}</td></tr>`
+            : `<tr><td style="padding:8px;border:1px solid #ddd;background:#f9fafb;font-weight:600">Group OD Amount</td><td style="padding:8px;border:1px solid #ddd">Rs. ${entry.groupOdAmount || 0}</td></tr>
+          <tr><td style="padding:8px;border:1px solid #ddd;background:#f9fafb;font-weight:600">Customer Share</td><td style="padding:8px;border:1px solid #ddd">Rs. ${entry.customerShare || 0}</td></tr>`
+          }
           <tr><td style="padding:8px;border:1px solid #ddd;background:#f9fafb;font-weight:600">PTP Date & Time</td><td style="padding:8px;border:1px solid #ddd;color:#c2410c;font-weight:600">${formatDMY(entry.ptpDate)} ${entry.ptpTime || ""}</td></tr>
           <tr><td style="padding:8px;border:1px solid #ddd;background:#f9fafb;font-weight:600">Recorded By</td><td style="padding:8px;border:1px solid #ddd">${entry.enteredByName || entry.enteredBy}</td></tr>
         </table>
@@ -276,7 +280,8 @@ async function checkPTPReminders() {
   for (const entry of ptpEntries) {
     const isToday = entry.ptpDate === today;
     const urgency = isToday ? "TODAY" : "TOMORROW";
-    const msg = `PTP Reminder (${urgency}): Collect cash payment from ${entry.customerName} (${entry.customerId}) - Branch: ${entry.branch} - PTP Date: ${formatDMY(entry.ptpDate)} - Amount: Rs. ${entry.groupOdPaidAmount || entry.totalPaidAmount || "N/A"}`;
+    const odAmountLabel = entry.odType === "Individual OD" ? (entry.amountDue || "N/A") : (entry.customerShare || entry.groupOdPaidAmount || entry.totalPaidAmount || "N/A");
+    const msg = `PTP Reminder (${urgency}): Collect cash payment from ${entry.customerName} (${entry.customerId}) - Branch: ${entry.branch} - OD Type: ${entry.odType || "Group OD"} - PTP Date: ${formatDMY(entry.ptpDate)} - Amount Due: Rs. ${odAmountLabel}`;
 
     // Check if we already sent this notification today
     const alreadySent = notifications.some(n =>

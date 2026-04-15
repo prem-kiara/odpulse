@@ -108,22 +108,23 @@ const exportToCSV = (entries, filename) => {
   const rows = [[
     "Date", "Time", "Branch", "Customer Name", "Customer ID", "Loan Account No.",
     "OD Type",
-    "Self OD Amount Due", "Self OD Paid", "Self OD Waiver",
-    "Group OD Amount Due", "No. of Customers in Group", "Customer Share (Auto)", "Group OD Paid", "Group OD Waiver",
+    "OD Amount Due", "No. of Customers in Group", "Customer Share (Auto)", "OD Paid", "OD Waiver",
     "Total Paid", "Total Waiver",
     "Payment Mode", "UPI Reference", "PTP Date",
     "Waiver Approver", "Approval Subject", "Approval Date", "Recorded By"
   ]];
   entries.forEach(e => {
-    const customerShare = e.customerShare !== undefined ? e.customerShare : (e.numberOfCustomers > 0 ? Math.round(e.groupOdAmount / e.numberOfCustomers) : 0);
+    const isIndiv = e.odType === "Individual OD";
+    const customerShare = isIndiv ? e.amountDue : (e.customerShare !== undefined ? e.customerShare : (e.numberOfCustomers > 0 ? Math.round(e.groupOdAmount / e.numberOfCustomers) : 0));
+    const odAmountDue = isIndiv ? (e.amountDue || 0) : (e.groupOdAmount || 0);
+    const odPaid = isIndiv ? (e.paidAmount !== undefined ? e.paidAmount : getPaidCSV(e)) : (e.groupOdPaidAmount !== undefined ? e.groupOdPaidAmount : (e.customerShare || 0));
+    const odWaiver = isIndiv ? (e.waiver || 0) : (e.groupOdWaiver !== undefined ? e.groupOdWaiver : (e.waiver || 0));
     rows.push([
       e.date, e.time, e.branch,
       e.customerName, e.customerId, e.loanAccountNo,
       e.odType || "Group OD",
-      e.selfOdAmountDue || 0, e.selfOdPaidAmount || 0, e.selfOdWaiver || 0,
-      e.groupOdAmount || 0, e.numberOfCustomers || 0, customerShare,
-      e.groupOdPaidAmount !== undefined ? e.groupOdPaidAmount : (e.customerShare || 0),
-      e.groupOdWaiver !== undefined ? e.groupOdWaiver : (e.waiver || 0),
+      odAmountDue, isIndiv ? 1 : (e.numberOfCustomers || 0), isIndiv ? odAmountDue : customerShare,
+      odPaid, odWaiver,
       getPaidCSV(e), e.waiver || 0,
       e.paymentMode || "", e.upiReference || "", e.ptpDate || "",
       e.waiverApproval ? e.waiverApproval.approverName : "",
@@ -159,6 +160,68 @@ const getDateRangePresets = () => {
     { label: "This Year", from: fmt(startOfYear), to: fmt(today) },
   ];
 };
+
+// ─── Multi-Select Dropdown ──────────────────────────────────────────────────
+function MultiSelectDropdown({ label, options, selected, onChange, colorClass = "teal" }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef(null);
+
+  useEffect(() => {
+    const handler = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false); };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, []);
+
+  const toggle = (value) => onChange(selected.includes(value) ? selected.filter(v => v !== value) : [...selected, value]);
+  const selectAll = () => onChange(options.map(o => o.value));
+  const clearAll = () => onChange([]);
+
+  const btnColor = colorClass === "indigo"
+    ? "border-indigo-300 bg-indigo-50 text-indigo-700"
+    : "border-teal-300 bg-teal-50 text-teal-700";
+  const checkColor = colorClass === "indigo" ? "accent-indigo-600" : "accent-teal-600";
+
+  return (
+    <div className="relative" ref={ref}>
+      <button onClick={() => setOpen(!open)}
+        className={`flex items-center gap-1.5 px-3 py-2 border rounded-lg text-sm transition-colors hover:shadow-sm ${selected.length > 0 ? btnColor : "bg-white text-gray-600 border-gray-300 hover:border-gray-400"}`}>
+        {selected.length === 0 ? `All ${label}` : `${label}: ${selected.length} selected`}
+        <ChevronDown size={13} className={`transition-transform ${open ? "rotate-180" : ""}`} />
+      </button>
+      {/* Selected pills */}
+      {selected.length > 0 && (
+        <div className="absolute top-full left-0 mt-0.5 flex flex-wrap gap-1 z-10 pointer-events-none max-w-xs">
+          {/* pills shown inline in the filter bar — handled outside this component */}
+        </div>
+      )}
+      {open && (
+        <div className="absolute top-full left-0 mt-1 bg-white border border-gray-200 rounded-xl shadow-xl z-30 w-56 max-h-64 flex flex-col">
+          {/* Header */}
+          <div className="flex items-center justify-between px-3 py-2 border-b text-xs text-gray-500">
+            <span className="font-semibold">{label}</span>
+            <div className="flex gap-2">
+              <button onClick={selectAll} className="text-teal-600 hover:underline">All</button>
+              <span>·</span>
+              <button onClick={clearAll} className="text-red-500 hover:underline">Clear</button>
+            </div>
+          </div>
+          {/* Options */}
+          <div className="overflow-y-auto flex-1">
+            {options.length === 0
+              ? <p className="px-3 py-3 text-xs text-gray-400">No options available</p>
+              : options.map(opt => (
+                <label key={opt.value} className="flex items-center gap-2.5 px-3 py-2 hover:bg-gray-50 cursor-pointer">
+                  <input type="checkbox" checked={selected.includes(opt.value)} onChange={() => toggle(opt.value)} className={`rounded ${checkColor}`} />
+                  <span className="text-sm text-gray-700 truncate">{opt.label}</span>
+                </label>
+              ))
+            }
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function DateRangeFilter({ dateFrom, dateTo, setDateFrom, setDateTo }) {
   const presets = getDateRangePresets();
@@ -376,7 +439,7 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
 
   return (
     <div className="max-w-2xl mx-auto">
-      <h2 className="text-xl font-bold text-gray-900 mb-6 flex items-center gap-2"><Plus size={22} className="text-teal-600" /> New Group OD Recovery Entry</h2>
+      <h2 className="text-xl font-bold text-gray-900 mb-6 flex items-center gap-2"><Plus size={22} className="text-teal-600" /> Group OD Entry</h2>
 
       {/* Section 1: Customer Details */}
       <div className="bg-white rounded-xl shadow-sm border p-5 mb-4">
@@ -510,13 +573,258 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
   );
 }
 
+// ─── Individual OD Entry Form ────────────────────────────────────────────────
+function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
+  const [branch, setBranch] = useState(user.branch || "");
+  const [date] = useState(nowDate());
+  const [customerName, setCustomerName] = useState("");
+  const [customerId, setCustomerId] = useState("");
+  const [loanAccountNo, setLoanAccountNo] = useState("");
+  const [amountDue, setAmountDue] = useState("");
+  const [paidAmount, setPaidAmount] = useState("");
+  const [approvalEmailSubject, setApprovalEmailSubject] = useState("");
+  const [paymentMode, setPaymentMode] = useState("");
+  const [upiReference, setUpiReference] = useState("");
+  const [ptpDate, setPtpDate] = useState("");
+  const [ptpTime, setPtpTime] = useState("");
+  const [showWaiverModal, setShowWaiverModal] = useState(false);
+  const [pendingEntry, setPendingEntry] = useState(null);
+
+  const isPtpFuture = (() => {
+    if (!ptpDate) return false;
+    const ptpDateTime = new Date(`${ptpDate}T${ptpTime || "23:59"}`);
+    return ptpDateTime > new Date();
+  })();
+
+  const due = Number(amountDue) || 0;
+  const paid = isPtpFuture ? 0 : (Number(paidAmount) || 0);
+  const waiver = isPtpFuture ? 0 : Math.max(0, due - paid);
+
+  const isValidDate = (dateStr) => { const d = new Date(dateStr); return d instanceof Date && !isNaN(d); };
+
+  const handleSave = () => {
+    if (!branch) { alert("Please select a branch."); return; }
+    if (!customerName.trim()) { alert("Please enter customer name."); return; }
+    if (!customerId.trim()) { alert("Please enter customer ID."); return; }
+    if (!loanAccountNo.trim()) { alert("Please enter loan account number."); return; }
+    if (due <= 0) { alert("Please enter OD Amount Due."); return; }
+    if (!isPtpFuture && paid < 0) { alert("Paid Amount cannot be negative."); return; }
+    if (!paymentMode) { alert("Please select a Payment Mode."); return; }
+    if (paymentMode === "UPI" && !upiReference.trim()) { alert("Please enter UPI Transaction Reference."); return; }
+    if (paymentMode === "Cash" && ptpDate && !isValidDate(ptpDate)) { alert("Please enter a valid PTP date."); return; }
+    if (paymentMode === "Cash" && ptpDate && !ptpTime) { alert("Please enter PTP time."); return; }
+    if (!isPtpFuture && waiver > 0 && !approvalEmailSubject.trim()) { alert("Waiver detected. Please enter the approval email subject line."); return; }
+
+    const isDup = entries.some(e =>
+      e.customerId === customerId.trim() && e.loanAccountNo === loanAccountNo.trim() && e.date === date && e.branch === branch && e.odType === "Individual OD"
+    );
+    if (isDup && !confirm("A similar entry already exists for this customer today. Save anyway?")) return;
+
+    const entry = {
+      id: generateId(), date, time: nowTime(), branch,
+      customerName: customerName.trim(), customerId: customerId.trim(), loanAccountNo: loanAccountNo.trim(),
+      odType: "Individual OD",
+      amountDue: due,
+      paidAmount: isPtpFuture ? 0 : paid,
+      waiver: isPtpFuture ? 0 : waiver,
+      totalPaidAmount: isPtpFuture ? 0 : paid,
+      paymentMode,
+      upiReference: paymentMode === "UPI" ? upiReference.trim() : "",
+      ptpDate: paymentMode === "Cash" ? ptpDate : "",
+      ptpTime: paymentMode === "Cash" ? ptpTime : "",
+      ptpStatus: isPtpFuture ? "pending" : "na",
+      ptpPaidDate: null,
+      ptpPaymentRef: null,
+      ptpReminderSent: false,
+      waiverApproval: (!isPtpFuture && waiver > 0) ? { approverName: user.name, emailSubject: approvalEmailSubject.trim(), approvalDate: date } : null,
+      enteredBy: user.id, enteredByName: user.name,
+    };
+
+    if (waiver > 0) {
+      setPendingEntry(entry);
+      setShowWaiverModal(true);
+    } else {
+      saveIndivEntry(entry);
+    }
+  };
+
+  const saveIndivEntry = (entry) => {
+    const updated = [entry, ...entries];
+    setEntries(updated);
+    localStorage.setItem(STORAGE_KEYS.entries, JSON.stringify(updated));
+    fetch(`${API_BASE}/entries/append`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(entry),
+    }).catch(err => console.warn("[API append]", err.message));
+
+    if (entry.ptpStatus === "pending" && entry.ptpDate) {
+      const existingNotifs = loadData(STORAGE_KEYS.notifications, []);
+      const allUsers = loadData(STORAGE_KEYS.users, []);
+      const recipientIds = new Set();
+      recipientIds.add(entry.enteredBy);
+      allUsers.filter(u => u.role === "admin" || u.role === "elevated_staff").forEach(u => recipientIds.add(u.id));
+      const ptpNotifs = [...recipientIds].map(userId => ({
+        id: generateId(),
+        type: "ptp_pending",
+        message: `PTP Pending: ${entry.customerName} (${entry.customerId}) - Branch: ${entry.branch} - PTP: ${formatDateDMY(entry.ptpDate)} ${entry.ptpTime || ""} - Amount Due: ${formatINR(entry.amountDue)}`,
+        entryId: entry.id,
+        userId: entry.enteredBy,
+        forUserId: userId,
+        date: new Date().toISOString(),
+        read: false,
+        ptpDate: entry.ptpDate,
+        ptpTime: entry.ptpTime,
+        persistent: true,
+      }));
+      saveData(STORAGE_KEYS.notifications, [...ptpNotifs, ...existingNotifs]);
+    }
+
+    setCustomerName(""); setCustomerId(""); setLoanAccountNo("");
+    setAmountDue(""); setPaidAmount(""); setApprovalEmailSubject("");
+    setPaymentMode(""); setUpiReference(""); setPtpDate(""); setPtpTime("");
+    setPage("ind_records");
+  };
+
+  const handleWaiverConfirm = (approval) => {
+    if (pendingEntry) {
+      saveIndivEntry({ ...pendingEntry, waiverApproval: approval });
+      setPendingEntry(null);
+      setShowWaiverModal(false);
+    }
+  };
+
+  return (
+    <div className="max-w-2xl mx-auto">
+      <h2 className="text-xl font-bold text-gray-900 mb-6 flex items-center gap-2"><Plus size={22} className="text-indigo-600" /> Individual OD Entry</h2>
+
+      {/* Customer Details */}
+      <div className="bg-white rounded-xl shadow-sm border p-5 mb-4">
+        <h3 className="text-sm font-semibold text-indigo-700 uppercase tracking-wide mb-4">Customer Details</h3>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Branch *</label>
+            <select value={branch} onChange={e => setBranch(e.target.value)} className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500">
+              <option value="">Select Branch</option>
+              {branches.map(b => <option key={b} value={b}>{b}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Date</label>
+            <input type="date" value={date} disabled className="w-full px-3 py-2 border rounded-lg bg-gray-100 text-gray-600" />
+          </div>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Customer Name *</label>
+            <input type="text" value={customerName} onChange={e => setCustomerName(e.target.value)}
+              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500" placeholder="Full name" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Customer ID *</label>
+            <input type="text" value={customerId} onChange={e => setCustomerId(e.target.value)}
+              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500" placeholder="e.g. CUST001" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Loan Account No. *</label>
+            <input type="text" value={loanAccountNo} onChange={e => setLoanAccountNo(e.target.value)}
+              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500" placeholder="e.g. LA12345" />
+          </div>
+        </div>
+      </div>
+
+      {/* Transaction Details */}
+      <div className="bg-white rounded-xl shadow-sm border p-5 mb-4">
+        <h3 className="text-sm font-semibold text-indigo-700 uppercase tracking-wide mb-4">Transaction Details</h3>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">OD Amount Due *</label>
+            <input type="number" min="0" value={amountDue} onChange={e => setAmountDue(e.target.value)}
+              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500" placeholder="e.g. 10000" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Payment Mode *</label>
+            <select value={paymentMode} onChange={e => setPaymentMode(e.target.value)} className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500">
+              <option value="">Select</option>
+              <option value="Cash">Cash</option>
+              <option value="UPI">UPI</option>
+            </select>
+          </div>
+        </div>
+        {paymentMode === "Cash" && (
+          <div className="mb-4">
+            <label className="block text-sm font-medium text-gray-700 mb-1">PTP Date & Time</label>
+            <div className="flex gap-2">
+              <input type="date" value={ptpDate} onChange={e => setPtpDate(e.target.value)}
+                className="flex-1 px-3 py-2 border rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500" />
+              <input type="time" value={ptpTime} onChange={e => setPtpTime(e.target.value)}
+                className="w-28 px-3 py-2 border rounded-lg focus:ring-2 focus:ring-green-500 focus:border-green-500" />
+            </div>
+            <p className="text-xs text-gray-500 mt-1">Set when the customer has promised to pay</p>
+          </div>
+        )}
+        {paymentMode === "UPI" && (
+          <div className="mb-4">
+            <label className="block text-sm font-medium text-gray-700 mb-1">UPI Transaction Reference *</label>
+            <input type="text" value={upiReference} onChange={e => setUpiReference(e.target.value)}
+              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500" placeholder="e.g. UPI_TRANS_12345" />
+          </div>
+        )}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Paid Amount {isPtpFuture ? "" : "*"}</label>
+            {isPtpFuture ? (
+              <div>
+                <input readOnly value="Payment pending (PTP)"
+                  className="w-full px-3 py-2 border border-orange-300 rounded-lg bg-orange-50 text-orange-700 font-medium cursor-not-allowed" />
+                <p className="text-xs text-orange-600 mt-1 flex items-center gap-1"><Clock size={10} /> PTP is in the future — payment will be recorded later</p>
+              </div>
+            ) : (
+              <input type="number" min="0" value={paidAmount} onChange={e => setPaidAmount(e.target.value)}
+                className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500" placeholder="e.g. 10000" />
+            )}
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Waiver (Auto)</label>
+            <input readOnly value={formatINR(waiver)}
+              className={`w-full px-3 py-2 border rounded-lg font-semibold cursor-default ${waiver > 0 ? "bg-amber-50 border-amber-300 text-amber-700" : "bg-green-50 border-green-300 text-green-700"}`} />
+            {waiver > 0 && <p className="text-xs text-amber-600 mt-1 font-medium">Approval required</p>}
+          </div>
+        </div>
+        {waiver > 0 && (
+          <div className="mt-4 p-4 bg-amber-50 rounded-lg border border-amber-200">
+            <div className="flex items-center gap-2 mb-2">
+              <AlertTriangle size={16} className="text-amber-600" />
+              <p className="text-sm font-semibold text-amber-800">Waiver of {formatINR(waiver)} requires approval</p>
+            </div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Approval Email Subject *</label>
+            <input type="text" value={approvalEmailSubject} onChange={e => setApprovalEmailSubject(e.target.value)}
+              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-amber-500 focus:border-amber-500" placeholder="e.g. OD Waiver Approval - Branch Name - Customer Name" />
+          </div>
+        )}
+      </div>
+
+      <button onClick={handleSave}
+        className="w-full py-3 bg-indigo-600 text-white rounded-xl font-semibold hover:bg-indigo-700 transition-colors flex items-center justify-center gap-2 shadow-lg shadow-indigo-200">
+        <Save size={18} /> Save Entry
+      </button>
+
+      {showWaiverModal && (
+        <WaiverApprovalModal waiverAmount={waiver} onConfirm={handleWaiverConfirm} onCancel={() => { setShowWaiverModal(false); setPendingEntry(null); }} />
+      )}
+    </div>
+  );
+}
+
 // ─── PTP Payment Modal ─────────────────────────────────────────────────────
 function PTPPaymentModal({ entry, onSave, onCancel }) {
   const [paidAmount, setPaidAmount] = useState("");
   const [paymentRef, setPaymentRef] = useState("");
   const [paymentMode, setPaymentMode] = useState("Cash");
 
-  const customerShare = entry.customerShare || (entry.numberOfCustomers > 0 ? Math.round(entry.groupOdAmount / entry.numberOfCustomers) : 0);
+  const customerShare = entry.odType === "Individual OD"
+    ? (entry.amountDue || 0)
+    : (entry.customerShare || (entry.numberOfCustomers > 0 ? Math.round(entry.groupOdAmount / entry.numberOfCustomers) : 0));
   const paid = Number(paidAmount) || 0;
   const waiver = Math.max(0, customerShare - paid);
 
@@ -547,8 +855,8 @@ function PTPPaymentModal({ entry, onSave, onCancel }) {
         </div>
         <div className="bg-gray-50 rounded-lg p-3 mb-4 text-sm space-y-1">
           <div className="flex justify-between"><span className="text-gray-500">Branch:</span><span className="font-medium">{entry.branch}</span></div>
-          <div className="flex justify-between"><span className="text-gray-500">Group OD Amount:</span><span className="font-medium">{formatINR(entry.groupOdAmount)}</span></div>
-          <div className="flex justify-between"><span className="text-gray-500">Customer Share:</span><span className="font-medium">{formatINR(customerShare)}</span></div>
+          <div className="flex justify-between"><span className="text-gray-500">{entry.odType === "Individual OD" ? "OD Amount Due:" : "Group OD Amount:"}</span><span className="font-medium">{formatINR(entry.odType === "Individual OD" ? entry.amountDue : entry.groupOdAmount)}</span></div>
+          {entry.odType !== "Individual OD" && <div className="flex justify-between"><span className="text-gray-500">Customer Share:</span><span className="font-medium">{formatINR(customerShare)}</span></div>}
           <div className="flex justify-between"><span className="text-gray-500">PTP Date:</span><span className="font-medium">{formatDateDMY(entry.ptpDate)} {entry.ptpTime || ""}</span></div>
         </div>
         <div className="space-y-3">
@@ -585,9 +893,10 @@ function PTPPaymentModal({ entry, onSave, onCancel }) {
 }
 
 // ─── Records Table ──────────────────────────────────────────────────────────
-function RecordsTable({ user, entries, setEntries, config, branches, notifications, setNotifications }) {
+function RecordsTable({ user, entries, setEntries, config, branches, notifications, setNotifications, odTypeFilter }) {
   const [searchTerm, setSearchTerm] = useState("");
-  const [branchFilter, setBranchFilter] = useState("");
+  const [selectedBranches, setSelectedBranches] = useState([]);
+  const [selectedStaff, setSelectedStaff] = useState([]);
   const [paymentModeFilter, setPaymentModeFilter] = useState("");
   const [ptpStatusFilter, setPtpStatusFilter] = useState("");
   const [sortField, setSortField] = useState("date");
@@ -598,6 +907,20 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
   const [ptpPaymentEntry, setPtpPaymentEntry] = useState(null); // entry being paid
 
   const canSeeAll = user.role === "admin" || user.role === "elevated_staff";
+
+  // Derive unique staff from entries (filtered by odTypeFilter so only relevant staff show)
+  const staffOptions = useMemo(() => {
+    const typeFiltered = odTypeFilter === "Group OD"
+      ? entries.filter(e => !e.odType || e.odType === "Group OD")
+      : odTypeFilter === "Individual OD"
+        ? entries.filter(e => e.odType === "Individual OD")
+        : entries;
+    const map = {};
+    typeFiltered.forEach(e => {
+      if (e.enteredBy && !map[e.enteredBy]) map[e.enteredBy] = e.enteredByName || e.enteredBy;
+    });
+    return Object.entries(map).map(([value, label]) => ({ value, label })).sort((a, b) => a.label.localeCompare(b.label));
+  }, [entries, odTypeFilter]);
 
   const handlePTPPayment = (paymentData) => {
     if (!ptpPaymentEntry) return;
@@ -642,9 +965,15 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
 
   const visibleEntries = useMemo(() => {
     let data = entries;
+    // Filter by OD type
+    if (odTypeFilter === "Group OD") data = data.filter(e => !e.odType || e.odType === "Group OD");
+    else if (odTypeFilter === "Individual OD") data = data.filter(e => e.odType === "Individual OD");
     // Staff sees only their own entries; elevated_staff and admin see all
     if (user.role === "staff") data = data.filter(e => e.enteredBy === user.id);
-    if (branchFilter) data = data.filter(e => e.branch === branchFilter);
+    // Multi-select branch filter (OR within branches)
+    if (selectedBranches.length > 0) data = data.filter(e => selectedBranches.includes(e.branch));
+    // Multi-select staff filter (OR within staff) — cross-combined AND with branches
+    if (selectedStaff.length > 0) data = data.filter(e => selectedStaff.includes(e.enteredBy));
     if (paymentModeFilter) data = data.filter(e => (e.ptpPaymentMode || e.paymentMode || "") === paymentModeFilter);
     if (ptpStatusFilter) {
       if (ptpStatusFilter === "pending") data = data.filter(e => e.ptpStatus === "pending");
@@ -672,10 +1001,11 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
       else if (sortField === "groupod") cmp = (Number(a.groupOdAmount) || 0) - (Number(b.groupOdAmount) || 0);
       else if (sortField === "branch") cmp = (a.branch || "").localeCompare(b.branch || "");
       else if (sortField === "customer") cmp = (a.customerName || "").localeCompare(b.customerName || "");
+      else if (sortField === "staff") cmp = (a.enteredByName || a.enteredBy || "").localeCompare(b.enteredByName || b.enteredBy || "");
       return sortDir === "desc" ? -cmp : cmp;
     });
     return data;
-  }, [entries, user, config, branchFilter, paymentModeFilter, ptpStatusFilter, dateFrom, dateTo, searchTerm, sortField, sortDir]);
+  }, [entries, user, config, selectedBranches, selectedStaff, paymentModeFilter, ptpStatusFilter, dateFrom, dateTo, searchTerm, sortField, sortDir]);
 
   const canDelete = user.role === "admin" || config.allowStaffDelete;
 
@@ -692,7 +1022,10 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
   return (
     <div>
       <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
-        <h2 className="text-xl font-bold text-gray-900 flex items-center gap-2"><FileText size={22} className="text-teal-600" /> Recovery Records</h2>
+        <h2 className="text-xl font-bold text-gray-900 flex items-center gap-2">
+          <FileText size={22} className={odTypeFilter === "Individual OD" ? "text-indigo-600" : "text-teal-600"} />
+          {odTypeFilter === "Individual OD" ? "Individual OD Records" : "Group OD Records"}
+        </h2>
         <button onClick={() => exportToCSV(visibleEntries, `odpulse-records-${nowDate()}.csv`)}
           className="flex items-center gap-1 px-3 py-1.5 bg-teal-50 text-teal-700 rounded-lg text-sm hover:bg-teal-100 transition-colors">
           <Download size={14} /> Export CSV
@@ -701,7 +1034,8 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
 
       {/* Filters */}
       <div className="bg-white rounded-xl shadow-sm border p-4 mb-4 space-y-3">
-        <div className="flex flex-wrap gap-3">
+        {/* Row 1: search + dropdowns */}
+        <div className="flex flex-wrap gap-3 items-center">
           <div className="flex-1 min-w-[200px]">
             <div className="relative">
               <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
@@ -710,10 +1044,22 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
             </div>
           </div>
           {canSeeAll && (
-            <select value={branchFilter} onChange={e => setBranchFilter(e.target.value)} className="px-3 py-2 border rounded-lg text-sm">
-              <option value="">All Branches</option>
-              {branches.map(b => <option key={b} value={b}>{b}</option>)}
-            </select>
+            <MultiSelectDropdown
+              label="Branches"
+              options={branches.map(b => ({ value: b, label: b }))}
+              selected={selectedBranches}
+              onChange={setSelectedBranches}
+              colorClass={odTypeFilter === "Individual OD" ? "indigo" : "teal"}
+            />
+          )}
+          {canSeeAll && staffOptions.length > 0 && (
+            <MultiSelectDropdown
+              label="Staff"
+              options={staffOptions}
+              selected={selectedStaff}
+              onChange={setSelectedStaff}
+              colorClass={odTypeFilter === "Individual OD" ? "indigo" : "teal"}
+            />
           )}
           <select value={paymentModeFilter} onChange={e => setPaymentModeFilter(e.target.value)} className="px-3 py-2 border rounded-lg text-sm">
             <option value="">All Payment Modes</option>
@@ -727,6 +1073,32 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
             <option value="na">Regular (No PTP)</option>
           </select>
         </div>
+        {/* Active filter pills */}
+        {(selectedBranches.length > 0 || selectedStaff.length > 0) && (
+          <div className="flex flex-wrap gap-1.5 pt-1">
+            {selectedBranches.map(b => (
+              <span key={b} className="inline-flex items-center gap-1 px-2 py-0.5 bg-teal-100 text-teal-700 rounded-full text-xs font-medium">
+                {b}
+                <button onClick={() => setSelectedBranches(selectedBranches.filter(x => x !== b))} className="hover:text-teal-900"><X size={10} /></button>
+              </span>
+            ))}
+            {selectedStaff.map(sid => {
+              const opt = staffOptions.find(o => o.value === sid);
+              return (
+                <span key={sid} className="inline-flex items-center gap-1 px-2 py-0.5 bg-indigo-100 text-indigo-700 rounded-full text-xs font-medium">
+                  {opt ? opt.label : sid}
+                  <button onClick={() => setSelectedStaff(selectedStaff.filter(x => x !== sid))} className="hover:text-indigo-900"><X size={10} /></button>
+                </span>
+              );
+            })}
+            {(selectedBranches.length > 0 && selectedStaff.length > 0) && (
+              <button onClick={() => { setSelectedBranches([]); setSelectedStaff([]); }}
+                className="px-2 py-0.5 text-xs text-red-500 hover:text-red-700 hover:underline">
+                Clear all filters
+              </button>
+            )}
+          </div>
+        )}
         <DateRangeFilter dateFrom={dateFrom} dateTo={dateTo} setDateFrom={setDateFrom} setDateTo={setDateTo} />
       </div>
 
@@ -766,12 +1138,16 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
                   </th>
                 ))}
                 <th className="text-left px-4 py-3 font-semibold text-gray-600">Mode</th>
+                <th className="text-left px-4 py-3 font-semibold text-gray-600 cursor-pointer hover:text-teal-700 select-none"
+                  onClick={() => { if (sortField === "staff") setSortDir(sortDir === "desc" ? "asc" : "desc"); else { setSortField("staff"); setSortDir("asc"); } }}>
+                  Staff {sortField === "staff" ? (sortDir === "desc" ? "↓" : "↑") : ""}
+                </th>
                 <th className="text-center px-4 py-3 font-semibold text-gray-600">Actions</th>
               </tr>
             </thead>
             <tbody>
               {visibleEntries.length === 0 ? (
-                <tr><td colSpan={8} className="text-center py-12 text-gray-400">No records found</td></tr>
+                <tr><td colSpan={9} className="text-center py-12 text-gray-400">No records found</td></tr>
               ) : visibleEntries.map(e => {
                 const paid = getPaid(e);
                 return (
@@ -814,6 +1190,9 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
                         "bg-gray-100 text-gray-500"
                       }`}>{e.ptpPaymentMode || e.paymentMode || "—"}</span>
                     </td>
+                    <td className="px-4 py-3">
+                      <div className="text-sm font-medium text-gray-700">{e.enteredByName || e.enteredBy || "—"}</div>
+                    </td>
                     <td className="px-4 py-3 text-center">
                       <div className="flex items-center justify-center gap-2">
                         {e.ptpStatus === "pending" && (
@@ -833,18 +1212,29 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
                   </tr>
                   {expandedId === e.id && (
                     <tr className="bg-gray-50">
-                      <td colSpan={8} className="px-6 py-4 space-y-3">
-                        {/* Group OD breakdown */}
-                        <div className="p-3 bg-teal-50 rounded-lg border border-teal-100">
-                          <p className="text-xs font-semibold text-teal-700 mb-2 uppercase tracking-wide">Group OD</p>
-                          <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 text-sm">
-                            <div><span className="text-gray-500">Amount Due:</span> <span className="font-medium">{formatINR(e.groupOdAmount)}</span></div>
-                            <div><span className="text-gray-500">No. of Customers:</span> <span className="font-medium">{e.numberOfCustomers}</span></div>
-                            <div><span className="text-gray-500">Customer Share:</span> <span className="font-medium">{formatINR(e.customerShare || (e.numberOfCustomers > 0 ? Math.round(e.groupOdAmount / e.numberOfCustomers) : 0))}</span></div>
-                            <div><span className="text-gray-500">Paid:</span> <span className="font-medium text-teal-700">{formatINR(e.groupOdPaidAmount !== undefined ? e.groupOdPaidAmount : e.customerShare)}</span></div>
-                            <div><span className="text-gray-500">Waiver:</span> <span className={`font-medium ${(e.groupOdWaiver || e.waiver) > 0 ? "text-amber-600" : "text-green-600"}`}>{formatINR(e.groupOdWaiver !== undefined ? e.groupOdWaiver : e.waiver)}</span></div>
+                      <td colSpan={9} className="px-6 py-4 space-y-3">
+                        {/* OD breakdown — Group or Individual */}
+                        {e.odType === "Individual OD" ? (
+                          <div className="p-3 bg-indigo-50 rounded-lg border border-indigo-100">
+                            <p className="text-xs font-semibold text-indigo-700 mb-2 uppercase tracking-wide">Individual OD</p>
+                            <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 text-sm">
+                              <div><span className="text-gray-500">Amount Due:</span> <span className="font-medium">{formatINR(e.amountDue)}</span></div>
+                              <div><span className="text-gray-500">Paid:</span> <span className="font-medium text-indigo-700">{formatINR(e.paidAmount !== undefined ? e.paidAmount : e.totalPaidAmount)}</span></div>
+                              <div><span className="text-gray-500">Waiver:</span> <span className={`font-medium ${(e.waiver || 0) > 0 ? "text-amber-600" : "text-green-600"}`}>{formatINR(e.waiver || 0)}</span></div>
+                            </div>
                           </div>
-                        </div>
+                        ) : (
+                          <div className="p-3 bg-teal-50 rounded-lg border border-teal-100">
+                            <p className="text-xs font-semibold text-teal-700 mb-2 uppercase tracking-wide">Group OD</p>
+                            <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 text-sm">
+                              <div><span className="text-gray-500">Amount Due:</span> <span className="font-medium">{formatINR(e.groupOdAmount)}</span></div>
+                              <div><span className="text-gray-500">No. of Customers:</span> <span className="font-medium">{e.numberOfCustomers}</span></div>
+                              <div><span className="text-gray-500">Customer Share:</span> <span className="font-medium">{formatINR(e.customerShare || (e.numberOfCustomers > 0 ? Math.round(e.groupOdAmount / e.numberOfCustomers) : 0))}</span></div>
+                              <div><span className="text-gray-500">Paid:</span> <span className="font-medium text-teal-700">{formatINR(e.groupOdPaidAmount !== undefined ? e.groupOdPaidAmount : e.customerShare)}</span></div>
+                              <div><span className="text-gray-500">Waiver:</span> <span className={`font-medium ${(e.groupOdWaiver || e.waiver) > 0 ? "text-amber-600" : "text-green-600"}`}>{formatINR(e.groupOdWaiver !== undefined ? e.groupOdWaiver : e.waiver)}</span></div>
+                            </div>
+                          </div>
+                        )}
                         {/* Payment Details */}
                         {(e.paymentMode || e.ptpDate) && (
                           <div className={`p-3 rounded-lg border ${e.ptpStatus === "pending" ? "bg-orange-50 border-orange-200" : "bg-blue-50 border-blue-100"}`}>
@@ -1011,8 +1401,11 @@ function Dashboard({ user, entries, branches, config }) {
   const [drillBranch, setDrillBranch] = useState(null);
   const [drillStaff, setDrillStaff] = useState(null);
   const [drillPanel, setDrillPanel] = useState(null); // "entries" | "recovered" | "waiver" | "groupod"
+  const [dashView, setDashView] = useState("group"); // "group" | "individual"
 
-  const visibleEntries = useMemo(() => {
+  const resetDrill = () => { setDrillBranch(null); setDrillStaff(null); setDrillPanel(null); };
+
+  const allVisibleEntries = useMemo(() => {
     let data = entries;
     // Staff sees only their own entries; elevated_staff and admin see all
     if (user.role === "staff") data = data.filter(e => e.enteredBy === user.id);
@@ -1021,12 +1414,20 @@ function Dashboard({ user, entries, branches, config }) {
     return data;
   }, [entries, user, config, dateFrom, dateTo]);
 
+  const visibleEntries = useMemo(() => {
+    if (dashView === "group") return allVisibleEntries.filter(e => !e.odType || e.odType === "Group OD");
+    return allVisibleEntries.filter(e => e.odType === "Individual OD");
+  }, [allVisibleEntries, dashView]);
+
   // Helper: backward compat — old entries used customerShare as paid, new entries have totalPaidAmount
   const getEntryPaid = (e) => e.totalPaidAmount !== undefined ? e.totalPaidAmount : (Number(e.customerShare) || 0);
 
+  // Helper: get the OD amount due (Group OD uses groupOdAmount; Individual OD uses amountDue)
+  const getODAmount = (e) => e.odType === "Individual OD" ? (Number(e.amountDue) || 0) : (Number(e.groupOdAmount) || 0);
+
   const stats = useMemo(() => {
     const totalRecovered = visibleEntries.reduce((s, e) => s + getEntryPaid(e), 0);
-    const totalGroupOD = visibleEntries.reduce((s, e) => s + (Number(e.groupOdAmount) || 0), 0);
+    const totalGroupOD = visibleEntries.reduce((s, e) => s + getODAmount(e), 0);
     const totalWaiver = visibleEntries.reduce((s, e) => s + (Number(e.waiver) || 0), 0);
     const entriesWithWaiver = visibleEntries.filter(e => (Number(e.waiver) || 0) > 0).length;
 
@@ -1036,7 +1437,7 @@ function Dashboard({ user, entries, branches, config }) {
       if (!byBranch[e.branch]) byBranch[e.branch] = { branch: e.branch, recovered: 0, waiver: 0, groupOD: 0, count: 0 };
       byBranch[e.branch].recovered += getEntryPaid(e);
       byBranch[e.branch].waiver += Number(e.waiver) || 0;
-      byBranch[e.branch].groupOD += Number(e.groupOdAmount) || 0;
+      byBranch[e.branch].groupOD += getODAmount(e);
       byBranch[e.branch].count += 1;
     });
     const branchData = Object.values(byBranch).sort((a, b) => b.recovered - a.recovered);
@@ -1049,7 +1450,7 @@ function Dashboard({ user, entries, branches, config }) {
       if (!byStaff[staffId]) byStaff[staffId] = { staffId, staff: staffName, recovered: 0, waiver: 0, groupOD: 0, count: 0 };
       byStaff[staffId].recovered += getEntryPaid(e);
       byStaff[staffId].waiver += Number(e.waiver) || 0;
-      byStaff[staffId].groupOD += Number(e.groupOdAmount) || 0;
+      byStaff[staffId].groupOD += getODAmount(e);
       byStaff[staffId].count += 1;
     });
     const staffData = Object.values(byStaff).sort((a, b) => b.recovered - a.recovered);
@@ -1109,7 +1510,7 @@ function Dashboard({ user, entries, branches, config }) {
           <div className="bg-white rounded-xl border p-4"><p className="text-xs text-gray-500">Total Entries</p><p className="text-2xl font-bold">{panelEntries.length}</p></div>
           <div className="bg-white rounded-xl border p-4"><p className="text-xs text-gray-500">Total Recovered</p><p className="text-2xl font-bold text-teal-700">{formatLakhs(panelEntries.reduce((s, e) => s + getEntryPaid(e), 0))}</p></div>
           <div className="bg-white rounded-xl border p-4"><p className="text-xs text-gray-500">Total Waiver</p><p className="text-2xl font-bold text-amber-700">{formatLakhs(panelEntries.reduce((s, e) => s + (Number(e.waiver) || 0), 0))}</p></div>
-          <div className="bg-white rounded-xl border p-4"><p className="text-xs text-gray-500">Group OD Total</p><p className="text-2xl font-bold text-gray-600">{formatLakhs(panelEntries.reduce((s, e) => s + (Number(e.groupOdAmount) || 0), 0))}</p></div>
+          <div className="bg-white rounded-xl border p-4"><p className="text-xs text-gray-500">Total OD Due</p><p className="text-2xl font-bold text-gray-600">{formatLakhs(panelEntries.reduce((s, e) => s + getODAmount(e), 0))}</p></div>
         </div>
 
         {/* Branch-wise breakdown */}
@@ -1315,7 +1716,18 @@ function Dashboard({ user, entries, branches, config }) {
   return (
     <div>
       <div className="flex flex-wrap items-center justify-between gap-3 mb-4">
-        <h2 className="text-xl font-bold text-gray-900 flex items-center gap-2"><LayoutDashboard size={22} className="text-teal-600" /> Dashboard</h2>
+        <h2 className="text-xl font-bold text-gray-900 flex items-center gap-2"><LayoutDashboard size={22} className={dashView === "individual" ? "text-indigo-600" : "text-teal-600"} /> Dashboard</h2>
+      </div>
+      {/* OD Type Toggle */}
+      <div className="flex gap-3 mb-4">
+        <button onClick={() => { setDashView("group"); resetDrill(); }}
+          className={`px-5 py-2 rounded-xl font-semibold text-sm transition-colors flex items-center gap-2 ${dashView === "group" ? "bg-teal-600 text-white shadow-md shadow-teal-200" : "bg-white text-gray-600 border hover:bg-gray-50"}`}>
+          <Users size={15} /> Group OD
+        </button>
+        <button onClick={() => { setDashView("individual"); resetDrill(); }}
+          className={`px-5 py-2 rounded-xl font-semibold text-sm transition-colors flex items-center gap-2 ${dashView === "individual" ? "bg-indigo-600 text-white shadow-md shadow-indigo-200" : "bg-white text-gray-600 border hover:bg-gray-50"}`}>
+          <UserPlus size={15} /> Individual OD
+        </button>
       </div>
       <div className="mb-4"><DateRangeFilter dateFrom={dateFrom} dateTo={dateTo} setDateFrom={setDateFrom} setDateTo={setDateTo} /></div>
 
@@ -1337,7 +1749,7 @@ function Dashboard({ user, entries, branches, config }) {
           <p className="text-xs text-gray-400">{stats.entriesWithWaiver} entries · <span className="text-teal-600">View details →</span></p>
         </div>
         <div className="bg-white rounded-xl border p-4 cursor-pointer hover:shadow-md transition-shadow" onClick={() => setDrillPanel("groupod")}>
-          <p className="text-xs text-gray-500 mb-1">Group OD Total</p>
+          <p className="text-xs text-gray-500 mb-1">{dashView === "individual" ? "Total Individual OD Due" : "Total Group OD Due"}</p>
           <p className="text-2xl font-bold text-gray-600">{formatLakhs(stats.totalGroupOD)}</p>
           <p className="text-xs text-teal-600 mt-1">View details →</p>
         </div>
@@ -1705,6 +2117,71 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
     e.target.value = "";
   };
 
+  const handleBulkIndividualEntries = (e) => {
+    const file = e.target.files[0]; if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const rows = parseCSV(ev.target.result);
+      let added = 0;
+      const newEntries = [];
+      rows.forEach(r => {
+        const customerName = (r["Customer Name"] || r.customerName || "").trim();
+        const customerId = (r["Customer ID"] || r.customerId || "").trim();
+        const loanAccountNo = (r["Loan Account No"] || r["Loan Account No."] || r.loanAccountNo || "").trim();
+        const branch = (r.Branch || r.branch || "").trim();
+        if (!customerName || !customerId || !branch) return;
+
+        let rawDate = (r.Date || r.date || "").trim();
+        rawDate = rawDate.replace(/[./]/g, "-");
+        if (/^\d{1,2}-\d{1,2}-\d{2}$/.test(rawDate)) { const p = rawDate.split("-"); p[2] = "20" + p[2]; rawDate = p.join("-"); }
+        if (/^\d{1,2}-\d{1,2}-\d{4}$/.test(rawDate)) {
+          const parts = rawDate.split("-");
+          const d = parts[0].padStart(2, "0"), m = parts[1].padStart(2, "0"), y = parts[2];
+          rawDate = Number(d) > 12 ? `${y}-${m}-${d}` : `${y}-${m}-${d}`;
+        }
+        if (rawDate && !/^\d{4}-\d{2}-\d{2}$/.test(rawDate)) rawDate = "";
+        if (!rawDate) rawDate = nowDate();
+
+        const num = (v) => { const c = String(v || "").replace(/[^\d.\-]/g, ""); const n = Number(c); return isNaN(n) ? 0 : n; };
+
+        const amountDue = num(r["OD Amount Due"] || r["Amount Due"] || r.amountDue);
+        const paidAmount = num(r["OD Paid"] || r["Paid Amount"] || r.paidAmount);
+        const waiver = Math.max(0, amountDue - paidAmount);
+        const approvalSubject = (r["Approval Subject"] || "").trim();
+        const recordedByRaw = (r["Recorded By"] || r["Entered By"] || "").trim();
+        const matchedUser = recordedByRaw ? users.find(u => u.name.toLowerCase() === recordedByRaw.toLowerCase() || u.username.toLowerCase() === recordedByRaw.toLowerCase()) : null;
+        const enteredById = matchedUser ? matchedUser.id : (recordedByRaw || "admin");
+        const enteredByName = matchedUser ? matchedUser.name : (recordedByRaw || "Bulk Upload");
+        const paymentMode = (r["Payment Mode"] || r.paymentMode || "").trim();
+        const upiReference = (r["UPI Reference"] || r.upiReference || "").trim();
+
+        let ptpDateRaw = (r["PTP Date"] || r.ptpDate || "").trim();
+        if (ptpDateRaw) {
+          ptpDateRaw = ptpDateRaw.replace(/[./]/g, "-");
+          if (/^\d{1,2}-\d{1,2}-\d{2}$/.test(ptpDateRaw)) { const p = ptpDateRaw.split("-"); p[2] = "20" + p[2]; ptpDateRaw = p.join("-"); }
+          if (/^\d{1,2}-\d{1,2}-\d{4}$/.test(ptpDateRaw)) { const parts = ptpDateRaw.split("-"); ptpDateRaw = `${parts[2]}-${parts[1].padStart(2, "0")}-${parts[0].padStart(2, "0")}`; }
+          if (!/^\d{4}-\d{2}-\d{2}$/.test(ptpDateRaw)) ptpDateRaw = "";
+        }
+
+        newEntries.push({
+          id: generateId(), date: rawDate, time: (r.Time || r.time || "00:00").trim(), branch,
+          customerName, customerId, loanAccountNo,
+          odType: "Individual OD",
+          amountDue, paidAmount, waiver, totalPaidAmount: paidAmount,
+          paymentMode, upiReference, ptpDate: ptpDateRaw, ptpReminderSent: false,
+          waiverApproval: waiver > 0 && approvalSubject ? { approverName: (r["Waiver Approver"] || "Bulk Upload").trim(), emailSubject: approvalSubject, approvalDate: rawDate } : null,
+          enteredBy: enteredById, enteredByName,
+        });
+        added++;
+      });
+      const allEntries = [...newEntries, ...entries];
+      setEntries(allEntries); saveData(STORAGE_KEYS.entries, allEntries);
+      alert(`Imported ${added} Individual OD entries. Total: ${allEntries.length}`);
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  };
+
   return (
     <div>
       <h2 className="text-xl font-bold text-gray-900 mb-4 flex items-center gap-2"><Settings size={22} className="text-teal-600" /> Admin Panel</h2>
@@ -1815,14 +2292,25 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
 
       {tab === "bulk" && (
         <div className="space-y-4">
-          {/* Bulk Upload Entries */}
+          {/* Bulk Upload Group OD Entries */}
           <div className="bg-white rounded-xl border p-5">
-            <h3 className="font-semibold text-gray-800 mb-2 flex items-center gap-2"><Upload size={18} className="text-teal-600" /> Bulk Upload Entries (Historical Data)</h3>
-            <p className="text-sm text-gray-500 mb-3">Upload a CSV file with columns: Date, Branch, Customer Name, Customer ID, Loan Account No., OD Type, Self OD Amount Due, Self OD Paid, Group OD Amount Due, No. of Customers, Group OD Paid, Time, Recorded By, Approval Subject, Waiver Approver, Payment Mode, UPI Reference, PTP Date</p>
-            <p className="text-xs text-gray-400 mb-3">Date format: dd-mm-yyyy or yyyy-mm-dd. OD Type: "Self OD" or "Group OD". Waivers are auto-calculated. "Recorded By" captures who collected the payment.</p>
+            <h3 className="font-semibold text-gray-800 mb-2 flex items-center gap-2"><Upload size={18} className="text-teal-600" /> Bulk Upload Group OD Entries</h3>
+            <p className="text-sm text-gray-500 mb-3">Upload a CSV file with columns: Date, Branch, Customer Name, Customer ID, Loan Account No., Group OD Amount Due, No. of Customers, Group OD Paid, Time, Recorded By, Approval Subject, Waiver Approver, Payment Mode, UPI Reference, PTP Date</p>
+            <p className="text-xs text-gray-400 mb-3">Date format: dd-mm-yyyy or yyyy-mm-dd. Waivers are auto-calculated. "Recorded By" captures who collected the payment.</p>
             <label className="inline-flex items-center gap-2 px-4 py-2 bg-teal-600 text-white rounded-lg text-sm hover:bg-teal-700 cursor-pointer transition-colors">
               <Upload size={14} /> Choose CSV File
               <input type="file" accept=".csv" onChange={handleBulkEntries} className="hidden" />
+            </label>
+          </div>
+
+          {/* Bulk Upload Individual OD Entries */}
+          <div className="bg-white rounded-xl border p-5">
+            <h3 className="font-semibold text-gray-800 mb-2 flex items-center gap-2"><Upload size={18} className="text-indigo-600" /> Bulk Upload Individual OD Entries</h3>
+            <p className="text-sm text-gray-500 mb-3">Upload a CSV file with columns: Date, Branch, Customer Name, Customer ID, Loan Account No., OD Amount Due, OD Paid, Time, Recorded By, Approval Subject, Waiver Approver, Payment Mode, UPI Reference, PTP Date</p>
+            <p className="text-xs text-gray-400 mb-3">Date format: dd-mm-yyyy or yyyy-mm-dd. Waivers are auto-calculated (OD Amount Due − OD Paid). "Recorded By" captures who collected the payment.</p>
+            <label className="inline-flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700 cursor-pointer transition-colors">
+              <Upload size={14} /> Choose CSV File
+              <input type="file" accept=".csv" onChange={handleBulkIndividualEntries} className="hidden" />
             </label>
           </div>
 
@@ -1851,11 +2339,18 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
             <h3 className="font-semibold text-gray-800 mb-3">Download CSV Templates</h3>
             <div className="flex flex-wrap gap-3">
               <button onClick={() => {
-                const csv = "Date,Branch,Customer Name,Customer ID,Loan Account No.,OD Type,Self OD Amount Due,Self OD Paid,Group OD Amount Due,No. of Customers,Group OD Paid,Time,Recorded By,Approval Subject,Waiver Approver,Payment Mode,UPI Reference,PTP Date\n01-04-2025,Annur,Sample Customer,CUST001,LA001,Group OD,0,0,50000,5,8000,10:30,Vijila,,,Cash,,";
+                const csv = "Date,Branch,Customer Name,Customer ID,Loan Account No.,Group OD Amount Due,No. of Customers,Group OD Paid,Time,Recorded By,Approval Subject,Waiver Approver,Payment Mode,UPI Reference,PTP Date\n01-04-2025,Annur,Sample Customer,CUST001,LA001,50000,5,8000,10:30,Vijila,,,Cash,,";
                 const blob = new Blob([csv], { type: "text/csv" });
-                const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "entries-template.csv"; a.click();
-              }} className="px-3 py-2 bg-gray-100 text-gray-700 rounded-lg text-sm hover:bg-gray-200 transition-colors flex items-center gap-1">
-                <Download size={14} /> Entries Template
+                const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "group-od-entries-template.csv"; a.click();
+              }} className="px-3 py-2 bg-teal-50 text-teal-700 rounded-lg text-sm hover:bg-teal-100 transition-colors flex items-center gap-1">
+                <Download size={14} /> Group OD Template
+              </button>
+              <button onClick={() => {
+                const csv = "Date,Branch,Customer Name,Customer ID,Loan Account No.,OD Amount Due,OD Paid,Time,Recorded By,Approval Subject,Waiver Approver,Payment Mode,UPI Reference,PTP Date\n01-04-2025,Annur,Sample Customer,CUST001,LA001,10000,10000,10:30,Vijila,,,Cash,,";
+                const blob = new Blob([csv], { type: "text/csv" });
+                const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "individual-od-entries-template.csv"; a.click();
+              }} className="px-3 py-2 bg-indigo-50 text-indigo-700 rounded-lg text-sm hover:bg-indigo-100 transition-colors flex items-center gap-1">
+                <Download size={14} /> Individual OD Template
               </button>
               <button onClick={() => {
                 const csv = "Branch\nNew Branch 1\nNew Branch 2";
@@ -2046,6 +2541,7 @@ export default function App() {
   const [config, setConfig] = useState(DEFAULT_CONFIG);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [notifications, setNotifications] = useState([]);
+  const [entryType, setEntryType] = useState("group"); // "group" | "individual"
 
   useEffect(() => {
     // Try to load from API first, fall back to localStorage
@@ -2138,7 +2634,8 @@ export default function App() {
   const navItems = [
     { key: "dashboard", icon: LayoutDashboard, label: "Dashboard" },
     { key: "entry", icon: Plus, label: "New Entry" },
-    { key: "records", icon: FileText, label: "Records" },
+    { key: "records", icon: FileText, label: "Group OD" },
+    { key: "ind_records", icon: FileText, label: "Individual OD" },
     { key: "notifications", icon: Bell, label: "Notifications", badge: unreadNotificationsCount > 0 ? unreadNotificationsCount : null },
     ...(isAdmin ? [{ key: "admin", icon: Shield, label: "Admin" }] : []),
   ];
@@ -2175,8 +2672,12 @@ export default function App() {
           <nav className="p-3 space-y-1">
             {navItems.map(item => (
               <button key={item.key} onClick={() => { setPage(item.key); setSidebarOpen(false); }}
-                className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors relative ${page === item.key ? "bg-teal-50 text-teal-700" : "text-gray-600 hover:bg-gray-50"}`}>
-                <item.icon size={18} /> {item.label}
+                className={`w-full flex items-center gap-2.5 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors relative ${
+                  page === item.key
+                    ? item.key === "ind_records" ? "bg-indigo-50 text-indigo-700" : "bg-teal-50 text-teal-700"
+                    : "text-gray-600 hover:bg-gray-50"
+                }`}>
+                <item.icon size={18} className={page === item.key && item.key === "ind_records" ? "text-indigo-600" : ""} /> {item.label}
                 {item.badge && <span className="absolute right-2 top-1/2 -translate-y-1/2 inline-flex items-center justify-center w-5 h-5 bg-red-600 text-white text-xs font-bold rounded-full">{item.badge}</span>}
               </button>
             ))}
@@ -2189,8 +2690,27 @@ export default function App() {
         {/* Main content */}
         <main className="flex-1 p-4 lg:p-6 min-h-[calc(100vh-60px)]">
           {page === "dashboard" && <Dashboard user={user} entries={entries} branches={branches} config={config} />}
-          {page === "entry" && <EntryForm user={user} branches={branches} entries={entries} setEntries={setEntries} setPage={setPage} />}
-          {page === "records" && <RecordsTable user={user} entries={entries} setEntries={setEntries} config={config} branches={branches} notifications={notifications} setNotifications={setNotifications} />}
+          {page === "entry" && (
+            <div>
+              {/* Entry type toggle */}
+              <div className="flex gap-3 mb-6">
+                <button onClick={() => setEntryType("group")}
+                  className={`px-5 py-2.5 rounded-xl font-semibold text-sm transition-colors flex items-center gap-2 ${entryType === "group" ? "bg-teal-600 text-white shadow-lg shadow-teal-200" : "bg-white text-gray-600 border hover:bg-gray-50"}`}>
+                  <Users size={15} /> Group OD Entry
+                </button>
+                <button onClick={() => setEntryType("individual")}
+                  className={`px-5 py-2.5 rounded-xl font-semibold text-sm transition-colors flex items-center gap-2 ${entryType === "individual" ? "bg-indigo-600 text-white shadow-lg shadow-indigo-200" : "bg-white text-gray-600 border hover:bg-gray-50"}`}>
+                  <UserPlus size={15} /> Individual OD Entry
+                </button>
+              </div>
+              {entryType === "group"
+                ? <EntryForm user={user} branches={branches} entries={entries} setEntries={setEntries} setPage={setPage} />
+                : <IndividualEntryForm user={user} branches={branches} entries={entries} setEntries={setEntries} setPage={setPage} />
+              }
+            </div>
+          )}
+          {page === "records" && <RecordsTable user={user} entries={entries} setEntries={setEntries} config={config} branches={branches} notifications={notifications} setNotifications={setNotifications} odTypeFilter="Group OD" />}
+          {page === "ind_records" && <RecordsTable user={user} entries={entries} setEntries={setEntries} config={config} branches={branches} notifications={notifications} setNotifications={setNotifications} odTypeFilter="Individual OD" />}
           {page === "notifications" && <NotificationsPage user={user} users={users} notifications={notifications} setNotifications={setNotifications} />}
           {page === "admin" && user.role === "admin" && <AdminPanel users={users} setUsers={setUsers} branches={branches} setBranches={setBranches} config={config} setConfig={setConfig} entries={entries} setEntries={setEntries} notifications={notifications} setNotifications={setNotifications} />}
         </main>
