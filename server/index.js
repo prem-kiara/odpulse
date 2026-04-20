@@ -4,10 +4,16 @@ const fs = require("fs");
 const path = require("path");
 const cron = require("node-cron");
 const nodemailer = require("nodemailer");
+const multer = require("multer");
+
+const db = require("./db");
+const { ingestPool, ingestAccrued, purgeOldSnapshots } = require("./ingest");
 
 const app = express();
 const PORT = 3001;
 const DATA_DIR = path.join(__dirname, "data");
+const BRANCHES_FILE = path.join(DATA_DIR, "branches.json");
+const RETENTION_DAYS = 90;
 
 // ─── Ensure data directory exists ───────────────────────────────────────────
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -34,7 +40,7 @@ const DEFAULT_USERS = [
   { id: "u_dinesh", username: "dinesh", password: "Dhanam@123", role: "elevated_staff", name: "Dinesh", branch: "Head Office", active: true, mustChangePassword: true },
 ];
 
-const DEFAULT_CONFIG = { companyName: "OD Pulse - MFI Recovery Tracker", allowStaffEdit: false, allowStaffDelete: false, staffSeeAllBranches: false };
+const DEFAULT_CONFIG = { companyName: "OD Pulse - MFI Recovery Tracker", allowStaffEdit: false, allowStaffDelete: false, staffSeeAllBranches: false, odInsightsAccessUserIds: [] };
 
 // ─── File helpers ───────────────────────────────────────────────────────────
 function loadJSON(filename, fallback) {
@@ -190,16 +196,422 @@ function getCustomerBase() {
 
 app.get("/api/customers/lookup", (req, res) => {
   const { phone, aadhaar } = req.query;
-  const db = getCustomerBase();
+  const base = getCustomerBase();
   let customers = [];
+  let key = "";
   if (phone) {
-    const key = String(phone).replace(/\D/g, "");
-    customers = db.byPhone[key] || [];
+    key = String(phone).replace(/\D/g, "");
+    customers = (base.byPhone[key] || []).slice();
   } else if (aadhaar) {
-    const key = String(aadhaar).replace(/\D/g, "");
-    customers = db.byAadhaar[key] || [];
+    key = String(aadhaar).replace(/\D/g, "");
+    customers = (base.byAadhaar[key] || []).slice();
   }
+
+  // Also query the OD SQLite customers table — so customers ingested via the
+  // Pool Report are reachable by phone/Aadhaar even if they aren't in the
+  // legacy customer-base.json file.
+  if (key) {
+    try {
+      let rows = [];
+      if (phone) {
+        // mobile_number in OD data may be stored with or without country code / dashes.
+        rows = db.prepare(
+          "SELECT loan_account_no, customer_number, customer_name, mobile_number, aadhaar_number FROM customers WHERE REPLACE(REPLACE(REPLACE(mobile_number,' ',''),'-',''),'+','') LIKE ?"
+        ).all("%" + key + "%");
+      } else if (aadhaar) {
+        rows = db.prepare(
+          "SELECT loan_account_no, customer_number, customer_name, mobile_number, aadhaar_number FROM customers WHERE REPLACE(REPLACE(aadhaar_number,' ',''),'-','') = ?"
+        ).all(key);
+      }
+      // Dedupe against existing customers by loanAccountNo (or customerId fallback).
+      const seen = new Set(customers.map(c => (c.loanAccountNo || c.customerId || "").toString()));
+      for (const r of rows) {
+        const k = (r.loan_account_no || r.customer_number || "").toString();
+        if (seen.has(k)) continue;
+        seen.add(k);
+        customers.push({
+          name: r.customer_name || "",
+          customerId: r.customer_number || "",
+          loanAccountNo: r.loan_account_no || "",
+          aadhaar: r.aadhaar_number || "",
+          phone: r.mobile_number || "",
+        });
+      }
+    } catch (e) {
+      console.error("[customers/lookup] OD fallback failed:", e.message);
+    }
+  }
+
   res.json({ found: customers.length > 0, customers });
+});
+
+// ─── OD Recovery (Pool + Accrued Interest) ─────────────────────────────────
+// Gating: frontend only allows admin/elevated_staff to reach upload UI; the
+// server additionally honours an `x-od-role` header on uploads as a belt-and-
+// suspenders check. Read endpoints are unrestricted (same pattern as existing
+// /api/:collection routes).
+
+const uploader = multer({ limits: { fileSize: 150 * 1024 * 1024 } });
+
+// Wraps multer.single() so Multer errors (file-size, disk, etc.) always come back
+// as JSON with a meaningful message instead of crashing Express into a blank body.
+function uploadField(fieldName) {
+  return (req, res, next) => {
+    uploader.single(fieldName)(req, res, (err) => {
+      if (err) {
+        console.error(`[UPLOAD:${fieldName}] multer error:`, err);
+        return res.status(400).json({ error: `Upload error: ${err.message || err.code || "unknown"}` });
+      }
+      next();
+    });
+  };
+}
+
+function requireUploader(req, res, next) {
+  const role = req.header("x-od-role") || "";
+  if (role !== "admin" && role !== "elevated_staff") {
+    return res.status(403).json({ error: "Only admin or elevated_staff can upload OD data." });
+  }
+  next();
+}
+
+function todayIso() { return new Date().toISOString().slice(0, 10); }
+
+// POST /api/od/pool/upload — ingest Compressed Pool Report (pipe-delimited)
+app.post("/api/od/pool/upload", requireUploader, uploadField("file"), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+  const t0 = Date.now();
+  try {
+    const snapshotDate = (req.body.snapshotDate || todayIso()).slice(0, 10);
+    const uploadedBy = req.header("x-od-user") || "unknown";
+    console.log(`[POOL UPLOAD] ${req.file.originalname} (${(req.file.size/1024/1024).toFixed(2)}MB) for ${snapshotDate}`);
+    const result = ingestPool(req.file.buffer.toString("utf8"), {
+      snapshotDate, branchesFile: BRANCHES_FILE, uploadedBy, filename: req.file.originalname,
+    });
+    console.log(`[POOL UPLOAD] done in ${Date.now()-t0}ms — ${result.rowCount} rows, ${result.newBranches} new branches`);
+    res.json({ ok: true, snapshotDate, ...result });
+  } catch (err) {
+    console.error("[POOL UPLOAD] error:", err);
+    if (!res.headersSent) res.status(500).json({ error: err.message || String(err) });
+  }
+});
+
+// POST /api/od/accrued/upload — ingest Interest Accrued Not Due Report (comma)
+app.post("/api/od/accrued/upload", requireUploader, uploadField("file"), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+  const t0 = Date.now();
+  try {
+    const snapshotDate = (req.body.snapshotDate || todayIso()).slice(0, 10);
+    const uploadedBy = req.header("x-od-user") || "unknown";
+    console.log(`[ACCRUED UPLOAD] ${req.file.originalname} (${(req.file.size/1024/1024).toFixed(2)}MB) for ${snapshotDate}`);
+    const result = ingestAccrued(req.file.buffer.toString("utf8"), {
+      snapshotDate, branchesFile: BRANCHES_FILE, uploadedBy, filename: req.file.originalname,
+    });
+    console.log(`[ACCRUED UPLOAD] done in ${Date.now()-t0}ms — ${result.rowCount} rows, col=${result.currentAccruedColumn}`);
+    res.json({ ok: true, snapshotDate, ...result });
+  } catch (err) {
+    console.error("[ACCRUED UPLOAD] error:", err);
+    if (!res.headersSent) res.status(500).json({ error: err.message || String(err) });
+  }
+});
+
+// GET /api/od/customer-lookup?loanAccountNo=...  (or customerId=...)
+app.get("/api/od/customer-lookup", (req, res) => {
+  const loan = String(req.query.loanAccountNo || "").trim();
+  const custNum = String(req.query.customerId || "").trim();
+  let customer = null;
+  if (loan) {
+    customer = db.prepare("SELECT * FROM customers WHERE loan_account_no = ?").get(loan);
+  }
+  if (!customer && custNum) {
+    customer = db.prepare("SELECT * FROM customers WHERE customer_number = ? LIMIT 1").get(custNum);
+  }
+  const lookupLoan = customer?.loan_account_no || loan;
+  if (!lookupLoan) return res.status(400).json({ error: "loanAccountNo or customerId required" });
+
+  const latestPool = db.prepare(
+    "SELECT * FROM pool_snapshots WHERE loan_account_no = ? ORDER BY snapshot_date DESC LIMIT 1"
+  ).get(lookupLoan);
+  const latestAccrued = db.prepare(
+    "SELECT * FROM accrued_snapshots WHERE loan_account_no = ? ORDER BY snapshot_date DESC LIMIT 1"
+  ).get(lookupLoan);
+
+  if (!customer && !latestPool && !latestAccrued) return res.json({ found: false });
+
+  const principalOutstanding = latestPool?.principal_outstanding ?? 0;
+  const accruedInterest = latestAccrued?.accrued_interest ?? 0;
+  const unpaidInterest = latestPool?.interest_overdue ?? 0; // "Interest OverDue" per user
+  const foreclosureValue = principalOutstanding + accruedInterest + unpaidInterest;
+
+  res.json({
+    found: true,
+    customer: customer || null,
+    pool: latestPool || null,
+    accrued: latestAccrued || null,
+    principalOutstanding,
+    accruedInterest,
+    unpaidInterest,
+    foreclosureValue,
+    poolSnapshotDate: latestPool?.snapshot_date || null,
+    accruedSnapshotDate: latestAccrued?.snapshot_date || null,
+  });
+});
+
+// GET /api/od/customers/search?q=&branch=&limit=20
+app.get("/api/od/customers/search", (req, res) => {
+  const q = String(req.query.q || "").trim();
+  const branch = String(req.query.branch || "").trim();
+  const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || "20", 10)));
+  if (!q && !branch) return res.json({ results: [] });
+
+  let sql = `SELECT loan_account_no, customer_number, customer_name, branch, mobile_number, aadhaar_number
+             FROM customers WHERE 1=1`;
+  const params = [];
+  if (q) {
+    sql += ` AND (loan_account_no LIKE ? OR customer_number LIKE ? OR customer_name LIKE ?
+                   OR mobile_number LIKE ? OR aadhaar_number LIKE ?)`;
+    const pat = `%${q}%`;
+    params.push(pat, pat, pat, pat, pat);
+  }
+  if (branch) { sql += ` AND branch = ?`; params.push(branch); }
+  sql += ` LIMIT ?`;
+  params.push(limit);
+  res.json({ results: db.prepare(sql).all(...params) });
+});
+
+// GET /api/od/metrics/dpd-buckets?date=&branch=
+app.get("/api/od/metrics/dpd-buckets", (req, res) => {
+  const date = req.query.date ||
+    db.prepare(`SELECT MAX(snapshot_date) AS d FROM pool_snapshots`).get()?.d;
+  if (!date) return res.json({ snapshotDate: null, buckets: [] });
+  const branch = String(req.query.branch || "");
+
+  let sql = `SELECT
+      CASE
+        WHEN overdue_days <= 0 THEN '0-Current'
+        WHEN overdue_days BETWEEN 1 AND 30 THEN '1-30'
+        WHEN overdue_days BETWEEN 31 AND 60 THEN '31-60'
+        WHEN overdue_days BETWEEN 61 AND 90 THEN '61-90'
+        WHEN overdue_days BETWEEN 91 AND 180 THEN '91-180'
+        ELSE '180+'
+      END AS bucket,
+      COUNT(*) AS accounts,
+      SUM(COALESCE(principal_overdue,0) + COALESCE(interest_overdue,0)) AS overdue_amount,
+      SUM(COALESCE(principal_outstanding,0)) AS principal_outstanding
+    FROM pool_snapshots WHERE snapshot_date = ?`;
+  const params = [date];
+  if (branch) { sql += ` AND branch = ?`; params.push(branch); }
+  sql += ` GROUP BY bucket
+           ORDER BY CASE bucket WHEN '0-Current' THEN 0 WHEN '1-30' THEN 1 WHEN '31-60' THEN 2
+                               WHEN '61-90' THEN 3 WHEN '91-180' THEN 4 ELSE 5 END`;
+  res.json({ snapshotDate: date, buckets: db.prepare(sql).all(...params) });
+});
+
+// GET /api/od/metrics/od-trend?from=&to=&branch=
+app.get("/api/od/metrics/od-trend", (req, res) => {
+  const from = String(req.query.from || "");
+  const to = String(req.query.to || "");
+  const branch = String(req.query.branch || "");
+
+  let sql = `SELECT snapshot_date,
+      SUM(COALESCE(principal_overdue,0))   AS principal_overdue,
+      SUM(COALESCE(interest_overdue,0))    AS interest_overdue,
+      SUM(COALESCE(principal_outstanding,0)) AS principal_outstanding,
+      COUNT(*) AS accounts
+    FROM pool_snapshots WHERE 1=1`;
+  const params = [];
+  if (from) { sql += ` AND snapshot_date >= ?`; params.push(from); }
+  if (to)   { sql += ` AND snapshot_date <= ?`; params.push(to); }
+  if (branch) { sql += ` AND branch = ?`; params.push(branch); }
+  sql += ` GROUP BY snapshot_date ORDER BY snapshot_date`;
+  res.json({ trend: db.prepare(sql).all(...params) });
+});
+
+// GET /api/od/metrics/branch-concentration?date=
+app.get("/api/od/metrics/branch-concentration", (req, res) => {
+  const date = req.query.date ||
+    db.prepare(`SELECT MAX(snapshot_date) AS d FROM pool_snapshots`).get()?.d;
+  if (!date) return res.json({ snapshotDate: null, branches: [] });
+  const branches = db.prepare(`SELECT branch,
+      COUNT(*) AS accounts,
+      SUM(COALESCE(principal_overdue,0) + COALESCE(interest_overdue,0)) AS overdue_amount,
+      SUM(COALESCE(principal_outstanding,0)) AS principal_outstanding
+    FROM pool_snapshots WHERE snapshot_date = ?
+    GROUP BY branch ORDER BY overdue_amount DESC`).all(date);
+  res.json({ snapshotDate: date, branches });
+});
+
+// GET /api/od/metrics/non-contactable?branch=
+app.get("/api/od/metrics/non-contactable", (req, res) => {
+  const branch = String(req.query.branch || "");
+  let sql = `SELECT c.loan_account_no, c.customer_name, c.branch, c.mobile_number, c.residence_phone,
+                    p.overdue_days, (COALESCE(p.principal_overdue,0)+COALESCE(p.interest_overdue,0)) AS overdue_amount
+             FROM customers c
+             LEFT JOIN pool_snapshots p ON p.loan_account_no = c.loan_account_no
+                 AND p.snapshot_date = (SELECT MAX(snapshot_date) FROM pool_snapshots WHERE loan_account_no = c.loan_account_no)
+             WHERE (c.mobile_number IS NULL OR c.mobile_number = '')
+               AND (c.residence_phone IS NULL OR c.residence_phone = '')
+               AND p.overdue_days > 0`;
+  const params = [];
+  if (branch) { sql += ` AND c.branch = ?`; params.push(branch); }
+  sql += ` ORDER BY overdue_amount DESC LIMIT 500`;
+  res.json({ customers: db.prepare(sql).all(...params) });
+});
+
+// GET /api/od/metrics/foreclosure-opportunity?threshold=0.5&branch=
+app.get("/api/od/metrics/foreclosure-opportunity", (req, res) => {
+  const threshold = Math.max(0, Math.min(2, parseFloat(req.query.threshold || "0.5")));
+  const branch = String(req.query.branch || "");
+  let sql = `WITH latest_pool AS (
+      SELECT * FROM pool_snapshots p WHERE snapshot_date = (
+        SELECT MAX(snapshot_date) FROM pool_snapshots WHERE loan_account_no = p.loan_account_no
+      )
+    ), latest_accrued AS (
+      SELECT * FROM accrued_snapshots a WHERE snapshot_date = (
+        SELECT MAX(snapshot_date) FROM accrued_snapshots WHERE loan_account_no = a.loan_account_no
+      )
+    )
+    SELECT c.loan_account_no, c.customer_name, c.branch, c.mobile_number, c.loan_amount,
+      COALESCE(p.principal_outstanding,0) AS principal_outstanding,
+      COALESCE(a.accrued_interest,0) AS accrued_interest,
+      COALESCE(p.interest_overdue,0) AS unpaid_interest,
+      (COALESCE(p.principal_outstanding,0) + COALESCE(a.accrued_interest,0) + COALESCE(p.interest_overdue,0)) AS foreclosure_value,
+      p.overdue_days, p.customer_dpd_classification
+    FROM customers c
+    LEFT JOIN latest_pool p ON p.loan_account_no = c.loan_account_no
+    LEFT JOIN latest_accrued a ON a.loan_account_no = c.loan_account_no
+    WHERE c.loan_amount > 0
+      AND (COALESCE(p.principal_outstanding,0) + COALESCE(a.accrued_interest,0) + COALESCE(p.interest_overdue,0)) > 0
+      AND (COALESCE(p.principal_outstanding,0) + COALESCE(a.accrued_interest,0) + COALESCE(p.interest_overdue,0)) <= c.loan_amount * ?`;
+  const params = [threshold];
+  if (branch) { sql += ` AND c.branch = ?`; params.push(branch); }
+  sql += ` ORDER BY foreclosure_value ASC LIMIT 500`;
+  res.json({ threshold, customers: db.prepare(sql).all(...params) });
+});
+
+// GET /api/od/metrics/efficiency?from=&to=&branch=&granularity=day|week|month
+app.get("/api/od/metrics/efficiency", (req, res) => {
+  const from = String(req.query.from || "");
+  const to = String(req.query.to || todayIso());
+  const branch = String(req.query.branch || "");
+  const gran = String(req.query.granularity || "day");
+
+  const entries = loadJSON("entries.json", []);
+  const inRange = entries.filter(e => {
+    const d = e.ptpPaidDate || e.date;
+    if (!d) return false;
+    if (from && d < from) return false;
+    if (to && d > to) return false;
+    if (branch && e.branch !== branch) return false;
+    return true;
+  });
+
+  const paidOf = (e) => Number(e.totalPaidAmount) || Number(e.groupOdPaidAmount) || Number(e.paidAmount) || 0;
+
+  const bucketKey = (iso) => {
+    if (!iso) return "";
+    if (gran === "month") return iso.slice(0, 7);
+    if (gran === "week") {
+      const dt = new Date(iso);
+      const oneJan = new Date(dt.getUTCFullYear(), 0, 1);
+      const week = Math.ceil((((dt - oneJan) / 86400000) + oneJan.getDay() + 1) / 7);
+      return `${dt.getUTCFullYear()}-W${String(week).padStart(2, "0")}`;
+    }
+    return iso;
+  };
+
+  const map = new Map();
+  for (const e of inRange) {
+    const key = bucketKey(e.ptpPaidDate || e.date);
+    if (!key) continue;
+    const b = map.get(key) || { bucket: key, collected: 0, waiver: 0, entries: 0 };
+    b.collected += paidOf(e);
+    b.waiver += Number(e.groupOdWaiver) || Number(e.waiver) || 0;
+    b.entries += 1;
+    map.set(key, b);
+  }
+  const series = Array.from(map.values()).sort((a, b) => a.bucket.localeCompare(b.bucket));
+
+  let openingSql = `SELECT SUM(COALESCE(principal_overdue,0) + COALESCE(interest_overdue,0)) AS book
+                    FROM pool_snapshots
+                    WHERE snapshot_date = (
+                      SELECT MIN(snapshot_date) FROM pool_snapshots WHERE snapshot_date >= ?
+                    )`;
+  const openingParams = [from || "1900-01-01"];
+  if (branch) { openingSql += ` AND branch = ?`; openingParams.push(branch); }
+  const openingBook = db.prepare(openingSql).get(...openingParams)?.book || 0;
+
+  const totalCollected = series.reduce((s, b) => s + b.collected, 0);
+  const efficiencyPct = openingBook > 0 ? (totalCollected / openingBook) * 100 : null;
+
+  res.json({ granularity: gran, from, to, branch: branch || null, openingBook, totalCollected, efficiencyPct, series });
+});
+
+// GET /api/od/metrics/officer-productivity?from=&to=&branch=
+app.get("/api/od/metrics/officer-productivity", (req, res) => {
+  const from = String(req.query.from || "");
+  const to = String(req.query.to || "");
+  const branch = String(req.query.branch || "");
+  const entries = loadJSON("entries.json", []);
+  const filtered = entries.filter(e => {
+    const d = e.date;
+    if (from && d < from) return false;
+    if (to && d > to) return false;
+    if (branch && e.branch !== branch) return false;
+    return true;
+  });
+  const paidOf = (e) => Number(e.totalPaidAmount) || Number(e.groupOdPaidAmount) || Number(e.paidAmount) || 0;
+  const byOfficer = new Map();
+  for (const e of filtered) {
+    const key = e.enteredByName || e.enteredBy || "Unknown";
+    const o = byOfficer.get(key) || { officer: key, entries: 0, collected: 0, waiver: 0, ptps: 0, ptpsPaid: 0, ptpsMissed: 0 };
+    o.entries += 1;
+    o.collected += paidOf(e);
+    o.waiver += Number(e.groupOdWaiver) || Number(e.waiver) || 0;
+    if (e.ptpDate) {
+      o.ptps += 1;
+      if (e.ptpStatus === "paid") o.ptpsPaid += 1;
+      else if (e.ptpDate < todayIso()) o.ptpsMissed += 1;
+    }
+    byOfficer.set(key, o);
+  }
+  const officers = Array.from(byOfficer.values()).sort((a, b) => b.collected - a.collected);
+  res.json({ officers });
+});
+
+// GET /api/od/metrics/ptp-conversion?from=&to=&branch=
+app.get("/api/od/metrics/ptp-conversion", (req, res) => {
+  const from = String(req.query.from || "");
+  const to = String(req.query.to || "");
+  const branch = String(req.query.branch || "");
+  const entries = loadJSON("entries.json", []).filter(e => e.ptpDate);
+  const filtered = entries.filter(e => {
+    if (from && e.ptpDate < from) return false;
+    if (to && e.ptpDate > to) return false;
+    if (branch && e.branch !== branch) return false;
+    return true;
+  });
+  const paid = filtered.filter(e => e.ptpStatus === "paid").length;
+  const pending = filtered.filter(e => e.ptpStatus === "pending").length;
+  const missed = filtered.filter(e => e.ptpStatus !== "paid" && e.ptpDate < todayIso()).length;
+  const conversionPct = filtered.length > 0 ? (paid / filtered.length) * 100 : 0;
+  res.json({ totalPTPs: filtered.length, paid, pending, missed, conversionPct });
+});
+
+// GET /api/od/upload-history
+app.get("/api/od/upload-history", (req, res) => {
+  const uploads = db.prepare(`SELECT * FROM upload_log ORDER BY uploaded_at DESC LIMIT 50`).all();
+  const latestPool = db.prepare(`SELECT snapshot_date, COUNT(*) AS rows FROM pool_snapshots
+    WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM pool_snapshots)`).get();
+  const latestAccrued = db.prepare(`SELECT snapshot_date, COUNT(*) AS rows FROM accrued_snapshots
+    WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM accrued_snapshots)`).get();
+  const totalCustomers = db.prepare(`SELECT COUNT(*) AS n FROM customers`).get().n;
+  res.json({ uploads, latestPool, latestAccrued, totalCustomers, retentionDays: RETENTION_DAYS });
+});
+
+// POST /api/od/retention/run — manual retention trigger (admin)
+app.post("/api/od/retention/run", requireUploader, (req, res) => {
+  res.json(purgeOldSnapshots(RETENTION_DAYS));
 });
 
 // ── Generic CRUD (wildcard — must be LAST) ──
@@ -398,6 +810,12 @@ async function checkPTPReminders() {
 // ─── Schedule: Run PTP check at 8:00 AM and 7:00 PM daily ──────────────────
 cron.schedule("0 8 * * *", () => { checkPTPReminders(); });
 cron.schedule("0 19 * * *", () => { checkPTPReminders(); });
+
+// ─── Schedule: Retention purge of OD snapshots > 90 days at 3:00 AM daily ──
+cron.schedule("0 3 * * *", () => {
+  const r = purgeOldSnapshots(RETENTION_DAYS);
+  console.log(`[RETENTION] Purged snapshots older than ${RETENTION_DAYS} days:`, r);
+});
 
 // Also run on server start (catches up after restarts)
 setTimeout(() => { checkPTPReminders(); }, 5000);

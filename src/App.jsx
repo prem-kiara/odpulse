@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend, LineChart, Line } from "recharts";
-import { Plus, Trash2, LogOut, Settings, Users, GitBranch, LayoutDashboard, FileText, ChevronDown, ChevronRight, ArrowLeft, Search, Eye, EyeOff, Edit2, Save, X, AlertTriangle, CheckCircle, Database, Shield, UserPlus, ChevronUp, Download, Calendar, Tag, Lock, Upload, Bell, Clock, CreditCard } from "lucide-react";
+import { Plus, Trash2, LogOut, Settings, Users, GitBranch, LayoutDashboard, FileText, ChevronDown, ChevronRight, ArrowLeft, Search, Eye, EyeOff, Edit2, Save, X, AlertTriangle, CheckCircle, Database, Shield, UserPlus, ChevronUp, Download, Calendar, Tag, Lock, Upload, Bell, Clock, CreditCard, TrendingUp } from "lucide-react";
+import { CustomerInfoPanel, DataUploadPage, CollectionDashboard } from "./OdInsights.jsx";
 
 // ─── Constants & Helpers ────────────────────────────────────────────────────
 const COLORS = ["#0f766e", "#06b6d4", "#8b5cf6", "#f59e0b", "#ef4444", "#10b981", "#ec4899", "#6366f1", "#14b8a6", "#f97316"];
@@ -345,6 +346,7 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
   const [autoFilledFields, setAutoFilledFields] = useState(new Set());
   const [lookupStatus, setLookupStatus] = useState("");
   const [customerMatches, setCustomerMatches] = useState([]);
+  const [odSnap, setOdSnap] = useState(null); // auto-populated OD snapshot from CustomerInfoPanel
   const lookupTimerRef = useRef(null);
 
   const applyCustomer = (c) => {
@@ -598,6 +600,40 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
               placeholder="e.g. LA12345" />
           </div>
         </div>
+        <CustomerInfoPanel loanAccountNo={loanAccountNo} customerId={customerId} hideValueBoxes onData={setOdSnap} />
+      </div>
+
+      {/* Section 2b: OD Snapshot — auto-populated from latest uploaded pool + accrued data */}
+      <div className="bg-white rounded-xl shadow-sm border p-5 mb-4">
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="text-sm font-semibold text-teal-700 uppercase tracking-wide">OD Snapshot (auto)</h3>
+          <span className="text-[11px] text-gray-400">
+            {odSnap ? `As of ${odSnap.poolSnapshotDate || "—"}${odSnap.accruedSnapshotDate ? ` · Accrued ${odSnap.accruedSnapshotDate}` : ""}` : "Enter Loan A/C or Customer ID to look up"}
+          </span>
+        </div>
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Principal Outstanding</label>
+            <input type="text" readOnly tabIndex={-1} value={odSnap ? formatINR(odSnap.principalOutstanding) : "—"}
+              className="w-full px-3 py-2 border rounded-lg bg-gray-50 text-gray-800 font-medium cursor-default" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Unpaid Interest</label>
+            <input type="text" readOnly tabIndex={-1} value={odSnap ? formatINR(odSnap.unpaidInterest) : "—"}
+              className="w-full px-3 py-2 border rounded-lg bg-gray-50 text-gray-800 font-medium cursor-default" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Accrued Interest</label>
+            <input type="text" readOnly tabIndex={-1} value={odSnap ? formatINR(odSnap.accruedInterest) : "—"}
+              className="w-full px-3 py-2 border rounded-lg bg-gray-50 text-gray-800 font-medium cursor-default" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-teal-800 mb-1">Foreclosure Amount</label>
+            <input type="text" readOnly tabIndex={-1} value={odSnap ? formatINR(odSnap.foreclosureValue) : "—"}
+              className="w-full px-3 py-2 border-2 border-teal-500 rounded-lg bg-teal-50 text-teal-900 font-bold cursor-default" />
+          </div>
+        </div>
+        <p className="text-[11px] text-gray-500 mt-2">Foreclosure = Principal Outstanding + Unpaid Interest + Accrued Interest. Values refresh automatically from the latest uploaded OD reports.</p>
       </div>
 
       {/* Section 3: Transaction Details */}
@@ -727,6 +763,7 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
   const [autoFilledFields, setAutoFilledFields] = useState(new Set());
   const [lookupStatus, setLookupStatus] = useState("");
   const [customerMatches, setCustomerMatches] = useState([]);
+  const [odSnap, setOdSnap] = useState(null); // auto-populated OD snapshot from CustomerInfoPanel
   const lookupTimerRef = useRef(null);
 
   const applyCustomer = (c) => {
@@ -968,6 +1005,40 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
             onSelect={c => applyCustomer(c)}
             onClose={() => { setCustomerMatches([]); setLookupStatus(""); }} />
         )}
+        <CustomerInfoPanel loanAccountNo={loanAccountNo} customerId={customerId} hideValueBoxes onData={setOdSnap} />
+      </div>
+
+      {/* OD Snapshot — auto-populated from latest uploaded pool + accrued data */}
+      <div className="bg-white rounded-xl shadow-sm border p-5 mb-4">
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="text-sm font-semibold text-indigo-700 uppercase tracking-wide">OD Snapshot (auto)</h3>
+          <span className="text-[11px] text-gray-400">
+            {odSnap ? `As of ${odSnap.poolSnapshotDate || "—"}${odSnap.accruedSnapshotDate ? ` · Accrued ${odSnap.accruedSnapshotDate}` : ""}` : "Enter Loan A/C or Customer ID to look up"}
+          </span>
+        </div>
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Principal Outstanding</label>
+            <input type="text" readOnly tabIndex={-1} value={odSnap ? formatINR(odSnap.principalOutstanding) : "—"}
+              className="w-full px-3 py-2 border rounded-lg bg-gray-50 text-gray-800 font-medium cursor-default" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Unpaid Interest</label>
+            <input type="text" readOnly tabIndex={-1} value={odSnap ? formatINR(odSnap.unpaidInterest) : "—"}
+              className="w-full px-3 py-2 border rounded-lg bg-gray-50 text-gray-800 font-medium cursor-default" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Accrued Interest</label>
+            <input type="text" readOnly tabIndex={-1} value={odSnap ? formatINR(odSnap.accruedInterest) : "—"}
+              className="w-full px-3 py-2 border rounded-lg bg-gray-50 text-gray-800 font-medium cursor-default" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-indigo-800 mb-1">Foreclosure Amount</label>
+            <input type="text" readOnly tabIndex={-1} value={odSnap ? formatINR(odSnap.foreclosureValue) : "—"}
+              className="w-full px-3 py-2 border-2 border-indigo-500 rounded-lg bg-indigo-50 text-indigo-900 font-bold cursor-default" />
+          </div>
+        </div>
+        <p className="text-[11px] text-gray-500 mt-2">Foreclosure = Principal Outstanding + Unpaid Interest + Accrued Interest. Values refresh automatically from the latest uploaded OD reports.</p>
       </div>
 
       {/* Transaction Details */}
@@ -1482,6 +1553,8 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
                   {expandedId === e.id && (
                     <tr className="bg-gray-50">
                       <td colSpan={9} className="px-6 py-4 space-y-3">
+                        {/* OD pool/accrued live view */}
+                        <CustomerInfoPanel loanAccountNo={e.loanAccountNo} customerId={e.customerId} />
                         {/* OD breakdown — Group or Individual */}
                         {e.odType === "Individual OD" ? (
                           <div className="p-3 bg-indigo-50 rounded-lg border border-indigo-100">
@@ -2910,6 +2983,61 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
               </div>
             </div>
           </div>
+          {/* OD Insights access control */}
+          <div className="bg-white rounded-xl border p-5">
+            <h3 className="font-semibold text-gray-800 mb-1 flex items-center gap-2"><TrendingUp size={18} className="text-teal-600" /> OD Insights Access</h3>
+            <p className="text-xs text-gray-500 mb-4">Admins always have access. Toggle which other users can view the OD Insights dashboards (DPD buckets, efficiency, trends, etc.).</p>
+            {(() => {
+              const accessList = Array.isArray(config.odInsightsAccessUserIds) ? config.odInsightsAccessUserIds : [];
+              const toggleAccess = (uid) => {
+                const next = accessList.includes(uid) ? accessList.filter(id => id !== uid) : [...accessList, uid];
+                handleConfigChange("odInsightsAccessUserIds", next);
+              };
+              const nonAdmins = users.filter(u => u.role !== "admin");
+              const grantedCount = nonAdmins.filter(u => accessList.includes(u.id)).length;
+              const allGranted = nonAdmins.length > 0 && grantedCount === nonAdmins.length;
+              const setAll = (grant) => {
+                handleConfigChange("odInsightsAccessUserIds", grant ? nonAdmins.map(u => u.id) : []);
+              };
+              return (
+                <>
+                  <div className="flex items-center gap-2 mb-3">
+                    <button onClick={() => setAll(true)} className="text-xs px-3 py-1.5 bg-teal-50 text-teal-700 rounded-lg hover:bg-teal-100 border border-teal-100">Grant all</button>
+                    <button onClick={() => setAll(false)} className="text-xs px-3 py-1.5 bg-gray-50 text-gray-600 rounded-lg hover:bg-gray-100 border">Revoke all</button>
+                    <span className="text-xs text-gray-500 ml-2">{grantedCount} of {nonAdmins.length} non-admin users granted</span>
+                  </div>
+                  <div className="max-h-80 overflow-y-auto border rounded-lg divide-y">
+                    {users.map(u => {
+                      const isUserAdmin = u.role === "admin";
+                      const granted = isUserAdmin || accessList.includes(u.id);
+                      const roleLabel = u.role === "elevated_staff" ? "MIS Staff" : u.role === "admin" ? "Admin" : "Staff";
+                      const roleColor = u.role === "admin" ? "bg-purple-100 text-purple-700" : u.role === "elevated_staff" ? "bg-amber-100 text-amber-700" : "bg-blue-100 text-blue-700";
+                      return (
+                        <div key={u.id} className="flex items-center justify-between px-3 py-2.5">
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-2">
+                              <p className="text-sm font-medium text-gray-800 truncate">{u.name}</p>
+                              <span className={`px-2 py-0.5 rounded-full text-[10px] font-medium ${roleColor}`}>{roleLabel}</span>
+                              {!u.active && <span className="text-[10px] text-gray-400">(inactive)</span>}
+                            </div>
+                            <p className="text-xs text-gray-500 truncate">@{u.username}{u.branch ? ` • ${u.branch}` : ""}</p>
+                          </div>
+                          {isUserAdmin ? (
+                            <span className="text-xs text-gray-400 px-2">Always on</span>
+                          ) : (
+                            <button onClick={() => toggleAccess(u.id)}
+                              className={`w-11 h-6 rounded-full transition-colors flex-shrink-0 ${granted ? "bg-teal-600" : "bg-gray-300"}`}>
+                              <div className={`w-5 h-5 bg-white rounded-full shadow transition-transform ${granted ? "translate-x-5" : "translate-x-0.5"}`} />
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </>
+              );
+            })()}
+          </div>
           <div className="bg-white rounded-xl border p-5">
             <h3 className="font-semibold text-amber-700 mb-1 flex items-center gap-2"><AlertTriangle size={18} /> Data Fix</h3>
             <p className="text-xs text-gray-500 mb-3">If Individual OD entries were imported with incorrect waiver amounts (the unpaid balance was mistakenly recorded as a waiver), use this to zero out waivers on all Individual OD entries.</p>
@@ -3158,6 +3286,8 @@ export default function App() {
     { key: "entry", icon: Plus, label: "New Entry" },
     { key: "records", icon: FileText, label: "Group OD" },
     { key: "ind_records", icon: FileText, label: "Individual OD" },
+    ...((isAdmin || (Array.isArray(config.odInsightsAccessUserIds) && config.odInsightsAccessUserIds.includes(user.id))) ? [{ key: "od_insights", icon: TrendingUp, label: "OD Insights" }] : []),
+    ...(isAdmin || isElevated ? [{ key: "od_upload", icon: Upload, label: "OD Upload" }] : []),
     { key: "notifications", icon: Bell, label: "Notifications", badge: unreadNotificationsCount > 0 ? unreadNotificationsCount : null },
     ...(isAdmin ? [{ key: "admin", icon: Shield, label: "Admin" }] : []),
   ];
@@ -3233,6 +3363,8 @@ export default function App() {
           )}
           {page === "records" && <RecordsTable user={user} entries={entries} setEntries={setEntries} config={config} branches={branches} notifications={notifications} setNotifications={setNotifications} odTypeFilter="Group OD" />}
           {page === "ind_records" && <RecordsTable user={user} entries={entries} setEntries={setEntries} config={config} branches={branches} notifications={notifications} setNotifications={setNotifications} odTypeFilter="Individual OD" />}
+          {page === "od_insights" && (isAdmin || (Array.isArray(config.odInsightsAccessUserIds) && config.odInsightsAccessUserIds.includes(user.id))) && <CollectionDashboard user={user} entries={entries} branches={branches} />}
+          {page === "od_upload" && (isAdmin || isElevated) && <DataUploadPage user={user} />}
           {page === "notifications" && <NotificationsPage user={user} users={users} notifications={notifications} setNotifications={setNotifications} />}
           {page === "admin" && user.role === "admin" && <AdminPanel users={users} setUsers={setUsers} branches={branches} setBranches={setBranches} config={config} setConfig={setConfig} entries={entries} setEntries={setEntries} notifications={notifications} setNotifications={setNotifications} />}
         </main>
