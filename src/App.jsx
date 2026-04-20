@@ -5,7 +5,7 @@ import { Plus, Trash2, LogOut, Settings, Users, GitBranch, LayoutDashboard, File
 // ─── Constants & Helpers ────────────────────────────────────────────────────
 const COLORS = ["#0f766e", "#06b6d4", "#8b5cf6", "#f59e0b", "#ef4444", "#10b981", "#ec4899", "#6366f1", "#14b8a6", "#f97316"];
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-const STORAGE_KEYS = { entries: "odpulse_entries", users: "odpulse_users", branches: "odpulse_branches", config: "odpulse_config", version: "odpulse_version", notifications: "odpulse_notifications" };
+const STORAGE_KEYS = { entries: "odpulse_entries", users: "odpulse_users", branches: "odpulse_branches", config: "odpulse_config", version: "odpulse_version", notifications: "odpulse_notifications", lastBulkUpload: "odpulse_last_bulk_upload" };
 const APP_VERSION = 4; // bump this to force re-seed users & branches
 
 const formatINR = (num) => {
@@ -106,8 +106,8 @@ const DEFAULT_CONFIG = { companyName: "OD Pulse - MFI Recovery Tracker", allowSt
 const exportToCSV = (entries, filename) => {
   const getPaidCSV = (e) => e.totalPaidAmount !== undefined ? e.totalPaidAmount : (Number(e.customerShare) || 0);
   const rows = [[
-    "Date", "Time", "Branch", "Customer Name", "Customer ID", "Loan Account No.",
-    "OD Type",
+    "Date", "Time", "Branch", "Customer Name", "Customer ID", "Loan Account No.", "Phone", "Aadhaar (Last 4)",
+    "OD Type", "SMA Bucket",
     "OD Amount Due", "No. of Customers in Group", "Customer Share (Auto)", "OD Paid", "OD Waiver",
     "Total Paid", "Total Waiver",
     "Payment Mode", "UPI Reference", "PTP Date",
@@ -119,10 +119,12 @@ const exportToCSV = (entries, filename) => {
     const odAmountDue = isIndiv ? (e.amountDue || 0) : (e.groupOdAmount || 0);
     const odPaid = isIndiv ? (e.paidAmount !== undefined ? e.paidAmount : getPaidCSV(e)) : (e.groupOdPaidAmount !== undefined ? e.groupOdPaidAmount : (e.customerShare || 0));
     const odWaiver = isIndiv ? (e.waiver || 0) : (e.groupOdWaiver !== undefined ? e.groupOdWaiver : (e.waiver || 0));
+    const aadhaarLast4 = e.aadhaar ? `XXXX XXXX ${String(e.aadhaar).slice(-4)}` : "";
     rows.push([
       e.date, e.time, e.branch,
       e.customerName, e.customerId, e.loanAccountNo,
-      e.odType || "Group OD",
+      e.phone || "", aadhaarLast4,
+      e.odType || "Group OD", isIndiv ? (e.smaBucket || "") : "",
       odAmountDue, isIndiv ? 1 : (e.numberOfCustomers || 0), isIndiv ? odAmountDue : customerShare,
       odPaid, odWaiver,
       getPaidCSV(e), e.waiver || 0,
@@ -293,6 +295,31 @@ function WaiverApprovalModal({ waiverAmount, onConfirm, onCancel }) {
   );
 }
 
+// ─── Customer Picker Modal ───────────────────────────────────────────────────
+function CustomerPicker({ matches, onSelect, onClose, accentColor = "teal" }) {
+  const ring = accentColor === "indigo" ? "hover:border-indigo-300 hover:bg-indigo-50" : "hover:border-teal-300 hover:bg-teal-50";
+  return (
+    <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4">
+      <div className="bg-white rounded-xl shadow-xl p-5 w-full max-w-md">
+        <div className="flex items-center justify-between mb-3">
+          <h3 className="font-semibold text-gray-800">Multiple accounts found — select one</h3>
+          <button onClick={onClose} className="p-1 hover:bg-gray-100 rounded"><X size={16} /></button>
+        </div>
+        <div className="space-y-2 max-h-64 overflow-y-auto">
+          {matches.map((c, i) => (
+            <button key={i} onClick={() => onSelect(c)}
+              className={`w-full text-left p-3 rounded-lg border transition-colors ${ring}`}>
+              <div className="font-medium text-gray-800">{c.name}</div>
+              <div className="text-xs text-gray-500 mt-0.5">Loan: {c.loanAccountNo} &nbsp;·&nbsp; ID: {c.customerId}</div>
+            </button>
+          ))}
+        </div>
+        <button onClick={onClose} className="mt-3 w-full px-4 py-2 bg-gray-100 text-gray-700 rounded-lg text-sm hover:bg-gray-200">Cancel</button>
+      </div>
+    </div>
+  );
+}
+
 // ─── Entry Form ─────────────────────────────────────────────────────────────
 function EntryForm({ user, branches, entries, setEntries, setPage }) {
   const [branch, setBranch] = useState(user.branch || "");
@@ -311,6 +338,56 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
   const [ptpTime, setPtpTime] = useState("");
   const [showWaiverModal, setShowWaiverModal] = useState(false);
   const [pendingEntry, setPendingEntry] = useState(null);
+  // Customer lookup
+  const [phone, setPhone] = useState("");
+  const [aadhaar, setAadhaar] = useState("");
+  const [aadhaarEditable, setAadhaarEditable] = useState(true);
+  const [autoFilledFields, setAutoFilledFields] = useState(new Set());
+  const [lookupStatus, setLookupStatus] = useState("");
+  const [customerMatches, setCustomerMatches] = useState([]);
+  const lookupTimerRef = useRef(null);
+
+  const applyCustomer = (c) => {
+    setCustomerName(c.name);
+    setCustomerId(c.customerId);
+    setLoanAccountNo(c.loanAccountNo);
+    if (c.aadhaar) { setAadhaar(c.aadhaar); setAadhaarEditable(false); }
+    if (c.phone) setPhone(c.phone);
+    setAutoFilledFields(new Set(["customerName", "customerId", "loanAccountNo", "aadhaar"]));
+    setCustomerMatches([]);
+    setLookupStatus("found");
+  };
+  const doLookup = (type, value) => {
+    const clean = value.replace(/\D/g, "");
+    if (clean.length < 8) { setLookupStatus(""); setCustomerMatches([]); return; }
+    setLookupStatus("searching");
+    fetch(`${API_BASE}/customers/lookup?${type}=${clean}`)
+      .then(r => r.json())
+      .then(data => {
+        if (data.found) {
+          if (data.customers.length === 1) { applyCustomer(data.customers[0]); }
+          else { setCustomerMatches(data.customers); setLookupStatus("multiple"); }
+        } else { setCustomerMatches([]); setLookupStatus("notfound"); }
+      })
+      .catch(() => setLookupStatus(""));
+  };
+  const handlePhoneChange = (val) => {
+    setPhone(val);
+    clearTimeout(lookupTimerRef.current);
+    lookupTimerRef.current = setTimeout(() => doLookup("phone", val), 600);
+  };
+  const handleAadhaarInputChange = (val) => {
+    setAadhaar(val);
+    clearTimeout(lookupTimerRef.current);
+    lookupTimerRef.current = setTimeout(() => doLookup("aadhaar", val), 600);
+  };
+  const handleAutoFilledChange = (fieldLabel, setter, newValue) => {
+    if (autoFilledFields.has(fieldLabel)) {
+      if (!window.confirm(`"${fieldLabel}" was auto-filled from the customer database. Are you sure you want to modify it?`)) return;
+      setAutoFilledFields(prev => { const n = new Set(prev); n.delete(fieldLabel); return n; });
+    }
+    setter(newValue);
+  };
 
   // Check if PTP date+time is in the future
   const isPtpFuture = (() => {
@@ -349,6 +426,7 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
     const entry = {
       id: generateId(), date, time: nowTime(), branch,
       customerName: customerName.trim(), customerId: customerId.trim(), loanAccountNo: loanAccountNo.trim(),
+      phone: phone.trim(), aadhaar: aadhaar.replace(/\D/g, ""),
       odType: "Group OD",
       selfOdAmountDue: 0, selfOdPaidAmount: 0, selfOdWaiver: 0,
       groupOdAmount: groupOdDue,
@@ -426,6 +504,8 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
     setApprovalEmailSubject("");
     setNumberOfCustomers(""); setGroupOdAmount(""); setGroupOdPaidAmount("");
     setPaymentMode(""); setUpiReference(""); setPtpDate(""); setPtpTime("");
+    setPhone(""); setAadhaar(""); setAadhaarEditable(true);
+    setAutoFilledFields(new Set()); setLookupStatus(""); setCustomerMatches([]);
     setPage("records");
   };
 
@@ -457,21 +537,65 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
             <input type="date" value={date} disabled className="w-full px-3 py-2 border rounded-lg bg-gray-100 text-gray-600" />
           </div>
         </div>
+        {/* Lookup fields */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-3">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Phone Number <span className="text-gray-400 font-normal">(for auto-fill)</span></label>
+            <input type="tel" value={phone} onChange={e => handlePhoneChange(e.target.value)}
+              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="10-digit mobile number" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Aadhaar Number <span className="text-gray-400 font-normal">(for auto-fill)</span></label>
+            {!aadhaarEditable && aadhaar ? (
+              <div className="flex gap-2">
+                <input disabled value={`XXXX XXXX ${aadhaar.slice(-4)}`} className="flex-1 px-3 py-2 border rounded-lg bg-gray-100 text-gray-600" />
+                <button type="button" onClick={() => {
+                  if (window.confirm("Aadhaar was auto-filled from the customer database. Do you want to edit it?")) {
+                    setAadhaarEditable(true);
+                    setAutoFilledFields(prev => { const n = new Set(prev); n.delete("aadhaar"); return n; });
+                  }
+                }} className="px-3 py-2 bg-gray-200 hover:bg-gray-300 rounded-lg text-xs text-gray-700 flex items-center gap-1">
+                  <Edit2 size={12} /> Edit
+                </button>
+              </div>
+            ) : (
+              <input type="text" value={aadhaar} onChange={e => handleAadhaarInputChange(e.target.value)}
+                className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="12-digit Aadhaar number" />
+            )}
+          </div>
+        </div>
+        {/* Lookup status */}
+        {lookupStatus === "searching" && <p className="text-xs text-gray-500 mb-3">🔍 Searching customer database...</p>}
+        {lookupStatus === "found" && <p className="text-xs text-green-600 mb-3">✓ Customer auto-filled from database. You can still edit the fields below.</p>}
+        {lookupStatus === "notfound" && <p className="text-xs text-amber-600 mb-3">⚠ Customer not found in database. Please fill in the details manually.</p>}
+        {lookupStatus === "multiple" && <p className="text-xs text-blue-600 mb-3">Multiple accounts found — select one from the list.</p>}
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Customer Name *</label>
-            <input type="text" value={customerName} onChange={e => setCustomerName(e.target.value)}
-              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="Full name" />
+            <label className="flex items-center gap-1 text-sm font-medium text-gray-700 mb-1">
+              Customer Name * {autoFilledFields.has("customerName") && <span className="text-teal-600 text-xs font-normal whitespace-nowrap">● filled</span>}
+            </label>
+            <input type="text" value={customerName}
+              onChange={e => handleAutoFilledChange("customerName", setCustomerName, e.target.value)}
+              className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500 ${autoFilledFields.has("customerName") ? "bg-teal-50 border-teal-200" : ""}`}
+              placeholder="Full name" />
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Customer ID *</label>
-            <input type="text" value={customerId} onChange={e => setCustomerId(e.target.value)}
-              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="e.g. CUST001" />
+            <label className="flex items-center gap-1 text-sm font-medium text-gray-700 mb-1">
+              Customer ID * {autoFilledFields.has("customerId") && <span className="text-teal-600 text-xs font-normal whitespace-nowrap">● filled</span>}
+            </label>
+            <input type="text" value={customerId}
+              onChange={e => handleAutoFilledChange("customerId", setCustomerId, e.target.value)}
+              className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500 ${autoFilledFields.has("customerId") ? "bg-teal-50 border-teal-200" : ""}`}
+              placeholder="e.g. CUST001" />
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Loan Account No. *</label>
-            <input type="text" value={loanAccountNo} onChange={e => setLoanAccountNo(e.target.value)}
-              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="e.g. LA12345" />
+            <label className="flex items-center gap-1 text-sm font-medium text-gray-700 mb-1">
+              Loan Account No. * {autoFilledFields.has("loanAccountNo") && <span className="text-teal-600 text-xs font-normal whitespace-nowrap">● filled</span>}
+            </label>
+            <input type="text" value={loanAccountNo}
+              onChange={e => handleAutoFilledChange("loanAccountNo", setLoanAccountNo, e.target.value)}
+              className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500 ${autoFilledFields.has("loanAccountNo") ? "bg-teal-50 border-teal-200" : ""}`}
+              placeholder="e.g. LA12345" />
           </div>
         </div>
       </div>
@@ -569,6 +693,11 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
       {showWaiverModal && (
         <WaiverApprovalModal waiverAmount={waiver} onConfirm={handleWaiverConfirm} onCancel={() => { setShowWaiverModal(false); setPendingEntry(null); }} />
       )}
+      {customerMatches.length > 1 && lookupStatus === "multiple" && (
+        <CustomerPicker matches={customerMatches} accentColor="teal"
+          onSelect={c => applyCustomer(c)}
+          onClose={() => { setCustomerMatches([]); setLookupStatus(""); }} />
+      )}
     </div>
   );
 }
@@ -587,8 +716,60 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
   const [upiReference, setUpiReference] = useState("");
   const [ptpDate, setPtpDate] = useState("");
   const [ptpTime, setPtpTime] = useState("");
+  const [smaBucket, setSmaBucket] = useState("");
+  const [waiverInput, setWaiverInput] = useState("");
   const [showWaiverModal, setShowWaiverModal] = useState(false);
   const [pendingEntry, setPendingEntry] = useState(null);
+  // Customer lookup
+  const [phone, setPhone] = useState("");
+  const [aadhaar, setAadhaar] = useState("");
+  const [aadhaarEditable, setAadhaarEditable] = useState(true);
+  const [autoFilledFields, setAutoFilledFields] = useState(new Set());
+  const [lookupStatus, setLookupStatus] = useState("");
+  const [customerMatches, setCustomerMatches] = useState([]);
+  const lookupTimerRef = useRef(null);
+
+  const applyCustomer = (c) => {
+    setCustomerName(c.name);
+    setCustomerId(c.customerId);
+    setLoanAccountNo(c.loanAccountNo);
+    if (c.aadhaar) { setAadhaar(c.aadhaar); setAadhaarEditable(false); }
+    if (c.phone) setPhone(c.phone);
+    setAutoFilledFields(new Set(["customerName", "customerId", "loanAccountNo", "aadhaar"]));
+    setCustomerMatches([]);
+    setLookupStatus("found");
+  };
+  const doLookup = (type, value) => {
+    const clean = value.replace(/\D/g, "");
+    if (clean.length < 8) { setLookupStatus(""); setCustomerMatches([]); return; }
+    setLookupStatus("searching");
+    fetch(`${API_BASE}/customers/lookup?${type}=${clean}`)
+      .then(r => r.json())
+      .then(data => {
+        if (data.found) {
+          if (data.customers.length === 1) { applyCustomer(data.customers[0]); }
+          else { setCustomerMatches(data.customers); setLookupStatus("multiple"); }
+        } else { setCustomerMatches([]); setLookupStatus("notfound"); }
+      })
+      .catch(() => setLookupStatus(""));
+  };
+  const handlePhoneChange = (val) => {
+    setPhone(val);
+    clearTimeout(lookupTimerRef.current);
+    lookupTimerRef.current = setTimeout(() => doLookup("phone", val), 600);
+  };
+  const handleAadhaarInputChange = (val) => {
+    setAadhaar(val);
+    clearTimeout(lookupTimerRef.current);
+    lookupTimerRef.current = setTimeout(() => doLookup("aadhaar", val), 600);
+  };
+  const handleAutoFilledChange = (fieldLabel, setter, newValue) => {
+    if (autoFilledFields.has(fieldLabel)) {
+      if (!window.confirm(`"${fieldLabel}" was auto-filled from the customer database. Are you sure you want to modify it?`)) return;
+      setAutoFilledFields(prev => { const n = new Set(prev); n.delete(fieldLabel); return n; });
+    }
+    setter(newValue);
+  };
 
   const isPtpFuture = (() => {
     if (!ptpDate) return false;
@@ -598,14 +779,13 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
 
   const due = Number(amountDue) || 0;
   const paid = isPtpFuture ? 0 : (Number(paidAmount) || 0);
-  const waiver = isPtpFuture ? 0 : Math.max(0, due - paid);
+  const waiver = isPtpFuture ? 0 : (Number(waiverInput) || 0);
 
   const isValidDate = (dateStr) => { const d = new Date(dateStr); return d instanceof Date && !isNaN(d); };
 
   const handleSave = () => {
     if (!branch) { alert("Please select a branch."); return; }
     if (!customerName.trim()) { alert("Please enter customer name."); return; }
-    if (!customerId.trim()) { alert("Please enter customer ID."); return; }
     if (!loanAccountNo.trim()) { alert("Please enter loan account number."); return; }
     if (due <= 0) { alert("Please enter OD Amount Due."); return; }
     if (!isPtpFuture && paid < 0) { alert("Paid Amount cannot be negative."); return; }
@@ -615,15 +795,21 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
     if (paymentMode === "Cash" && ptpDate && !ptpTime) { alert("Please enter PTP time."); return; }
     if (!isPtpFuture && waiver > 0 && !approvalEmailSubject.trim()) { alert("Waiver detected. Please enter the approval email subject line."); return; }
 
+    // Auto-detect CSB: no Customer ID + hyphenated loan number (e.g. 0269-80394391-657201)
+    const isCSBCustomer = !customerId.trim() && /\d+-\d+-\d+/.test(loanAccountNo.trim());
+
     const isDup = entries.some(e =>
-      e.customerId === customerId.trim() && e.loanAccountNo === loanAccountNo.trim() && e.date === date && e.branch === branch && e.odType === "Individual OD"
+      e.loanAccountNo === loanAccountNo.trim() && e.date === date && e.branch === branch && e.odType === "Individual OD"
     );
     if (isDup && !confirm("A similar entry already exists for this customer today. Save anyway?")) return;
 
     const entry = {
       id: generateId(), date, time: nowTime(), branch,
       customerName: customerName.trim(), customerId: customerId.trim(), loanAccountNo: loanAccountNo.trim(),
+      phone: phone.trim(), aadhaar: aadhaar.replace(/\D/g, ""),
       odType: "Individual OD",
+      isCSBCustomer: isCSBCustomer || undefined,
+      smaBucket: smaBucket || "",
       amountDue: due,
       paidAmount: isPtpFuture ? 0 : paid,
       waiver: isPtpFuture ? 0 : waiver,
@@ -681,8 +867,10 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
     }
 
     setCustomerName(""); setCustomerId(""); setLoanAccountNo("");
-    setAmountDue(""); setPaidAmount(""); setApprovalEmailSubject("");
+    setAmountDue(""); setPaidAmount(""); setWaiverInput(""); setApprovalEmailSubject("");
     setPaymentMode(""); setUpiReference(""); setPtpDate(""); setPtpTime("");
+    setSmaBucket(""); setPhone(""); setAadhaar(""); setAadhaarEditable(true);
+    setAutoFilledFields(new Set()); setLookupStatus(""); setCustomerMatches([]);
     setPage("ind_records");
   };
 
@@ -714,23 +902,72 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
             <input type="date" value={date} disabled className="w-full px-3 py-2 border rounded-lg bg-gray-100 text-gray-600" />
           </div>
         </div>
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        {/* Lookup fields */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-3">
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Customer Name *</label>
-            <input type="text" value={customerName} onChange={e => setCustomerName(e.target.value)}
-              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500" placeholder="Full name" />
+            <label className="block text-sm font-medium text-gray-700 mb-1">Phone Number <span className="text-gray-400 font-normal">(for auto-fill)</span></label>
+            <input type="tel" value={phone} onChange={e => handlePhoneChange(e.target.value)}
+              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500" placeholder="10-digit mobile number" />
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Customer ID *</label>
-            <input type="text" value={customerId} onChange={e => setCustomerId(e.target.value)}
-              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500" placeholder="e.g. CUST001" />
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Loan Account No. *</label>
-            <input type="text" value={loanAccountNo} onChange={e => setLoanAccountNo(e.target.value)}
-              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500" placeholder="e.g. LA12345" />
+            <label className="block text-sm font-medium text-gray-700 mb-1">Aadhaar Number <span className="text-gray-400 font-normal">(for auto-fill)</span></label>
+            {!aadhaarEditable && aadhaar ? (
+              <div className="flex gap-2">
+                <input disabled value={`XXXX XXXX ${aadhaar.slice(-4)}`} className="flex-1 px-3 py-2 border rounded-lg bg-gray-100 text-gray-600" />
+                <button type="button" onClick={() => {
+                  if (window.confirm("Aadhaar was auto-filled from the customer database. Do you want to edit it?")) {
+                    setAadhaarEditable(true);
+                    setAutoFilledFields(prev => { const n = new Set(prev); n.delete("aadhaar"); return n; });
+                  }
+                }} className="px-3 py-2 bg-gray-200 hover:bg-gray-300 rounded-lg text-xs text-gray-700 flex items-center gap-1">
+                  <Edit2 size={12} /> Edit
+                </button>
+              </div>
+            ) : (
+              <input type="text" value={aadhaar} onChange={e => handleAadhaarInputChange(e.target.value)}
+                className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500" placeholder="12-digit Aadhaar number" />
+            )}
           </div>
         </div>
+        {lookupStatus === "searching" && <p className="text-xs text-gray-500 mb-3">🔍 Searching customer database...</p>}
+        {lookupStatus === "found" && <p className="text-xs text-green-600 mb-3">✓ Customer auto-filled from database. You can still edit the fields below.</p>}
+        {lookupStatus === "notfound" && <p className="text-xs text-amber-600 mb-3">⚠ Customer not found in database. Please fill in the details manually.</p>}
+        {lookupStatus === "multiple" && <p className="text-xs text-blue-600 mb-3">Multiple accounts found — select one from the list.</p>}
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <div>
+            <label className="flex items-center gap-1 text-sm font-medium text-gray-700 mb-1">
+              Customer Name * {autoFilledFields.has("customerName") && <span className="text-indigo-600 text-xs font-normal whitespace-nowrap">● filled</span>}
+            </label>
+            <input type="text" value={customerName}
+              onChange={e => handleAutoFilledChange("customerName", setCustomerName, e.target.value)}
+              className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500 ${autoFilledFields.has("customerName") ? "bg-indigo-50 border-indigo-200" : ""}`}
+              placeholder="Full name" />
+          </div>
+          <div>
+            <label className="flex items-center gap-1 text-sm font-medium text-gray-700 mb-1">
+              Customer ID {autoFilledFields.has("customerId") && <span className="text-indigo-600 text-xs font-normal whitespace-nowrap">● filled</span>}
+              <span className="text-gray-400 font-normal text-xs">(optional)</span>
+            </label>
+            <input type="text" value={customerId}
+              onChange={e => handleAutoFilledChange("customerId", setCustomerId, e.target.value)}
+              className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500 ${autoFilledFields.has("customerId") ? "bg-indigo-50 border-indigo-200" : ""}`}
+              placeholder="e.g. CUST001" />
+          </div>
+          <div>
+            <label className="flex items-center gap-1 text-sm font-medium text-gray-700 mb-1">
+              Loan Account No. * {autoFilledFields.has("loanAccountNo") && <span className="text-indigo-600 text-xs font-normal whitespace-nowrap">● filled</span>}
+            </label>
+            <input type="text" value={loanAccountNo}
+              onChange={e => handleAutoFilledChange("loanAccountNo", setLoanAccountNo, e.target.value)}
+              className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500 ${autoFilledFields.has("loanAccountNo") ? "bg-indigo-50 border-indigo-200" : ""}`}
+              placeholder="e.g. LA12345" />
+          </div>
+        </div>
+        {customerMatches.length > 1 && lookupStatus === "multiple" && (
+          <CustomerPicker matches={customerMatches} accentColor="indigo"
+            onSelect={c => applyCustomer(c)}
+            onClose={() => { setCustomerMatches([]); setLookupStatus(""); }} />
+        )}
       </div>
 
       {/* Transaction Details */}
@@ -750,6 +987,16 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
               <option value="UPI">UPI</option>
             </select>
           </div>
+        </div>
+        <div className="mb-4">
+          <label className="block text-sm font-medium text-gray-700 mb-1">SMA Bucket</label>
+          <select value={smaBucket} onChange={e => setSmaBucket(e.target.value)} className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500">
+            <option value="">Select SMA Bucket</option>
+            <option value="SMA-0">SMA-0 (1–30 DPD)</option>
+            <option value="SMA-1">SMA-1 (31–60 DPD)</option>
+            <option value="SMA-2">SMA-2 (61–90 DPD)</option>
+            <option value="NPA">NPA (&gt;90 DPD)</option>
+          </select>
         </div>
         {paymentMode === "Cash" && (
           <div className="mb-4">
@@ -785,9 +1032,10 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
             )}
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Waiver (Auto)</label>
-            <input readOnly value={formatINR(waiver)}
-              className={`w-full px-3 py-2 border rounded-lg font-semibold cursor-default ${waiver > 0 ? "bg-amber-50 border-amber-300 text-amber-700" : "bg-green-50 border-green-300 text-green-700"}`} />
+            <label className="block text-sm font-medium text-gray-700 mb-1">Waiver Amount</label>
+            <input type="number" min="0" value={waiverInput} onChange={e => setWaiverInput(e.target.value)}
+              className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500 ${waiver > 0 ? "bg-amber-50 border-amber-300" : ""}`}
+              placeholder="0 (leave blank if none)" />
             {waiver > 0 && <p className="text-xs text-amber-600 mt-1 font-medium">Approval required</p>}
           </div>
         </div>
@@ -899,6 +1147,8 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
   const [selectedStaff, setSelectedStaff] = useState([]);
   const [paymentModeFilter, setPaymentModeFilter] = useState("");
   const [ptpStatusFilter, setPtpStatusFilter] = useState("");
+  const [smaBucketFilter, setSmaBucketFilter] = useState("");
+  const [csbFilter, setCsbFilter] = useState(false);
   const [sortField, setSortField] = useState("date");
   const [sortDir, setSortDir] = useState("desc");
   const [dateFrom, setDateFrom] = useState("");
@@ -975,6 +1225,8 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
     // Multi-select staff filter (OR within staff) — cross-combined AND with branches
     if (selectedStaff.length > 0) data = data.filter(e => selectedStaff.includes(e.enteredBy));
     if (paymentModeFilter) data = data.filter(e => (e.ptpPaymentMode || e.paymentMode || "") === paymentModeFilter);
+    if (smaBucketFilter) data = data.filter(e => (e.smaBucket || "") === smaBucketFilter);
+    if (csbFilter) data = data.filter(e => e.isCSBCustomer === true);
     if (ptpStatusFilter) {
       if (ptpStatusFilter === "pending") data = data.filter(e => e.ptpStatus === "pending");
       else if (ptpStatusFilter === "paid") data = data.filter(e => e.ptpStatus === "paid");
@@ -1002,10 +1254,11 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
       else if (sortField === "branch") cmp = (a.branch || "").localeCompare(b.branch || "");
       else if (sortField === "customer") cmp = (a.customerName || "").localeCompare(b.customerName || "");
       else if (sortField === "staff") cmp = (a.enteredByName || a.enteredBy || "").localeCompare(b.enteredByName || b.enteredBy || "");
+      else if (sortField === "sma") cmp = (a.smaBucket || "").localeCompare(b.smaBucket || "");
       return sortDir === "desc" ? -cmp : cmp;
     });
     return data;
-  }, [entries, user, config, selectedBranches, selectedStaff, paymentModeFilter, ptpStatusFilter, dateFrom, dateTo, searchTerm, sortField, sortDir]);
+  }, [entries, user, config, selectedBranches, selectedStaff, paymentModeFilter, smaBucketFilter, csbFilter, ptpStatusFilter, dateFrom, dateTo, searchTerm, sortField, sortDir]);
 
   const canDelete = user.role === "admin" || config.allowStaffDelete;
 
@@ -1066,6 +1319,22 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
             <option value="Cash">Cash</option>
             <option value="UPI">UPI</option>
           </select>
+          {odTypeFilter === "Individual OD" && (
+            <select value={smaBucketFilter} onChange={e => setSmaBucketFilter(e.target.value)} className="px-3 py-2 border rounded-lg text-sm">
+              <option value="">All SMA Buckets</option>
+              <option value="SMA-0">SMA-0 (1–30 DPD)</option>
+              <option value="SMA-1">SMA-1 (31–60 DPD)</option>
+              <option value="SMA-2">SMA-2 (61–90 DPD)</option>
+              <option value="NPA">NPA (&gt;90 DPD)</option>
+            </select>
+          )}
+          {odTypeFilter === "Individual OD" && (
+            <button
+              onClick={() => setCsbFilter(f => !f)}
+              className={`px-3 py-2 rounded-lg text-sm font-medium border transition-colors ${csbFilter ? "bg-blue-600 text-white border-blue-600" : "bg-white text-gray-600 border-gray-300 hover:bg-gray-50"}`}>
+              {csbFilter ? "✓ CSB Only" : "CSB Bank"}
+            </button>
+          )}
           <select value={ptpStatusFilter} onChange={e => setPtpStatusFilter(e.target.value)} className="px-3 py-2 border rounded-lg text-sm">
             <option value="">All Status</option>
             <option value="pending">PTP Pending</option>
@@ -1221,6 +1490,7 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
                               <div><span className="text-gray-500">Amount Due:</span> <span className="font-medium">{formatINR(e.amountDue)}</span></div>
                               <div><span className="text-gray-500">Paid:</span> <span className="font-medium text-indigo-700">{formatINR(e.paidAmount !== undefined ? e.paidAmount : e.totalPaidAmount)}</span></div>
                               <div><span className="text-gray-500">Waiver:</span> <span className={`font-medium ${(e.waiver || 0) > 0 ? "text-amber-600" : "text-green-600"}`}>{formatINR(e.waiver || 0)}</span></div>
+                              {e.smaBucket && <div><span className="text-gray-500">SMA Bucket:</span> <span className={`font-medium px-2 py-0.5 rounded-full text-xs ${e.smaBucket === "NPA" ? "bg-red-100 text-red-700" : e.smaBucket === "SMA-2" ? "bg-orange-100 text-orange-700" : e.smaBucket === "SMA-1" ? "bg-amber-100 text-amber-700" : "bg-yellow-100 text-yellow-700"}`}>{e.smaBucket}</span></div>}
                             </div>
                           </div>
                         ) : (
@@ -1416,6 +1686,7 @@ function Dashboard({ user, entries, branches, config }) {
 
   const visibleEntries = useMemo(() => {
     if (dashView === "group") return allVisibleEntries.filter(e => !e.odType || e.odType === "Group OD");
+    if (dashView === "csb") return allVisibleEntries.filter(e => e.odType === "Individual OD" && e.isCSBCustomer === true);
     return allVisibleEntries.filter(e => e.odType === "Individual OD");
   }, [allVisibleEntries, dashView]);
 
@@ -1728,6 +1999,10 @@ function Dashboard({ user, entries, branches, config }) {
           className={`px-5 py-2 rounded-xl font-semibold text-sm transition-colors flex items-center gap-2 ${dashView === "individual" ? "bg-indigo-600 text-white shadow-md shadow-indigo-200" : "bg-white text-gray-600 border hover:bg-gray-50"}`}>
           <UserPlus size={15} /> Individual OD
         </button>
+        <button onClick={() => { setDashView("csb"); resetDrill(); }}
+          className={`px-5 py-2 rounded-xl font-semibold text-sm transition-colors flex items-center gap-2 ${dashView === "csb" ? "bg-blue-600 text-white shadow-md shadow-blue-200" : "bg-white text-gray-600 border hover:bg-gray-50"}`}>
+          <CreditCard size={15} /> CSB Bank
+        </button>
       </div>
       <div className="mb-4"><DateRangeFilter dateFrom={dateFrom} dateTo={dateTo} setDateFrom={setDateFrom} setDateTo={setDateTo} /></div>
 
@@ -1749,11 +2024,38 @@ function Dashboard({ user, entries, branches, config }) {
           <p className="text-xs text-gray-400">{stats.entriesWithWaiver} entries · <span className="text-teal-600">View details →</span></p>
         </div>
         <div className="bg-white rounded-xl border p-4 cursor-pointer hover:shadow-md transition-shadow" onClick={() => setDrillPanel("groupod")}>
-          <p className="text-xs text-gray-500 mb-1">{dashView === "individual" ? "Total Individual OD Due" : "Total Group OD Due"}</p>
+          <p className="text-xs text-gray-500 mb-1">{dashView === "individual" ? "Total Individual OD Due" : dashView === "csb" ? "Total CSB OD Due" : "Total Group OD Due"}</p>
           <p className="text-2xl font-bold text-gray-600">{formatLakhs(stats.totalGroupOD)}</p>
           <p className="text-xs text-teal-600 mt-1">View details →</p>
         </div>
       </div>
+
+      {/* CSB quick-link chip when viewing Individual OD */}
+      {dashView === "individual" && (() => {
+        const csbCount = allVisibleEntries.filter(e => e.odType === "Individual OD" && e.isCSBCustomer === true).length;
+        if (csbCount === 0) return null;
+        return (
+          <div className="mb-4 flex">
+            <button onClick={() => { setDashView("csb"); resetDrill(); }}
+              className="inline-flex items-center gap-2 px-4 py-2 bg-blue-50 border border-blue-200 text-blue-700 rounded-lg text-sm font-medium hover:bg-blue-100 transition-colors">
+              <CreditCard size={14} /> {csbCount} CSB Bank entries — view separately →
+            </button>
+          </div>
+        );
+      })()}
+
+      {/* CSB Bank info banner */}
+      {dashView === "csb" && (
+        <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 mb-6 flex items-center gap-3">
+          <CreditCard size={20} className="text-blue-600 flex-shrink-0" />
+          <div>
+            <p className="text-sm font-semibold text-blue-800">CSB Bank OD Portfolio</p>
+            <p className="text-xs text-blue-600 mt-0.5">
+              {stats.totalEntries} entries across {new Set(visibleEntries.map(e => e.branch)).size} branches. These customers have CSB Bank loan accounts (hyphenated loan numbers) without Dhanam Customer IDs.
+            </p>
+          </div>
+        </div>
+      )}
 
       {/* Charts: Monthly Trend & Payment Mode */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
@@ -1858,6 +2160,60 @@ function Dashboard({ user, entries, branches, config }) {
   );
 }
 
+// ─── CSB Approval Modal ───────────────────────────────────────────────────────
+function CSBApprovalModal({ candidates, groupODRows, failedRows, onConfirm, onReject }) {
+  return (
+    <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+      <div className="bg-white rounded-xl shadow-xl w-full max-w-lg max-h-[90vh] flex flex-col">
+        <div className="p-5 border-b">
+          <h3 className="font-bold text-gray-900 text-lg">CSB Bank Customers Detected</h3>
+          <p className="text-sm text-gray-600 mt-1">
+            {candidates.length} entries have no Customer ID but have CSB-format loan numbers (e.g. 0269-XXXXXXXX-657201).
+            Are these CSB Bank customers?
+          </p>
+        </div>
+        <div className="overflow-y-auto flex-1 p-4 space-y-3">
+          <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide">Customer List ({candidates.length})</p>
+          <div className="space-y-1 max-h-48 overflow-y-auto border rounded-lg p-2 bg-gray-50">
+            {candidates.map((r, i) => (
+              <div key={i} className="flex items-center justify-between text-sm py-1 border-b last:border-0">
+                <span className="font-medium text-gray-800">{r.customerName}</span>
+                <span className="text-xs text-gray-500">{r.branch} · {r.loanAccountNo}</span>
+              </div>
+            ))}
+          </div>
+          {groupODRows.length > 0 && (
+            <div className="bg-amber-50 border border-amber-200 rounded-lg p-3">
+              <p className="text-xs font-semibold text-amber-800 mb-1">⚠ {groupODRows.length} Group OD entries detected — will NOT be imported</p>
+              <div className="text-xs text-amber-700 space-y-0.5 max-h-24 overflow-y-auto">
+                {groupODRows.map((r, i) => <div key={i}>{r.customerName} ({r.branch})</div>)}
+              </div>
+            </div>
+          )}
+          {failedRows.length > 0 && (
+            <div className="bg-red-50 border border-red-200 rounded-lg p-3">
+              <p className="text-xs font-semibold text-red-800 mb-1">✗ {failedRows.length} entries will be skipped (missing required fields)</p>
+              <div className="text-xs text-red-700 space-y-0.5 max-h-24 overflow-y-auto">
+                {failedRows.map((r, i) => <div key={i}>{r.customerName || "(no name)"} — {r.reason}</div>)}
+              </div>
+            </div>
+          )}
+        </div>
+        <div className="p-4 border-t flex gap-3">
+          <button onClick={onConfirm}
+            className="flex-1 py-2.5 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700 transition-colors text-sm">
+            ✓ Yes, these are CSB customers — import them
+          </button>
+          <button onClick={onReject}
+            className="flex-1 py-2.5 bg-gray-200 text-gray-700 rounded-lg font-medium hover:bg-gray-300 transition-colors text-sm">
+            ✗ No — skip them
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Admin Panel ────────────────────────────────────────────────────────────
 function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig, entries, setEntries, notifications, setNotifications }) {
   const [tab, setTab] = useState("users");
@@ -1865,6 +2221,83 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
   const [newBranch, setNewBranch] = useState("");
   const [showPassId, setShowPassId] = useState(null);
   const [editingBranch, setEditingBranch] = useState(null);
+  const [lastBulkUpload, setLastBulkUpload] = useState(() => loadData(STORAGE_KEYS.lastBulkUpload, null));
+  const [pendingBulkImport, setPendingBulkImport] = useState(null); // holds parsed data waiting for CSB decision
+
+  const handleUndoBulkUpload = () => {
+    if (!lastBulkUpload) return;
+    const { type, ids, count, timestamp } = lastBulkUpload;
+    const dateStr = new Date(timestamp).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" });
+    if (!window.confirm(`Undo the bulk upload of ${count} ${type} entries from ${dateStr}?\n\nThis will permanently remove those ${count} entries. This cannot be undone.`)) return;
+    const idSet = new Set(ids);
+    const updated = entries.filter(e => !idSet.has(e.id));
+    const removed = entries.length - updated.length;
+    setEntries(updated);
+    saveData(STORAGE_KEYS.entries, updated); // saves to localStorage + fires POST to server
+    localStorage.removeItem(STORAGE_KEYS.lastBulkUpload);
+    setLastBulkUpload(null);
+    alert(`Done. Removed ${removed} entries. Records restored to before the upload.`);
+  };
+
+  const downloadResultFile = (imported, csbRows, csbApproved, groupODRows, failedRows) => {
+    const lines = [];
+    const q = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
+    const rowCols = (r) => [r.date, r.branch, r.customerName, r.customerId || "", r.loanAccountNo, r.amountDue, r.paidAmount, r.paymentMode || "", r.smaBucket || ""].map(q).join(",");
+
+    lines.push("BULK UPLOAD RESULT REPORT");
+    lines.push(`Generated: ${new Date().toLocaleString("en-IN")}`);
+    lines.push("");
+
+    lines.push(`== SUCCESSFULLY IMPORTED (${imported.length}) ==`);
+    lines.push(["Date","Branch","Customer Name","Customer ID","Loan Account No.","OD Amount Due","OD Paid","Payment Mode","SMA Bucket"].map(q).join(","));
+    imported.forEach(r => lines.push(rowCols(r)));
+    lines.push("");
+
+    if (csbRows.length > 0) {
+      const label = csbApproved ? `CSB BANK ENTRIES — IMPORTED (${csbRows.length})` : `CSB BANK ENTRIES — SKIPPED (${csbRows.length})`;
+      lines.push(`== ${label} ==`);
+      lines.push(["Date","Branch","Customer Name","Customer ID","Loan Account No.","OD Amount Due","OD Paid","Payment Mode","SMA Bucket"].map(q).join(","));
+      csbRows.forEach(r => lines.push(rowCols(r)));
+      lines.push("");
+    }
+
+    if (groupODRows.length > 0) {
+      lines.push(`== GROUP OD ENTRIES DETECTED — NOT IMPORTED (${groupODRows.length}) ==`);
+      lines.push(["Date","Branch","Customer Name","Customer ID","Loan Account No.","OD Amount Due","OD Paid","Payment Mode","Asset Type"].map(q).join(","));
+      groupODRows.forEach(r => lines.push([r.date, r.branch, r.customerName, r.customerId || "", r.loanAccountNo, r.amountDue, r.paidAmount, r.paymentMode || "", "Group OD"].map(q).join(",")));
+      lines.push("");
+    }
+
+    if (failedRows.length > 0) {
+      lines.push(`== FAILED / SKIPPED ENTRIES (${failedRows.length}) ==`);
+      lines.push(["Customer Name","Branch","Loan Account No.","Reason"].map(q).join(","));
+      failedRows.forEach(r => lines.push([r.customerName || "", r.branch || "", r.loanAccountNo || "", r.reason].map(q).join(",")));
+    }
+
+    const csv = lines.join("\n");
+    const blob = new Blob([csv], { type: "text/csv" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `bulk-upload-result-${new Date().toISOString().slice(0,10)}.csv`;
+    a.click();
+  };
+
+  const finalizeBulkIndivImport = (validRows, csbRows, csbApproved, groupODRows, failedRows) => {
+    const toImport = csbApproved ? [...validRows, ...csbRows] : validRows;
+    const allEntries = [...toImport, ...entries];
+    setEntries(allEntries);
+    saveData(STORAGE_KEYS.entries, allEntries);
+    const snapshot = { type: "Individual OD", ids: toImport.map(e => e.id), count: toImport.length, timestamp: new Date().toISOString() };
+    saveData(STORAGE_KEYS.lastBulkUpload, snapshot);
+    setLastBulkUpload(snapshot);
+    setPendingBulkImport(null);
+    downloadResultFile(validRows, csbRows, csbApproved, groupODRows, failedRows);
+    const csbMsg = csbRows.length > 0 ? (csbApproved ? `\n• ${csbRows.length} CSB entries imported.` : `\n• ${csbRows.length} CSB entries skipped.`) : "";
+    const groupMsg = groupODRows.length > 0 ? `\n• ${groupODRows.length} Group OD entries were NOT imported (see result file).` : "";
+    const failMsg = failedRows.length > 0 ? `\n• ${failedRows.length} entries failed (see result file).` : "";
+    alert(`Import complete.\n• ${validRows.length} Individual OD entries imported.${csbMsg}${groupMsg}${failMsg}\n\nA result file has been downloaded.`);
+  };
+
   const [editBranchName, setEditBranchName] = useState("");
 
   const handleAddUser = () => {
@@ -2111,7 +2544,10 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
       });
       const allEntries = [...newEntries, ...entries];
       setEntries(allEntries); saveData(STORAGE_KEYS.entries, allEntries);
-      alert(`Imported ${added} entries. Total: ${allEntries.length}`);
+      const bulkSnapshot = { type: "Group OD", ids: newEntries.map(e => e.id), count: added, timestamp: new Date().toISOString() };
+      saveData(STORAGE_KEYS.lastBulkUpload, bulkSnapshot);
+      setLastBulkUpload(bulkSnapshot);
+      alert(`Imported ${added} Group OD entries. Total: ${allEntries.length}\n\nYou can undo this upload from the Admin panel if needed.`);
     };
     reader.readAsText(file);
     e.target.value = "";
@@ -2122,31 +2558,48 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
     const reader = new FileReader();
     reader.onload = (ev) => {
       const rows = parseCSV(ev.target.result);
-      let added = 0;
-      const newEntries = [];
-      rows.forEach(r => {
+
+      const validRows = [];
+      const csbRows = [];
+      const groupODRows = [];
+      const failedRows = [];
+
+      const parseRow = (r) => {
         const customerName = (r["Customer Name"] || r.customerName || "").trim();
         const customerId = (r["Customer ID"] || r.customerId || "").trim();
         const loanAccountNo = (r["Loan Account No"] || r["Loan Account No."] || r.loanAccountNo || "").trim();
         const branch = (r.Branch || r.branch || "").trim();
-        if (!customerName || !customerId || !branch) return;
 
+        // Check for Group OD in Asset Type / SMA Bucket column
+        const assetTypeRaw = (r["SMA Bucket"] || r["Asset Type"] || r["SMA"] || r.smaBucket || "").trim();
+        if (assetTypeRaw.toLowerCase() === "group od") {
+          const num = (v) => { const c = String(v || "").replace(/[^\d.\-]/g, ""); const n = Number(c); return isNaN(n) ? 0 : n; };
+          groupODRows.push({ customerName, branch, loanAccountNo, customerId, amountDue: num(r["OD Amount Due"] || r["Amount Due"] || r.amountDue), paidAmount: num(r["OD Paid"] || r["Paid Amount"] || r.paidAmount), paymentMode: (r["Payment Mode"] || "").trim() });
+          return;
+        }
+
+        if (!customerName || !branch) {
+          failedRows.push({ customerName, branch, loanAccountNo, reason: "Missing customer name or branch" });
+          return;
+        }
+
+        // Parse date
         let rawDate = (r.Date || r.date || "").trim();
         rawDate = rawDate.replace(/[./]/g, "-");
         if (/^\d{1,2}-\d{1,2}-\d{2}$/.test(rawDate)) { const p = rawDate.split("-"); p[2] = "20" + p[2]; rawDate = p.join("-"); }
         if (/^\d{1,2}-\d{1,2}-\d{4}$/.test(rawDate)) {
           const parts = rawDate.split("-");
           const d = parts[0].padStart(2, "0"), m = parts[1].padStart(2, "0"), y = parts[2];
-          rawDate = Number(d) > 12 ? `${y}-${m}-${d}` : `${y}-${m}-${d}`;
+          rawDate = `${y}-${m}-${d}`;
         }
         if (rawDate && !/^\d{4}-\d{2}-\d{2}$/.test(rawDate)) rawDate = "";
         if (!rawDate) rawDate = nowDate();
 
         const num = (v) => { const c = String(v || "").replace(/[^\d.\-]/g, ""); const n = Number(c); return isNaN(n) ? 0 : n; };
-
         const amountDue = num(r["OD Amount Due"] || r["Amount Due"] || r.amountDue);
         const paidAmount = num(r["OD Paid"] || r["Paid Amount"] || r.paidAmount);
-        const waiver = Math.max(0, amountDue - paidAmount);
+        // Waiver is manually specified. If no Waiver column in CSV, defaults to 0.
+        const waiver = num(r["Waiver"] || r["Waiver Amount"] || r.waiver || 0);
         const approvalSubject = (r["Approval Subject"] || "").trim();
         const recordedByRaw = (r["Recorded By"] || r["Entered By"] || "").trim();
         const matchedUser = recordedByRaw ? users.find(u => u.name.toLowerCase() === recordedByRaw.toLowerCase() || u.username.toLowerCase() === recordedByRaw.toLowerCase()) : null;
@@ -2154,6 +2607,7 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
         const enteredByName = matchedUser ? matchedUser.name : (recordedByRaw || "Bulk Upload");
         const paymentMode = (r["Payment Mode"] || r.paymentMode || "").trim();
         const upiReference = (r["UPI Reference"] || r.upiReference || "").trim();
+        const smaBucket = ["SMA-0", "SMA-1", "SMA-2", "NPA"].includes(assetTypeRaw) ? assetTypeRaw : "";
 
         let ptpDateRaw = (r["PTP Date"] || r.ptpDate || "").trim();
         if (ptpDateRaw) {
@@ -2163,20 +2617,44 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
           if (!/^\d{4}-\d{2}-\d{2}$/.test(ptpDateRaw)) ptpDateRaw = "";
         }
 
-        newEntries.push({
+        const entry = {
           id: generateId(), date: rawDate, time: (r.Time || r.time || "00:00").trim(), branch,
-          customerName, customerId, loanAccountNo,
+          customerName, loanAccountNo,
           odType: "Individual OD",
+          smaBucket,
           amountDue, paidAmount, waiver, totalPaidAmount: paidAmount,
           paymentMode, upiReference, ptpDate: ptpDateRaw, ptpReminderSent: false,
           waiverApproval: waiver > 0 && approvalSubject ? { approverName: (r["Waiver Approver"] || "Bulk Upload").trim(), emailSubject: approvalSubject, approvalDate: rawDate } : null,
           enteredBy: enteredById, enteredByName,
-        });
-        added++;
-      });
-      const allEntries = [...newEntries, ...entries];
-      setEntries(allEntries); saveData(STORAGE_KEYS.entries, allEntries);
-      alert(`Imported ${added} Individual OD entries. Total: ${allEntries.length}`);
+        };
+
+        // CSB Bank detection: no Customer ID + loan number contains hyphens (e.g. 0269-80394391-657201)
+        const isCSB = !customerId && /\d+-\d+-\d+/.test(loanAccountNo);
+        // Mahashemam detection: no Customer ID + no Loan Account No (Aadhaar-only customers)
+        const aadhaar = (r["Aadhaar"] || r["Aadhaar No"] || r["Aadhaar Number"] || r.aadhaar || "").trim().replace(/\D/g, "");
+        const isMahashemam = !customerId && !loanAccountNo;
+        if (isCSB) {
+          csbRows.push({ ...entry, customerId: "", isCSBCustomer: true });
+        } else if (isMahashemam) {
+          // Aadhaar-only customers belong to Mahashemam branch
+          validRows.push({ ...entry, customerId: "", loanAccountNo: "", branch: "Mahashemam", aadhaar, isMahashemamCustomer: true });
+        } else if (!customerId) {
+          // No Customer ID and no CSB pattern — skip
+          failedRows.push({ customerName, branch, loanAccountNo, reason: "Missing Customer ID (not a CSB format loan number)" });
+        } else {
+          validRows.push({ ...entry, customerId, aadhaar });
+        }
+      };
+
+      rows.forEach(parseRow);
+
+      // If CSB candidates found, show modal for approval
+      if (csbRows.length > 0) {
+        setPendingBulkImport({ validRows, csbRows, groupODRows, failedRows });
+      } else {
+        // No CSB rows — finalize directly
+        finalizeBulkIndivImport(validRows, [], false, groupODRows, failedRows);
+      }
     };
     reader.readAsText(file);
     e.target.value = "";
@@ -2292,6 +2770,25 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
 
       {tab === "bulk" && (
         <div className="space-y-4">
+          {/* Undo Last Bulk Upload */}
+          {lastBulkUpload ? (
+            <div className="bg-amber-50 border border-amber-200 rounded-xl p-4 flex items-center justify-between gap-4">
+              <div>
+                <p className="text-sm font-semibold text-amber-800">Last Bulk Upload</p>
+                <p className="text-xs text-amber-700 mt-0.5">
+                  {lastBulkUpload.count} {lastBulkUpload.type} entries · {new Date(lastBulkUpload.timestamp).toLocaleString("en-IN", { dateStyle: "medium", timeStyle: "short" })}
+                </p>
+              </div>
+              <button onClick={handleUndoBulkUpload}
+                className="flex items-center gap-2 px-4 py-2 bg-red-600 text-white rounded-lg text-sm hover:bg-red-700 transition-colors whitespace-nowrap">
+                Undo Upload
+              </button>
+            </div>
+          ) : (
+            <div className="bg-gray-50 border border-gray-200 rounded-xl p-4">
+              <p className="text-sm text-gray-500">No recent bulk upload to undo.</p>
+            </div>
+          )}
           {/* Bulk Upload Group OD Entries */}
           <div className="bg-white rounded-xl border p-5">
             <h3 className="font-semibold text-gray-800 mb-2 flex items-center gap-2"><Upload size={18} className="text-teal-600" /> Bulk Upload Group OD Entries</h3>
@@ -2306,8 +2803,8 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
           {/* Bulk Upload Individual OD Entries */}
           <div className="bg-white rounded-xl border p-5">
             <h3 className="font-semibold text-gray-800 mb-2 flex items-center gap-2"><Upload size={18} className="text-indigo-600" /> Bulk Upload Individual OD Entries</h3>
-            <p className="text-sm text-gray-500 mb-3">Upload a CSV file with columns: Date, Branch, Customer Name, Customer ID, Loan Account No., OD Amount Due, OD Paid, Time, Recorded By, Approval Subject, Waiver Approver, Payment Mode, UPI Reference, PTP Date</p>
-            <p className="text-xs text-gray-400 mb-3">Date format: dd-mm-yyyy or yyyy-mm-dd. Waivers are auto-calculated (OD Amount Due − OD Paid). "Recorded By" captures who collected the payment.</p>
+            <p className="text-sm text-gray-500 mb-3">Upload a CSV file with columns: Date, Branch, Customer Name, Customer ID, Loan Account No., OD Amount Due, OD Paid, Waiver, SMA Bucket, Time, Recorded By, Approval Subject, Waiver Approver, Payment Mode, UPI Reference, PTP Date</p>
+            <p className="text-xs text-gray-400 mb-3">Date format: dd-mm-yyyy or yyyy-mm-dd. Waiver column is optional — if omitted or blank, waiver defaults to 0. SMA Bucket: SMA-0, SMA-1, SMA-2, or NPA. "Recorded By" captures who collected the payment.</p>
             <label className="inline-flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm hover:bg-indigo-700 cursor-pointer transition-colors">
               <Upload size={14} /> Choose CSV File
               <input type="file" accept=".csv" onChange={handleBulkIndividualEntries} className="hidden" />
@@ -2346,7 +2843,7 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
                 <Download size={14} /> Group OD Template
               </button>
               <button onClick={() => {
-                const csv = "Date,Branch,Customer Name,Customer ID,Loan Account No.,OD Amount Due,OD Paid,Time,Recorded By,Approval Subject,Waiver Approver,Payment Mode,UPI Reference,PTP Date\n01-04-2025,Annur,Sample Customer,CUST001,LA001,10000,10000,10:30,Vijila,,,Cash,,";
+                const csv = "Date,Branch,Customer Name,Customer ID,Loan Account No.,OD Amount Due,OD Paid,Waiver,SMA Bucket,Time,Recorded By,Approval Subject,Waiver Approver,Payment Mode,UPI Reference,PTP Date\n01-04-2025,Annur,Sample Customer,CUST001,LA001,10000,10000,0,SMA-1,10:30,Vijila,,,Cash,,";
                 const blob = new Blob([csv], { type: "text/csv" });
                 const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "individual-od-entries-template.csv"; a.click();
               }} className="px-3 py-2 bg-indigo-50 text-indigo-700 rounded-lg text-sm hover:bg-indigo-100 transition-colors flex items-center gap-1">
@@ -2369,6 +2866,16 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
             </div>
           </div>
         </div>
+      )}
+
+      {pendingBulkImport && (
+        <CSBApprovalModal
+          candidates={pendingBulkImport.csbRows}
+          groupODRows={pendingBulkImport.groupODRows}
+          failedRows={pendingBulkImport.failedRows}
+          onConfirm={() => finalizeBulkIndivImport(pendingBulkImport.validRows, pendingBulkImport.csbRows, true, pendingBulkImport.groupODRows, pendingBulkImport.failedRows)}
+          onReject={() => finalizeBulkIndivImport(pendingBulkImport.validRows, pendingBulkImport.csbRows, false, pendingBulkImport.groupODRows, [...pendingBulkImport.failedRows, ...pendingBulkImport.csbRows.map(r => ({ ...r, reason: "CSB Bank — rejected by user" }))])}
+        />
       )}
 
       {tab === "settings" && (
@@ -2402,6 +2909,21 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
                 </button>
               </div>
             </div>
+          </div>
+          <div className="bg-white rounded-xl border p-5">
+            <h3 className="font-semibold text-amber-700 mb-1 flex items-center gap-2"><AlertTriangle size={18} /> Data Fix</h3>
+            <p className="text-xs text-gray-500 mb-3">If Individual OD entries were imported with incorrect waiver amounts (the unpaid balance was mistakenly recorded as a waiver), use this to zero out waivers on all Individual OD entries.</p>
+            <button onClick={() => {
+              const indivCount = entries.filter(e => e.odType === "Individual OD" && (Number(e.waiver) || 0) > 0).length;
+              if (indivCount === 0) { alert("No Individual OD entries with waivers found. Nothing to fix."); return; }
+              if (!window.confirm(`This will set waiver = 0 on ${indivCount} Individual OD entries that currently have a waiver amount.\n\nThe unpaid balance will remain as pending dues. Continue?`)) return;
+              const fixed = entries.map(e => e.odType === "Individual OD" ? { ...e, waiver: 0, waiverApproval: null } : e);
+              setEntries(fixed);
+              saveData(STORAGE_KEYS.entries, fixed);
+              alert(`Done. Cleared waivers on ${indivCount} Individual OD entries.`);
+            }} className="px-4 py-2 bg-amber-600 text-white rounded-lg text-sm hover:bg-amber-700 transition-colors">
+              Fix Individual OD Waivers
+            </button>
           </div>
           <div className="bg-white rounded-xl border p-5">
             <h3 className="font-semibold text-red-700 mb-3 flex items-center gap-2"><Database size={18} /> Danger Zone</h3>

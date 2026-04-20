@@ -173,6 +173,35 @@ app.post("/api/test-email", async (req, res) => {
   }
 });
 
+// ── Customer Lookup ──────────────────────────────────────────────────────────
+let customerBaseCache = null;
+function getCustomerBase() {
+  if (!customerBaseCache) {
+    const p = path.join(DATA_DIR, "customer-base.json");
+    if (fs.existsSync(p)) {
+      try { customerBaseCache = JSON.parse(fs.readFileSync(p, "utf8")); }
+      catch (e) { console.error("[CustomerBase] Failed to load:", e.message); customerBaseCache = { byPhone: {}, byAadhaar: {} }; }
+    } else {
+      customerBaseCache = { byPhone: {}, byAadhaar: {} };
+    }
+  }
+  return customerBaseCache;
+}
+
+app.get("/api/customers/lookup", (req, res) => {
+  const { phone, aadhaar } = req.query;
+  const db = getCustomerBase();
+  let customers = [];
+  if (phone) {
+    const key = String(phone).replace(/\D/g, "");
+    customers = db.byPhone[key] || [];
+  } else if (aadhaar) {
+    const key = String(aadhaar).replace(/\D/g, "");
+    customers = db.byAadhaar[key] || [];
+  }
+  res.json({ found: customers.length > 0, customers });
+});
+
 // ── Generic CRUD (wildcard — must be LAST) ──
 
 // GET /api/:collection
