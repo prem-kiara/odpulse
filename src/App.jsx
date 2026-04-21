@@ -543,6 +543,119 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
     <div className="max-w-2xl mx-auto">
       <h2 className="text-xl font-bold text-gray-900 mb-6 flex items-center gap-2"><Plus size={22} className="text-teal-600" /> Group OD Entry</h2>
 
+      {/* Section 1: Customer Details */}
+      <div className="bg-white rounded-xl shadow-sm border p-5 mb-4">
+        <h3 className="text-sm font-semibold text-teal-700 uppercase tracking-wide mb-4">Customer Details</h3>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Branch *</label>
+            <select value={branch} onChange={e => setBranch(e.target.value)} className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500">
+              <option value="">Select Branch</option>
+              {branches.map(b => <option key={b} value={b}>{b}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Date</label>
+            <input type="date" value={date} disabled className="w-full px-3 py-2 border rounded-lg bg-gray-100 text-gray-600" />
+          </div>
+        </div>
+        {/* Lookup fields */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-3">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Phone Number <span className="text-gray-400 font-normal">(for auto-fill)</span></label>
+            <input type="tel" value={phone} onChange={e => handlePhoneChange(e.target.value)}
+              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="10-digit mobile number" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Aadhaar Number <span className="text-gray-400 font-normal">(for auto-fill)</span></label>
+            {!aadhaarEditable && aadhaar ? (
+              <div className="flex gap-2">
+                <input disabled value={`XXXX XXXX ${aadhaar.slice(-4)}`} className="flex-1 px-3 py-2 border rounded-lg bg-gray-100 text-gray-600" />
+                <button type="button" onClick={() => {
+                  if (window.confirm("Aadhaar was auto-filled from the customer database. Do you want to edit it?")) {
+                    setAadhaarEditable(true);
+                    setAutoFilledFields(prev => { const n = new Set(prev); n.delete("aadhaar"); return n; });
+                  }
+                }} className="px-3 py-2 bg-gray-200 hover:bg-gray-300 rounded-lg text-xs text-gray-700 flex items-center gap-1">
+                  <Edit2 size={12} /> Edit
+                </button>
+              </div>
+            ) : (
+              <input type="text" value={aadhaar} onChange={e => handleAadhaarInputChange(e.target.value)}
+                className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="12-digit Aadhaar number" />
+            )}
+          </div>
+        </div>
+        {/* Lookup status */}
+        {lookupStatus === "searching" && <p className="text-xs text-gray-500 mb-3">🔍 Searching customer database...</p>}
+        {lookupStatus === "found" && <p className="text-xs text-green-600 mb-3">✓ Customer auto-filled from database. You can still edit the fields below.</p>}
+        {lookupStatus === "notfound" && <p className="text-xs text-amber-600 mb-3">⚠ Customer not found in database. Please fill in the details manually.</p>}
+        {lookupStatus === "multiple" && <p className="text-xs text-blue-600 mb-3">Multiple accounts found — select one from the list.</p>}
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          <div>
+            <label className="flex items-center gap-1 text-sm font-medium text-gray-700 mb-1">
+              Customer Name * {autoFilledFields.has("customerName") && <span className="text-teal-600 text-xs font-normal whitespace-nowrap">● filled</span>}
+            </label>
+            <input type="text" value={customerName}
+              onChange={e => handleAutoFilledChange("customerName", setCustomerName, e.target.value)}
+              className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500 ${autoFilledFields.has("customerName") ? "bg-teal-50 border-teal-200" : ""}`}
+              placeholder="Full name" />
+          </div>
+          <div>
+            <label className="flex items-center gap-1 text-sm font-medium text-gray-700 mb-1">
+              Customer ID * {autoFilledFields.has("customerId") && <span className="text-teal-600 text-xs font-normal whitespace-nowrap">● filled</span>}
+            </label>
+            <input type="text" value={customerId}
+              onChange={e => handleAutoFilledChange("customerId", setCustomerId, e.target.value)}
+              className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500 ${autoFilledFields.has("customerId") ? "bg-teal-50 border-teal-200" : ""}`}
+              placeholder="e.g. CUST001" />
+          </div>
+          <div>
+            <label className="flex items-center gap-1 text-sm font-medium text-gray-700 mb-1">
+              Loan Account No. * {autoFilledFields.has("loanAccountNo") && <span className="text-teal-600 text-xs font-normal whitespace-nowrap">● filled</span>}
+            </label>
+            <input type="text" value={loanAccountNo}
+              onChange={e => handleAutoFilledChange("loanAccountNo", setLoanAccountNo, e.target.value)}
+              className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500 ${autoFilledFields.has("loanAccountNo") ? "bg-teal-50 border-teal-200" : ""}`}
+              placeholder="e.g. LA12345" />
+          </div>
+        </div>
+        <CustomerInfoPanel loanAccountNo={loanAccountNo} customerId={customerId} hideValueBoxes onData={setOdSnap} />
+      </div>
+
+      {/* Section 2b: OD Snapshot — auto-populated from latest uploaded pool + accrued data */}
+      <div className="bg-white rounded-xl shadow-sm border p-5 mb-4">
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="text-sm font-semibold text-teal-700 uppercase tracking-wide">OD Snapshot (auto)</h3>
+          <span className="text-[11px] text-gray-400">
+            {odSnap ? `As of ${odSnap.poolSnapshotDate || "—"}${odSnap.accruedSnapshotDate ? ` · Accrued ${odSnap.accruedSnapshotDate}` : ""}` : "Enter Loan A/C or Customer ID to look up"}
+          </span>
+        </div>
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Principal Outstanding</label>
+            <input type="text" readOnly tabIndex={-1} value={odSnap ? formatINR(odSnap.principalOutstanding) : "—"}
+              className="w-full px-3 py-2 border rounded-lg bg-gray-50 text-gray-800 font-medium cursor-default" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Unpaid Interest</label>
+            <input type="text" readOnly tabIndex={-1} value={odSnap ? formatINR(odSnap.unpaidInterest) : "—"}
+              className="w-full px-3 py-2 border rounded-lg bg-gray-50 text-gray-800 font-medium cursor-default" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Accrued Interest</label>
+            <input type="text" readOnly tabIndex={-1} value={odSnap ? formatINR(odSnap.accruedInterest) : "—"}
+              className="w-full px-3 py-2 border rounded-lg bg-gray-50 text-gray-800 font-medium cursor-default" />
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-teal-800 mb-1">Foreclosure Amount</label>
+            <input type="text" readOnly tabIndex={-1} value={odSnap ? formatINR(odSnap.foreclosureValue) : "—"}
+              className="w-full px-3 py-2 border-2 border-teal-500 rounded-lg bg-teal-50 text-teal-900 font-bold cursor-default" />
+          </div>
+        </div>
+        <p className="text-[11px] text-gray-500 mt-2">Foreclosure = Principal Outstanding + Unpaid Interest + Accrued Interest. Values refresh automatically from the latest uploaded OD reports.</p>
+      </div>
+
       {customerCenters.length > 0 && customerCenters.map((cs, ci) => {
         const CLOSED_S = ["Closed", "Written Off"];
         const DELINQ_DPD = ["SMA-0", "SMA-1", "SMA-2", "NPA"];
@@ -738,119 +851,6 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
           </div>
         );
       })}
-
-      {/* Section 1: Customer Details */}
-      <div className="bg-white rounded-xl shadow-sm border p-5 mb-4">
-        <h3 className="text-sm font-semibold text-teal-700 uppercase tracking-wide mb-4">Customer Details</h3>
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Branch *</label>
-            <select value={branch} onChange={e => setBranch(e.target.value)} className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500">
-              <option value="">Select Branch</option>
-              {branches.map(b => <option key={b} value={b}>{b}</option>)}
-            </select>
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Date</label>
-            <input type="date" value={date} disabled className="w-full px-3 py-2 border rounded-lg bg-gray-100 text-gray-600" />
-          </div>
-        </div>
-        {/* Lookup fields */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-3">
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Phone Number <span className="text-gray-400 font-normal">(for auto-fill)</span></label>
-            <input type="tel" value={phone} onChange={e => handlePhoneChange(e.target.value)}
-              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="10-digit mobile number" />
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Aadhaar Number <span className="text-gray-400 font-normal">(for auto-fill)</span></label>
-            {!aadhaarEditable && aadhaar ? (
-              <div className="flex gap-2">
-                <input disabled value={`XXXX XXXX ${aadhaar.slice(-4)}`} className="flex-1 px-3 py-2 border rounded-lg bg-gray-100 text-gray-600" />
-                <button type="button" onClick={() => {
-                  if (window.confirm("Aadhaar was auto-filled from the customer database. Do you want to edit it?")) {
-                    setAadhaarEditable(true);
-                    setAutoFilledFields(prev => { const n = new Set(prev); n.delete("aadhaar"); return n; });
-                  }
-                }} className="px-3 py-2 bg-gray-200 hover:bg-gray-300 rounded-lg text-xs text-gray-700 flex items-center gap-1">
-                  <Edit2 size={12} /> Edit
-                </button>
-              </div>
-            ) : (
-              <input type="text" value={aadhaar} onChange={e => handleAadhaarInputChange(e.target.value)}
-                className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="12-digit Aadhaar number" />
-            )}
-          </div>
-        </div>
-        {/* Lookup status */}
-        {lookupStatus === "searching" && <p className="text-xs text-gray-500 mb-3">🔍 Searching customer database...</p>}
-        {lookupStatus === "found" && <p className="text-xs text-green-600 mb-3">✓ Customer auto-filled from database. You can still edit the fields below.</p>}
-        {lookupStatus === "notfound" && <p className="text-xs text-amber-600 mb-3">⚠ Customer not found in database. Please fill in the details manually.</p>}
-        {lookupStatus === "multiple" && <p className="text-xs text-blue-600 mb-3">Multiple accounts found — select one from the list.</p>}
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-          <div>
-            <label className="flex items-center gap-1 text-sm font-medium text-gray-700 mb-1">
-              Customer Name * {autoFilledFields.has("customerName") && <span className="text-teal-600 text-xs font-normal whitespace-nowrap">● filled</span>}
-            </label>
-            <input type="text" value={customerName}
-              onChange={e => handleAutoFilledChange("customerName", setCustomerName, e.target.value)}
-              className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500 ${autoFilledFields.has("customerName") ? "bg-teal-50 border-teal-200" : ""}`}
-              placeholder="Full name" />
-          </div>
-          <div>
-            <label className="flex items-center gap-1 text-sm font-medium text-gray-700 mb-1">
-              Customer ID * {autoFilledFields.has("customerId") && <span className="text-teal-600 text-xs font-normal whitespace-nowrap">● filled</span>}
-            </label>
-            <input type="text" value={customerId}
-              onChange={e => handleAutoFilledChange("customerId", setCustomerId, e.target.value)}
-              className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500 ${autoFilledFields.has("customerId") ? "bg-teal-50 border-teal-200" : ""}`}
-              placeholder="e.g. CUST001" />
-          </div>
-          <div>
-            <label className="flex items-center gap-1 text-sm font-medium text-gray-700 mb-1">
-              Loan Account No. * {autoFilledFields.has("loanAccountNo") && <span className="text-teal-600 text-xs font-normal whitespace-nowrap">● filled</span>}
-            </label>
-            <input type="text" value={loanAccountNo}
-              onChange={e => handleAutoFilledChange("loanAccountNo", setLoanAccountNo, e.target.value)}
-              className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500 ${autoFilledFields.has("loanAccountNo") ? "bg-teal-50 border-teal-200" : ""}`}
-              placeholder="e.g. LA12345" />
-          </div>
-        </div>
-        <CustomerInfoPanel loanAccountNo={loanAccountNo} customerId={customerId} hideValueBoxes onData={setOdSnap} />
-      </div>
-
-      {/* Section 2b: OD Snapshot — auto-populated from latest uploaded pool + accrued data */}
-      <div className="bg-white rounded-xl shadow-sm border p-5 mb-4">
-        <div className="flex items-center justify-between mb-4">
-          <h3 className="text-sm font-semibold text-teal-700 uppercase tracking-wide">OD Snapshot (auto)</h3>
-          <span className="text-[11px] text-gray-400">
-            {odSnap ? `As of ${odSnap.poolSnapshotDate || "—"}${odSnap.accruedSnapshotDate ? ` · Accrued ${odSnap.accruedSnapshotDate}` : ""}` : "Enter Loan A/C or Customer ID to look up"}
-          </span>
-        </div>
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Principal Outstanding</label>
-            <input type="text" readOnly tabIndex={-1} value={odSnap ? formatINR(odSnap.principalOutstanding) : "—"}
-              className="w-full px-3 py-2 border rounded-lg bg-gray-50 text-gray-800 font-medium cursor-default" />
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Unpaid Interest</label>
-            <input type="text" readOnly tabIndex={-1} value={odSnap ? formatINR(odSnap.unpaidInterest) : "—"}
-              className="w-full px-3 py-2 border rounded-lg bg-gray-50 text-gray-800 font-medium cursor-default" />
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Accrued Interest</label>
-            <input type="text" readOnly tabIndex={-1} value={odSnap ? formatINR(odSnap.accruedInterest) : "—"}
-              className="w-full px-3 py-2 border rounded-lg bg-gray-50 text-gray-800 font-medium cursor-default" />
-          </div>
-          <div>
-            <label className="block text-sm font-medium text-teal-800 mb-1">Foreclosure Amount</label>
-            <input type="text" readOnly tabIndex={-1} value={odSnap ? formatINR(odSnap.foreclosureValue) : "—"}
-              className="w-full px-3 py-2 border-2 border-teal-500 rounded-lg bg-teal-50 text-teal-900 font-bold cursor-default" />
-          </div>
-        </div>
-        <p className="text-[11px] text-gray-500 mt-2">Foreclosure = Principal Outstanding + Unpaid Interest + Accrued Interest. Values refresh automatically from the latest uploaded OD reports.</p>
-      </div>
 
       {/* Section 3: Transaction Details */}
       <div className="bg-white rounded-xl shadow-sm border p-5 mb-4">
