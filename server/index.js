@@ -719,19 +719,47 @@ app.post("/api/od/retention/run", requireUploader, (req, res) => {
   res.json(purgeOldSnapshots(RETENTION_DAYS));
 });
 
-// ── Pool Data (pool-data.json) helpers & routes ──────────────────────────────
+// ── Pool Data (SQLite) helpers & routes ──────────────────────────────────────
 
-let _poolDb = null;
-let _poolDbMtime = 0;
-function getPoolData() {
-  const poolPath = path.join(DATA_DIR, "pool-data.json");
-  if (!fs.existsSync(poolPath)) return { byLoan: {}, byPhone: {}, byAadhaar: {} };
-  const mtime = fs.statSync(poolPath).mtimeMs;
-  if (!_poolDb || mtime !== _poolDbMtime) {
-    _poolDb = JSON.parse(fs.readFileSync(poolPath, "utf8"));
-    _poolDbMtime = mtime;
-  }
-  return _poolDb;
+const POOL_JOIN = `
+  SELECT
+    c.loan_account_no, c.customer_number, c.customer_name, c.branch,
+    c.center_name, c.group_name, c.mobile_number, c.aadhaar_number,
+    c.product_interest_rate, c.loan_amount, c.officer_name,
+    c.disbursement_date, c.last_payment_date,
+    p.snapshot_date, p.principal_outstanding, p.interest_outstanding,
+    p.principal_overdue, p.interest_overdue, p.current_od,
+    p.overdue_days, p.loan_status, p.account_dpd_classification,
+    p.customer_dpd, p.customer_dpd_classification, p.total_interest_collected
+  FROM customers c
+  LEFT JOIN pool_snapshots p ON c.loan_account_no = p.loan_account_no
+`;
+
+function mapPoolRow(r) {
+  return {
+    loanNumber:             r.loan_account_no || "",
+    customerNumber:         r.customer_number || "",
+    memberName:             r.customer_name || "",
+    officeName:             r.branch || "",
+    centerName:             r.center_name || "",
+    groupName:              r.group_name || "",
+    phone:                  String(r.mobile_number || "").replace(/\D/g, ""),
+    aadhaar:                String(r.aadhaar_number || "").replace(/\D/g, ""),
+    interestRate:           Number(r.product_interest_rate) || 0,
+    loanAmount:             Number(r.loan_amount) || 0,
+    principalOutstanding:   Number(r.principal_outstanding) || 0,
+    interestOutstanding:    Number(r.interest_outstanding) || 0,
+    principalOverdue:       Number(r.principal_overdue) || 0,
+    interestOverdue:        Number(r.interest_overdue) || 0,
+    currentOD:              Number(r.current_od) || 0,
+    overdueDays:            Number(r.overdue_days) || 0,
+    loanStatus:             r.loan_status || "",
+    accountDPD:             r.account_dpd_classification || "",
+    customerDPD:            Number(r.customer_dpd) || 0,
+    customerDPDClass:       r.customer_dpd_classification || "",
+    totalInterestCollected: Number(r.total_interest_collected) || 0,
+    reportDate:             r.snapshot_date || "",
+  };
 }
 
 function calcInterestTillDate(record) {
@@ -743,81 +771,85 @@ function calcInterestTillDate(record) {
   const interestOverdueTillDate = Math.round((record.interestOverdue + additionalInterest) * 100) / 100;
   return {
     ...record, daysSinceReport,
-    additionalInterest: Math.round(additionalInterest * 100) / 100,
+    additionalInterest:    Math.round(additionalInterest * 100) / 100,
     interestOverdueTillDate,
-    arrearAmount: Math.round((record.principalOverdue + record.interestOverdue) * 100) / 100,
-    arrearAmountTillDate: Math.round((record.principalOverdue + interestOverdueTillDate) * 100) / 100,
+    arrearAmount:          Math.round((record.principalOverdue + record.interestOverdue) * 100) / 100,
+    arrearAmountTillDate:  Math.round((record.principalOverdue + interestOverdueTillDate) * 100) / 100,
+  };
+}
+
+function poolAggregates(members) {
+  const CLOSED_S   = ["Closed", "Written Off"];
+  const DELINQ_DPD = ["SMA-0", "SMA-1", "SMA-2", "NPA"];
+  const closedCount     = members.filter(r => CLOSED_S.includes(r.loanStatus)).length;
+  const delinquentCount = members.filter(r => !CLOSED_S.includes(r.loanStatus) && DELINQ_DPD.includes(r.customerDPDClass)).length;
+  const activeCount     = members.filter(r => !CLOSED_S.includes(r.loanStatus) && !DELINQ_DPD.includes(r.customerDPDClass)).length;
+  const nonClosed       = members.filter(r => !CLOSED_S.includes(r.loanStatus));
+  const totalPrincipalOverdue = members.reduce((s, r) => s + r.principalOverdue, 0);
+  const totalInterestOverdue  = members.reduce((s, r) => s + r.interestOverdueTillDate, 0);
+  const totalArrear           = members.reduce((s, r) => s + r.arrearAmountTillDate, 0);
+  return {
+    count: members.length, activeCount, delinquentCount, closedCount,
+    nonClosedCount: nonClosed.length,
+    totalPrincipalOverdue: Math.round(totalPrincipalOverdue * 100) / 100,
+    totalInterestOverdue:  Math.round(totalInterestOverdue  * 100) / 100,
+    totalArrear:           Math.round(totalArrear           * 100) / 100,
+    perMemberArrear: nonClosed.length > 0 ? Math.round(totalArrear / nonClosed.length * 100) / 100 : 0,
   };
 }
 
 // GET /api/pool/lookup?loan=|?phone=|?aadhaar=
 app.get("/api/pool/lookup", (req, res) => {
-  const { loan, phone, aadhaar } = req.query;
-  const db = getPoolData();
-  let records = [];
-  if (loan) {
-    const r = db.byLoan[String(loan).trim()];
-    if (r) records = [r];
-  } else if (phone) {
-    const key = String(phone).replace(/\D/g, "");
-    const loans = db.byPhone[key] || [];
-    records = loans.map(l => db.byLoan[l]).filter(Boolean);
-  } else if (aadhaar) {
-    const key = String(aadhaar).replace(/\D/g, "");
-    const loans = db.byAadhaar[key] || [];
-    records = loans.map(l => db.byLoan[l]).filter(Boolean);
+  try {
+    const { loan, phone, aadhaar } = req.query;
+    let rows = [];
+    if (loan) {
+      rows = db.prepare(POOL_JOIN + " WHERE c.loan_account_no = ?").all(String(loan).trim());
+    } else if (phone) {
+      const key = String(phone).replace(/\D/g, "");
+      rows = db.prepare(POOL_JOIN + " WHERE REPLACE(REPLACE(c.mobile_number,' ',''),'-','') LIKE ?").all("%" + key + "%");
+    } else if (aadhaar) {
+      const key = String(aadhaar).replace(/\D/g, "");
+      rows = db.prepare(POOL_JOIN + " WHERE REPLACE(c.aadhaar_number,' ','') = ?").all(key);
+    }
+    const results = rows.map(mapPoolRow).map(calcInterestTillDate);
+    const reportDate = results[0]?.reportDate || "";
+    res.json({ found: results.length > 0, count: results.length, reportDate, results });
+  } catch (e) {
+    console.error("[pool/lookup]", e.message);
+    res.json({ found: false, count: 0, results: [] });
   }
-  const results = records.map(calcInterestTillDate);
-  res.json({ found: results.length > 0, count: results.length, reportDate: db.reportDate, results });
 });
 
 // GET /api/pool/center?name=XXXX
 app.get("/api/pool/center", (req, res) => {
-  const { name } = req.query;
-  if (!name) return res.json({ found: false, members: [], count: 0 });
-  const db = getPoolData();
-  const q = name.trim().toLowerCase();
-  const members = Object.values(db.byLoan)
-    .filter(r => r.centerName.toLowerCase() === q)
-    .map(calcInterestTillDate);
-  const totalPrincipalOverdue = members.reduce((s, r) => s + r.principalOverdue, 0);
-  const totalInterestOverdue = members.reduce((s, r) => s + r.interestOverdueTillDate, 0);
-  const totalArrear = members.reduce((s, r) => s + r.arrearAmountTillDate, 0);
-  const CLOSED_STATUSES = ["Closed", "Written Off"];
-  const DELINQUENT_DPD = ["SMA-0", "SMA-1", "SMA-2", "NPA"];
-  const closedCount = members.filter(r => CLOSED_STATUSES.includes(r.loanStatus)).length;
-  const delinquentCount = members.filter(r => !CLOSED_STATUSES.includes(r.loanStatus) && DELINQUENT_DPD.includes(r.customerDPDClass)).length;
-  const activeCount = members.filter(r => !CLOSED_STATUSES.includes(r.loanStatus) && !DELINQUENT_DPD.includes(r.customerDPDClass)).length;
-  const nonClosedMembers = members.filter(r => !CLOSED_STATUSES.includes(r.loanStatus));
-  const totalArrearNonClosed = nonClosedMembers.reduce((s, r) => s + r.arrearAmountTillDate, 0);
-  res.json({
-    found: members.length > 0,
-    centerName: name,
-    count: members.length,
-    activeCount,
-    delinquentCount,
-    closedCount,
-    nonClosedCount: nonClosedMembers.length,
-    totalPrincipalOverdue: Math.round(totalPrincipalOverdue * 100) / 100,
-    totalInterestOverdue: Math.round(totalInterestOverdue * 100) / 100,
-    totalArrear: Math.round(totalArrear * 100) / 100,
-    perMemberArrear: nonClosedMembers.length > 0 ? Math.round(totalArrear / nonClosedMembers.length * 100) / 100 : 0,
-    members,
-    reportDate: db.reportDate,
-  });
+  try {
+    const { name } = req.query;
+    if (!name) return res.json({ found: false, members: [], count: 0 });
+    const rows = db.prepare(POOL_JOIN + " WHERE LOWER(c.center_name) = LOWER(?)").all(name.trim());
+    const members = rows.map(mapPoolRow).map(calcInterestTillDate);
+    const agg = poolAggregates(members);
+    const reportDate = members[0]?.reportDate || "";
+    res.json({ found: members.length > 0, centerName: name, ...agg, members, reportDate });
+  } catch (e) {
+    console.error("[pool/center]", e.message);
+    res.json({ found: false, members: [], count: 0 });
+  }
 });
 
 // GET /api/pool/search?name=XXXX
 app.get("/api/pool/search", (req, res) => {
-  const { name } = req.query;
-  if (!name || name.trim().length < 2) return res.json({ found: false, count: 0, results: [] });
-  const db = getPoolData();
-  const q = name.trim().toUpperCase();
-  const matches = Object.values(db.byLoan)
-    .filter(r => r.memberName.toUpperCase().includes(q))
-    .slice(0, 50)
-    .map(calcInterestTillDate);
-  res.json({ found: matches.length > 0, count: matches.length, reportDate: db.reportDate, results: matches });
+  try {
+    const { name } = req.query;
+    if (!name || name.trim().length < 2) return res.json({ found: false, count: 0, results: [] });
+    const rows = db.prepare(POOL_JOIN + " WHERE UPPER(c.customer_name) LIKE ? LIMIT 50").all("%" + name.trim().toUpperCase() + "%");
+    const results = rows.map(mapPoolRow).map(calcInterestTillDate);
+    const reportDate = results[0]?.reportDate || "";
+    res.json({ found: results.length > 0, count: results.length, reportDate, results });
+  } catch (e) {
+    console.error("[pool/search]", e.message);
+    res.json({ found: false, count: 0, results: [] });
+  }
 });
 
 // ── Generic CRUD (wildcard — must be LAST) ──

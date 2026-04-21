@@ -980,14 +980,29 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
   const [lookupStatus, setLookupStatus] = useState("");
   const [customerMatches, setCustomerMatches] = useState([]);
   const [odSnap, setOdSnap] = useState(null); // auto-populated OD snapshot from CustomerInfoPanel
+  const [indivCenters, setIndivCenters] = useState([]);
   const lookupTimerRef = useRef(null);
+
+  const fetchIndivCenters = (phoneNum) => {
+    const clean = String(phoneNum).replace(/\D/g, "");
+    if (clean.length < 10) return;
+    fetch(`${API_BASE}/pool/lookup?phone=${clean}`)
+      .then(r => r.json())
+      .then(data => {
+        if (!data.found) return;
+        const uniqueCenters = [...new Set(data.results.map(r => r.centerName).filter(Boolean))];
+        Promise.all(uniqueCenters.map(cn =>
+          fetch(`${API_BASE}/pool/center?name=${encodeURIComponent(cn)}`).then(r => r.json())
+        )).then(results => setIndivCenters(results.filter(r => r.found)));
+      }).catch(() => {});
+  };
 
   const applyCustomer = (c) => {
     setCustomerName(c.name);
     setCustomerId(c.customerId);
     setLoanAccountNo(c.loanAccountNo);
     if (c.aadhaar) { setAadhaar(c.aadhaar); setAadhaarEditable(false); }
-    if (c.phone) setPhone(c.phone);
+    if (c.phone) { setPhone(c.phone); fetchIndivCenters(c.phone); }
     setAutoFilledFields(new Set(["customerName", "customerId", "loanAccountNo", "aadhaar"]));
     setCustomerMatches([]);
     setLookupStatus("found");
@@ -1010,6 +1025,7 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
     setPhone(val);
     clearTimeout(lookupTimerRef.current);
     lookupTimerRef.current = setTimeout(() => doLookup("phone", val), 600);
+    if (val.replace(/\D/g, "").length >= 10) fetchIndivCenters(val);
   };
   const handleAadhaarInputChange = (val) => {
     setAadhaar(val);
@@ -1124,6 +1140,7 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
     setPaymentMode(""); setUpiReference(""); setPtpDate(""); setPtpTime("");
     setSmaBucket(""); setPhone(""); setAadhaar(""); setAadhaarEditable(true);
     setAutoFilledFields(new Set()); setLookupStatus(""); setCustomerMatches([]);
+    setIndivCenters([]);
     setPage("ind_records");
   };
 
@@ -1256,6 +1273,115 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
         </div>
         <p className="text-[11px] text-gray-500 mt-2">Foreclosure = Principal Outstanding + Unpaid Interest + Accrued Interest. Values refresh automatically from the latest uploaded OD reports.</p>
       </div>
+
+      {/* Center / Group Context Panel — read-only reference for individual entry */}
+      {indivCenters.length > 0 && indivCenters.map((cs, ci) => {
+        const CLOSED_S = ["Closed", "Written Off"];
+        const DELINQ_DPD = ["SMA-0", "SMA-1", "SMA-2", "NPA"];
+        const nonClosedCount = cs.count - cs.closedCount;
+        const perMemberShare = nonClosedCount > 0 ? Math.round(cs.totalArrear / nonClosedCount) : 0;
+        const enriched = cs.members.map(m => {
+          const isClosed = CLOSED_S.includes(m.loanStatus);
+          const isDelinquent = !isClosed && DELINQ_DPD.includes(m.customerDPDClass);
+          return { ...m, isClosed, isDelinquent };
+        });
+        const pendingMembers = enriched.filter(m => !m.isClosed);
+        return (
+          <div key={ci} className="bg-white rounded-xl shadow-sm border p-5 mb-4">
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-sm font-semibold text-indigo-700 uppercase tracking-wide">
+                Group Context — {cs.centerName}
+              </h3>
+              <span className="text-xs text-gray-400 bg-gray-100 px-2 py-0.5 rounded-full">Reference only</span>
+            </div>
+
+            {/* Bucket counts */}
+            <div className="grid grid-cols-3 sm:grid-cols-7 gap-2 mb-4">
+              <div className="bg-indigo-50 border border-indigo-200 rounded-lg p-2 text-center">
+                <p className="text-xs text-gray-500 mb-0.5">Total</p>
+                <p className="text-lg font-extrabold text-indigo-700">{cs.count}</p>
+              </div>
+              <div className="bg-green-50 border border-green-200 rounded-lg p-2 text-center">
+                <p className="text-xs text-gray-500 mb-0.5">Regular</p>
+                <p className="text-lg font-extrabold text-green-700">{cs.activeCount > 0 ? cs.activeCount : "—"}</p>
+              </div>
+              {[["SMA-0","blue"],["SMA-1","yellow"],["SMA-2","orange"],["NPA","red"]].map(([bucket, color]) => {
+                const cnt = enriched.filter(m => !m.isClosed && m.customerDPDClass === bucket).length;
+                return (
+                  <div key={bucket} className={`bg-${color}-50 border border-${color}-200 rounded-lg p-2 text-center`}>
+                    <p className="text-xs text-gray-500 mb-0.5">{bucket}</p>
+                    <p className={`text-lg font-extrabold text-${color}-700`}>{cnt > 0 ? cnt : "—"}</p>
+                  </div>
+                );
+              })}
+              <div className="bg-gray-50 border border-gray-200 rounded-lg p-2 text-center">
+                <p className="text-xs text-gray-500 mb-0.5">Closed</p>
+                <p className="text-lg font-extrabold text-gray-500">{cs.closedCount > 0 ? cs.closedCount : "—"}</p>
+              </div>
+            </div>
+
+            {/* Financial summary */}
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-4">
+              <div className="bg-red-50 border border-red-200 rounded-lg p-3 text-center">
+                <p className="text-xs text-gray-500 mb-1">Total Group OD (Principal)</p>
+                <p className="text-sm font-bold text-red-700">{formatINR(Math.round(cs.totalPrincipalOverdue))}</p>
+              </div>
+              <div className="bg-red-50 border border-red-200 rounded-lg p-3 text-center">
+                <p className="text-xs text-gray-500 mb-1">Total Arrear Till Today</p>
+                <p className="text-sm font-bold text-red-700">{formatINR(Math.round(cs.totalArrear))}</p>
+              </div>
+              <div className="bg-indigo-50 border border-indigo-200 rounded-lg p-3 text-center">
+                <p className="text-xs text-gray-500 mb-1">Individual OD Share (Till Today)</p>
+                <p className="text-base font-extrabold text-indigo-700">{formatINR(perMemberShare)}</p>
+              </div>
+            </div>
+
+            {/* Member list — read-only */}
+            <div className="overflow-x-auto rounded-lg border">
+              <table className="w-full text-xs">
+                <thead className="bg-gray-50">
+                  <tr>
+                    <th className="px-3 py-2 text-left font-semibold text-gray-600">#</th>
+                    <th className="px-3 py-2 text-left font-semibold text-gray-600">Member Name</th>
+                    <th className="px-3 py-2 text-left font-semibold text-gray-600">Loan No.</th>
+                    <th className="px-3 py-2 text-right font-semibold text-gray-600">Principal OD</th>
+                    <th className="px-3 py-2 text-right font-semibold text-gray-600">Arrear Till Today</th>
+                    <th className="px-3 py-2 text-center font-semibold text-gray-600">DPD</th>
+                    <th className="px-3 py-2 text-center font-semibold text-gray-600">Status</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  {enriched.map((m, i) => (
+                    <tr key={m.loanNumber}
+                      className={`${m.isClosed ? "opacity-40 bg-gray-50" : m.loanNumber === loanAccountNo ? "bg-indigo-50 ring-1 ring-inset ring-indigo-300" : ""}`}>
+                      <td className="px-3 py-2.5 text-gray-400">{i + 1}</td>
+                      <td className="px-3 py-2.5 font-semibold text-gray-800">
+                        {m.memberName}
+                        {m.loanNumber === loanAccountNo && <span className="ml-1 text-indigo-600 text-xs font-bold">← You</span>}
+                      </td>
+                      <td className="px-3 py-2.5 text-gray-500 font-mono text-xs">{m.loanNumber}</td>
+                      <td className="px-3 py-2.5 text-right text-gray-700">{formatINR(Math.round(m.principalOverdue))}</td>
+                      <td className="px-3 py-2.5 text-right font-bold text-red-700">{formatINR(Math.round(m.arrearAmountTillDate))}</td>
+                      <td className="px-3 py-2.5 text-center">
+                        <span className={`px-2 py-0.5 rounded-full text-xs font-bold ${m.customerDPD > 90 ? "bg-red-100 text-red-700" : m.customerDPD > 60 ? "bg-orange-100 text-orange-700" : m.customerDPD > 30 ? "bg-yellow-100 text-yellow-700" : m.customerDPD > 0 ? "bg-blue-100 text-blue-700" : "bg-green-100 text-green-700"}`}>
+                          {m.customerDPD}d
+                        </span>
+                      </td>
+                      <td className="px-3 py-2.5 text-center">
+                        {m.isClosed
+                          ? <span className="px-2 py-0.5 rounded-full text-xs font-bold bg-gray-200 text-gray-500">Closed</span>
+                          : m.isDelinquent
+                            ? <span className={`px-2 py-0.5 rounded-full text-xs font-bold ${m.customerDPDClass === "NPA" ? "bg-red-100 text-red-700" : m.customerDPDClass === "SMA-2" ? "bg-orange-100 text-orange-700" : m.customerDPDClass === "SMA-1" ? "bg-yellow-100 text-yellow-700" : "bg-blue-100 text-blue-700"}`}>{m.customerDPDClass}</span>
+                            : <span className="px-2 py-0.5 rounded-full text-xs font-bold bg-green-100 text-green-700">Active</span>}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        );
+      })}
 
       {/* Transaction Details */}
       <div className="bg-white rounded-xl shadow-sm border p-5 mb-4">
