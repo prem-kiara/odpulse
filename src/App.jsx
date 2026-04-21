@@ -347,7 +347,24 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
   const [lookupStatus, setLookupStatus] = useState("");
   const [customerMatches, setCustomerMatches] = useState([]);
   const [odSnap, setOdSnap] = useState(null); // auto-populated OD snapshot from CustomerInfoPanel
+  const [customerCenters, setCustomerCenters] = useState([]);
+  const [memberArrearOverride, setMemberArrearOverride] = useState(0);
+  const [memberAlreadyCollected, setMemberAlreadyCollected] = useState(0);
   const lookupTimerRef = useRef(null);
+
+  const fetchCentersForPhone = (phoneNum) => {
+    const clean = phoneNum.replace(/\D/g, "");
+    if (clean.length < 10) return;
+    fetch(`${API_BASE}/pool/lookup?phone=${clean}`)
+      .then(r => r.json())
+      .then(data => {
+        if (!data.found) return;
+        const uniqueCenters = [...new Set(data.results.map(r => r.centerName).filter(Boolean))];
+        Promise.all(uniqueCenters.map(cn =>
+          fetch(`${API_BASE}/pool/center?name=${encodeURIComponent(cn)}`).then(r => r.json())
+        )).then(results => setCustomerCenters(results.filter(r => r.found)));
+      }).catch(() => {});
+  };
 
   const applyCustomer = (c) => {
     setCustomerName(c.name);
@@ -358,6 +375,7 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
     setAutoFilledFields(new Set(["customerName", "customerId", "loanAccountNo", "aadhaar"]));
     setCustomerMatches([]);
     setLookupStatus("found");
+    if (c.phone) fetchCentersForPhone(c.phone);
   };
   const doLookup = (type, value) => {
     const clean = value.replace(/\D/g, "");
@@ -377,6 +395,7 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
     setPhone(val);
     clearTimeout(lookupTimerRef.current);
     lookupTimerRef.current = setTimeout(() => doLookup("phone", val), 600);
+    if (val.replace(/\D/g, "").length >= 10) fetchCentersForPhone(val);
   };
   const handleAadhaarInputChange = (val) => {
     setAadhaar(val);
@@ -401,9 +420,9 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
   // Group OD calculations
   const numCust = Number(numberOfCustomers) || 0;
   const groupOdDue = Number(groupOdAmount) || 0;
-  const customerShare = numCust > 0 ? Math.round(groupOdDue / numCust) : 0;
+  const customerShare = memberArrearOverride > 0 ? memberArrearOverride : (numCust > 0 ? Math.round(groupOdDue / numCust) : 0);
   const groupOdPaid = isPtpFuture ? 0 : (Number(groupOdPaidAmount) || 0);
-  const waiver = isPtpFuture ? 0 : Math.max(0, customerShare - groupOdPaid);
+  const waiver = isPtpFuture ? 0 : Math.max(0, customerShare - memberAlreadyCollected - groupOdPaid);
 
   const handleSave = () => {
     if (!branch) { alert("Please select a branch."); return; }
@@ -508,6 +527,7 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
     setPaymentMode(""); setUpiReference(""); setPtpDate(""); setPtpTime("");
     setPhone(""); setAadhaar(""); setAadhaarEditable(true);
     setAutoFilledFields(new Set()); setLookupStatus(""); setCustomerMatches([]);
+    setCustomerCenters([]); setMemberArrearOverride(0); setMemberAlreadyCollected(0);
     setPage("records");
   };
 
@@ -522,6 +542,202 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
   return (
     <div className="max-w-2xl mx-auto">
       <h2 className="text-xl font-bold text-gray-900 mb-6 flex items-center gap-2"><Plus size={22} className="text-teal-600" /> Group OD Entry</h2>
+
+      {customerCenters.length > 0 && customerCenters.map((cs, ci) => {
+        const CLOSED_S = ["Closed", "Written Off"];
+        const DELINQ_DPD = ["SMA-0", "SMA-1", "SMA-2", "NPA"];
+        const centerLoanNos = new Set(cs.members.map(m => m.loanNumber));
+        const centerEntries = entries.filter(e => centerLoanNos.has(e.loanAccountNo));
+        const totalCollected = centerEntries.reduce((s, e) => s + (Number(e.groupOdPaidAmount) || 0), 0);
+        const nonClosedCount = cs.count - cs.closedCount;
+        const perMemberShare = nonClosedCount > 0 ? Math.round(cs.totalArrear / nonClosedCount) : 0;
+        const remainingArrear = Math.max(0, Math.round(cs.totalArrear) - totalCollected);
+
+        const enriched = cs.members.map(m => {
+          const isClosed = CLOSED_S.includes(m.loanStatus);
+          const isDelinquent = !isClosed && DELINQ_DPD.includes(m.customerDPDClass);
+          const memberCollected = centerEntries
+            .filter(e => e.loanAccountNo === m.loanNumber)
+            .reduce((s, e) => s + (Number(e.groupOdPaidAmount) || 0), 0);
+          const memberRemaining = Math.max(0, Math.round(m.arrearAmountTillDate) - memberCollected);
+          const isSettledToday = !isClosed && memberCollected > 0 && memberRemaining === 0;
+          const isPartiallyPaid = !isClosed && memberCollected > 0 && memberRemaining > 0;
+          return { ...m, isClosed, isDelinquent, memberCollected, memberRemaining, isSettledToday, isPartiallyPaid };
+        });
+
+        const settledTodayCount = enriched.filter(m => m.isSettledToday).length;
+        const pendingMembers = enriched.filter(m => !m.isClosed && !m.isSettledToday);
+        const settledMembers = enriched.filter(m => m.isSettledToday);
+        const closedMembers = enriched.filter(m => m.isClosed);
+        const adjustedActive = cs.activeCount + settledTodayCount;
+        const remainingPerMember = pendingMembers.length > 0 ? Math.round(remainingArrear / pendingMembers.length) : 0;
+
+        const MemberRow = ({ m, idx }) => (
+          <tr key={m.loanNumber}
+            onClick={() => {
+              if (m.isClosed || m.isSettledToday) return;
+              setCustomerName(m.memberName);
+              setCustomerId(m.customerNumber);
+              setLoanAccountNo(m.loanNumber);
+              setPhone(m.phone || "");
+              setNumberOfCustomers(String(nonClosedCount));
+              setGroupOdAmount(String(Math.round(cs.totalArrear)));
+              setMemberArrearOverride(Math.round(m.arrearAmountTillDate));
+              setMemberAlreadyCollected(m.memberCollected || 0);
+              setAutoFilledFields(new Set(["customerName", "customerId", "loanAccountNo"]));
+              setLookupStatus("found");
+              window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+            }}
+            className={`transition-colors ${m.isClosed || m.isSettledToday ? "opacity-60 bg-gray-50" : m.isPartiallyPaid ? "bg-yellow-50 cursor-pointer hover:bg-yellow-100" : "cursor-pointer hover:bg-teal-50"}`}
+            title={m.isClosed ? "Loan closed" : m.isSettledToday ? "Fully settled today" : m.isPartiallyPaid ? `Partial — ${formatINR(m.memberRemaining)} remaining` : "Click to fill form"}>
+            <td className="px-3 py-2.5 text-gray-400">{idx}</td>
+            <td className="px-3 py-2.5 font-semibold text-gray-800">
+              {m.memberName}
+              {m.isSettledToday && <span className="ml-1 text-green-600 text-xs font-bold">✓ Settled</span>}
+              {m.isPartiallyPaid && <span className="ml-1 text-yellow-600 text-xs font-bold">~ Partial</span>}
+            </td>
+            <td className="px-3 py-2.5 text-gray-500 font-mono text-xs">{m.loanNumber}</td>
+            <td className="px-3 py-2.5 text-gray-500">{m.customerNumber}</td>
+            <td className="px-3 py-2.5 text-right font-bold text-red-700">{formatINR(Math.round(m.arrearAmountTillDate))}</td>
+            <td className="px-3 py-2.5 text-right font-bold text-green-700">{m.memberCollected > 0 ? formatINR(m.memberCollected) : "—"}</td>
+            <td className="px-3 py-2.5 text-right font-bold">
+              {m.memberRemaining > 0
+                ? <span className="text-orange-700">{formatINR(m.memberRemaining)}</span>
+                : m.memberCollected > 0
+                  ? <span className="text-green-600 font-bold">Cleared</span>
+                  : <span className="text-red-700">{formatINR(Math.round(m.arrearAmountTillDate))}</span>}
+            </td>
+            <td className="px-3 py-2.5 text-center">
+              {m.isSettledToday
+                ? <span className="px-2 py-0.5 rounded-full text-xs font-bold bg-green-100 text-green-700">0d</span>
+                : <span className={`px-2 py-0.5 rounded-full text-xs font-bold ${m.customerDPD > 90 ? "bg-red-100 text-red-700" : m.customerDPD > 60 ? "bg-orange-100 text-orange-700" : m.customerDPD > 30 ? "bg-yellow-100 text-yellow-700" : m.customerDPD > 0 ? "bg-blue-100 text-blue-700" : "bg-green-100 text-green-700"}`}>{m.customerDPD}d</span>}
+            </td>
+            <td className="px-3 py-2.5 text-center">
+              {m.isClosed
+                ? <span className="px-2 py-0.5 rounded-full text-xs font-bold bg-gray-200 text-gray-500">Closed</span>
+                : m.isSettledToday
+                  ? <span className="px-2 py-0.5 rounded-full text-xs font-bold bg-green-200 text-green-800">Regular</span>
+                  : m.isDelinquent
+                    ? <span className={`px-2 py-0.5 rounded-full text-xs font-bold ${m.customerDPDClass === "NPA" ? "bg-red-100 text-red-700" : m.customerDPDClass === "SMA-2" ? "bg-orange-100 text-orange-700" : m.customerDPDClass === "SMA-1" ? "bg-yellow-100 text-yellow-700" : "bg-blue-100 text-blue-700"}`}>{m.customerDPDClass}</span>
+                    : <span className="px-2 py-0.5 rounded-full text-xs font-bold bg-green-100 text-green-700">Active</span>}
+            </td>
+          </tr>
+        );
+
+        return (
+          <div key={ci} className="bg-white rounded-xl shadow-sm border p-5 mb-4">
+            <h3 className="text-sm font-semibold text-teal-700 uppercase tracking-wide mb-3">
+              Group / Center {customerCenters.length > 1 ? `#${ci + 1}` : ""}: {cs.centerName}
+            </h3>
+            <div>
+              <div className="grid grid-cols-3 sm:grid-cols-6 gap-2 mb-4">
+                <div className="bg-teal-50 border border-teal-200 rounded-lg p-2.5 text-center">
+                  <p className="text-xs text-gray-500 mb-1">Total</p>
+                  <p className="text-xl font-extrabold text-teal-700">{cs.count}</p>
+                </div>
+                <div className="bg-green-50 border border-green-200 rounded-lg p-2.5 text-center">
+                  <p className="text-xs text-gray-500 mb-1">Regular</p>
+                  <p className="text-xl font-extrabold text-green-700">{adjustedActive > 0 ? adjustedActive : "—"}</p>
+                  {settledTodayCount > 0 && <p className="text-xs text-green-500">(+{settledTodayCount} settled)</p>}
+                </div>
+                {[["SMA-0","blue"],["SMA-1","yellow"],["SMA-2","orange"],["NPA","red"]].map(([bucket, color]) => {
+                  const cnt = pendingMembers.filter(m => m.customerDPDClass === bucket).length;
+                  return (
+                    <div key={bucket} className={`bg-${color}-50 border border-${color}-200 rounded-lg p-2.5 text-center`}>
+                      <p className="text-xs text-gray-500 mb-1">{bucket}</p>
+                      <p className={`text-xl font-extrabold text-${color}-700`}>{cnt > 0 ? cnt : "—"}</p>
+                    </div>
+                  );
+                })}
+              </div>
+              <div className="grid grid-cols-2 gap-2 mb-4">
+                <div className="bg-gray-50 border border-gray-200 rounded-lg p-2.5 text-center">
+                  <p className="text-xs text-gray-500 mb-1">Closed</p>
+                  <p className="text-xl font-extrabold text-gray-500">{cs.closedCount > 0 ? cs.closedCount : "—"}</p>
+                </div>
+                <div className="bg-red-50 border border-red-200 rounded-lg p-2.5 text-center">
+                  <p className="text-xs text-gray-500 mb-1">Individual OD Share (Till Today)</p>
+                  <p className="text-lg font-extrabold text-red-700">{formatINR(perMemberShare)}</p>
+                </div>
+              </div>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+                <div className="bg-red-50 border border-red-200 rounded-lg p-3 text-center">
+                  <p className="text-xs text-gray-500 mb-1">Total Group OD (Principal)</p>
+                  <p className="text-sm font-bold text-red-700">{formatINR(Math.round(cs.totalPrincipalOverdue))}</p>
+                </div>
+                <div className="bg-red-50 border border-red-200 rounded-lg p-3 text-center">
+                  <p className="text-xs text-gray-500 mb-1">Total Arrear Till Today</p>
+                  <p className="text-sm font-bold text-red-700">{formatINR(Math.round(cs.totalArrear))}</p>
+                </div>
+                <div className="bg-green-50 border border-green-200 rounded-lg p-3 text-center">
+                  <p className="text-xs text-gray-500 mb-1">Total Collected (Today)</p>
+                  <p className="text-sm font-bold text-green-700">{formatINR(totalCollected)}</p>
+                </div>
+                <div className={`${remainingArrear > 0 ? "bg-orange-50 border-orange-200" : "bg-green-50 border-green-200"} border rounded-lg p-3 text-center`}>
+                  <p className="text-xs text-gray-500 mb-1">Remaining Arrear</p>
+                  <p className={`text-sm font-bold ${remainingArrear > 0 ? "text-orange-700" : "text-green-700"}`}>{formatINR(remainingArrear)}</p>
+                  {remainingArrear > 0 && pendingMembers.length > 0 && (
+                    <p className="text-xs text-orange-600 mt-0.5">≈ {formatINR(remainingPerMember)}/member</p>
+                  )}
+                </div>
+              </div>
+              {pendingMembers.length > 0 && (
+                <>
+                  <p className="text-xs text-teal-600 mb-2 font-medium">👆 Click a member row to auto-fill their details into the form below</p>
+                  <div className="overflow-x-auto rounded-lg border mb-3">
+                    <table className="w-full text-xs">
+                      <thead className="bg-gray-50">
+                        <tr>
+                          <th className="px-3 py-2 text-left font-semibold text-gray-600">#</th>
+                          <th className="px-3 py-2 text-left font-semibold text-gray-600">Member Name</th>
+                          <th className="px-3 py-2 text-left font-semibold text-gray-600">Loan No.</th>
+                          <th className="px-3 py-2 text-left font-semibold text-gray-600">Customer ID</th>
+                          <th className="px-3 py-2 text-right font-semibold text-gray-600">Arrear (Till Today)</th>
+                          <th className="px-3 py-2 text-right font-semibold text-green-600">Collected</th>
+                          <th className="px-3 py-2 text-right font-semibold text-orange-600">Remaining</th>
+                          <th className="px-3 py-2 text-center font-semibold text-gray-600">DPD</th>
+                          <th className="px-3 py-2 text-center font-semibold text-gray-600">Status</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-gray-100">
+                        {pendingMembers.map((m, i) => <MemberRow key={m.loanNumber} m={m} idx={i + 1} />)}
+                      </tbody>
+                    </table>
+                  </div>
+                </>
+              )}
+              {settledMembers.length > 0 && (
+                <div className="mb-3">
+                  <p className="text-xs font-semibold text-green-700 uppercase tracking-wide mb-1">✓ Settled Today ({settledMembers.length})</p>
+                  <div className="overflow-x-auto rounded-lg border border-green-200">
+                    <table className="w-full text-xs">
+                      <thead className="bg-green-50">
+                        <tr>
+                          <th className="px-3 py-2 text-left font-semibold text-green-700">#</th>
+                          <th className="px-3 py-2 text-left font-semibold text-green-700">Member Name</th>
+                          <th className="px-3 py-2 text-left font-semibold text-green-700">Loan No.</th>
+                          <th className="px-3 py-2 text-left font-semibold text-green-700">Customer ID</th>
+                          <th className="px-3 py-2 text-right font-semibold text-green-700">Arrear (Till Today)</th>
+                          <th className="px-3 py-2 text-right font-semibold text-green-700">Collected</th>
+                          <th className="px-3 py-2 text-right font-semibold text-green-700">Remaining</th>
+                          <th className="px-3 py-2 text-center font-semibold text-green-700">DPD</th>
+                          <th className="px-3 py-2 text-center font-semibold text-green-700">Status</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-green-100">
+                        {settledMembers.map((m, i) => <MemberRow key={m.loanNumber} m={m} idx={i + 1} />)}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+              {closedMembers.length > 0 && (
+                <p className="text-xs text-gray-400 text-center">{closedMembers.length} closed loan{closedMembers.length > 1 ? "s" : ""} not shown</p>
+              )}
+            </div>
+          </div>
+        );
+      })}
 
       {/* Section 1: Customer Details */}
       <div className="bg-white rounded-xl shadow-sm border p-5 mb-4">

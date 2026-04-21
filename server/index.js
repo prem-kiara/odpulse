@@ -719,6 +719,107 @@ app.post("/api/od/retention/run", requireUploader, (req, res) => {
   res.json(purgeOldSnapshots(RETENTION_DAYS));
 });
 
+// ── Pool Data (pool-data.json) helpers & routes ──────────────────────────────
+
+let _poolDb = null;
+let _poolDbMtime = 0;
+function getPoolData() {
+  const poolPath = path.join(DATA_DIR, "pool-data.json");
+  if (!fs.existsSync(poolPath)) return { byLoan: {}, byPhone: {}, byAadhaar: {} };
+  const mtime = fs.statSync(poolPath).mtimeMs;
+  if (!_poolDb || mtime !== _poolDbMtime) {
+    _poolDb = JSON.parse(fs.readFileSync(poolPath, "utf8"));
+    _poolDbMtime = mtime;
+  }
+  return _poolDb;
+}
+
+function calcInterestTillDate(record) {
+  const reportDate = new Date(record.reportDate + "T00:00:00");
+  const today = new Date(); today.setHours(0,0,0,0);
+  const daysSinceReport = Math.max(0, Math.floor((today - reportDate) / 86400000));
+  const dailyRate = record.interestRate / 100 / 365;
+  const additionalInterest = record.principalOverdue * dailyRate * daysSinceReport;
+  const interestOverdueTillDate = Math.round((record.interestOverdue + additionalInterest) * 100) / 100;
+  return {
+    ...record, daysSinceReport,
+    additionalInterest: Math.round(additionalInterest * 100) / 100,
+    interestOverdueTillDate,
+    arrearAmount: Math.round((record.principalOverdue + record.interestOverdue) * 100) / 100,
+    arrearAmountTillDate: Math.round((record.principalOverdue + interestOverdueTillDate) * 100) / 100,
+  };
+}
+
+// GET /api/pool/lookup?loan=|?phone=|?aadhaar=
+app.get("/api/pool/lookup", (req, res) => {
+  const { loan, phone, aadhaar } = req.query;
+  const db = getPoolData();
+  let records = [];
+  if (loan) {
+    const r = db.byLoan[String(loan).trim()];
+    if (r) records = [r];
+  } else if (phone) {
+    const key = String(phone).replace(/\D/g, "");
+    const loans = db.byPhone[key] || [];
+    records = loans.map(l => db.byLoan[l]).filter(Boolean);
+  } else if (aadhaar) {
+    const key = String(aadhaar).replace(/\D/g, "");
+    const loans = db.byAadhaar[key] || [];
+    records = loans.map(l => db.byLoan[l]).filter(Boolean);
+  }
+  const results = records.map(calcInterestTillDate);
+  res.json({ found: results.length > 0, count: results.length, reportDate: db.reportDate, results });
+});
+
+// GET /api/pool/center?name=XXXX
+app.get("/api/pool/center", (req, res) => {
+  const { name } = req.query;
+  if (!name) return res.json({ found: false, members: [], count: 0 });
+  const db = getPoolData();
+  const q = name.trim().toLowerCase();
+  const members = Object.values(db.byLoan)
+    .filter(r => r.centerName.toLowerCase() === q)
+    .map(calcInterestTillDate);
+  const totalPrincipalOverdue = members.reduce((s, r) => s + r.principalOverdue, 0);
+  const totalInterestOverdue = members.reduce((s, r) => s + r.interestOverdueTillDate, 0);
+  const totalArrear = members.reduce((s, r) => s + r.arrearAmountTillDate, 0);
+  const CLOSED_STATUSES = ["Closed", "Written Off"];
+  const DELINQUENT_DPD = ["SMA-0", "SMA-1", "SMA-2", "NPA"];
+  const closedCount = members.filter(r => CLOSED_STATUSES.includes(r.loanStatus)).length;
+  const delinquentCount = members.filter(r => !CLOSED_STATUSES.includes(r.loanStatus) && DELINQUENT_DPD.includes(r.customerDPDClass)).length;
+  const activeCount = members.filter(r => !CLOSED_STATUSES.includes(r.loanStatus) && !DELINQUENT_DPD.includes(r.customerDPDClass)).length;
+  const nonClosedMembers = members.filter(r => !CLOSED_STATUSES.includes(r.loanStatus));
+  const totalArrearNonClosed = nonClosedMembers.reduce((s, r) => s + r.arrearAmountTillDate, 0);
+  res.json({
+    found: members.length > 0,
+    centerName: name,
+    count: members.length,
+    activeCount,
+    delinquentCount,
+    closedCount,
+    nonClosedCount: nonClosedMembers.length,
+    totalPrincipalOverdue: Math.round(totalPrincipalOverdue * 100) / 100,
+    totalInterestOverdue: Math.round(totalInterestOverdue * 100) / 100,
+    totalArrear: Math.round(totalArrear * 100) / 100,
+    perMemberArrear: nonClosedMembers.length > 0 ? Math.round(totalArrear / nonClosedMembers.length * 100) / 100 : 0,
+    members,
+    reportDate: db.reportDate,
+  });
+});
+
+// GET /api/pool/search?name=XXXX
+app.get("/api/pool/search", (req, res) => {
+  const { name } = req.query;
+  if (!name || name.trim().length < 2) return res.json({ found: false, count: 0, results: [] });
+  const db = getPoolData();
+  const q = name.trim().toUpperCase();
+  const matches = Object.values(db.byLoan)
+    .filter(r => r.memberName.toUpperCase().includes(q))
+    .slice(0, 50)
+    .map(calcInterestTillDate);
+  res.json({ found: matches.length > 0, count: matches.length, reportDate: db.reportDate, results: matches });
+});
+
 // ── Generic CRUD (wildcard — must be LAST) ──
 
 // GET /api/:collection
