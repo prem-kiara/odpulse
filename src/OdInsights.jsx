@@ -840,7 +840,11 @@ export function CollectionDashboard({ user, entries, branches }) {
   ];
 
   return (
-    <div className="space-y-6">
+    // min-w-0 + overflow-x-hidden enforces that no child can push the OD Insights
+    // page wider than its column in the app shell. Without this, the Branch ×
+    // Product heatmap (up to 80k cells, ~34k px wide) escapes its own
+    // overflow-x-auto wrapper in some layouts and drags the whole page with it.
+    <div className="space-y-6 min-w-0 overflow-x-hidden">
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div>
           <h2 className="text-2xl font-bold text-gray-900">OD Insights</h2>
@@ -2817,6 +2821,10 @@ function ProductPerformanceView({ openDrill }) {
   const [loading, setLoading] = useState(false);
   const [sortKey, setSortKey] = useState("principal_outstanding");
   const [sortDir, setSortDir] = useState("desc");
+  // Matrix size cap — with 212 branches × 379 products the raw heatmap is
+  // unreadable AND forces horizontal overflow. Default to the biggest
+  // 20 branches × 15 products by book size; user can expand to see all.
+  const [matrixExpanded, setMatrixExpanded] = useState(false);
 
   useEffect(() => {
     if (latest && !period.start) setPeriod({ start: latest.period_start, end: latest.period_end });
@@ -2880,6 +2888,21 @@ function ProductPerformanceView({ openDrill }) {
     }
     return m;
   }, [matrix.matrix]);
+
+  // Keep only the biggest branches/products when collapsed — otherwise the
+  // heatmap has tens of thousands of cells and becomes a wall of colour.
+  const MATRIX_TOP_BRANCHES = 20;
+  const MATRIX_TOP_PRODUCTS = 15;
+  const visibleMatrix = useMemo(() => {
+    if (matrixExpanded) return { branches: matrix.branches, products: matrix.products };
+    const byBookDesc = (a, b) => (b.book || 0) - (a.book || 0);
+    const branches = [...matrix.branches].sort(byBookDesc).slice(0, MATRIX_TOP_BRANCHES);
+    const products = [...matrix.products].sort(byBookDesc).slice(0, MATRIX_TOP_PRODUCTS);
+    return { branches, products };
+  }, [matrix.branches, matrix.products, matrixExpanded]);
+  const matrixTrimmed =
+    matrix.branches.length > visibleMatrix.branches.length ||
+    matrix.products.length > visibleMatrix.products.length;
 
   const drill = (product, branch) => openDrill({
     product: product || undefined,
@@ -3072,29 +3095,42 @@ function ProductPerformanceView({ openDrill }) {
       </div>
 
       {/* Branch × Product heatmap */}
-      <div className="bg-white rounded-xl border">
-        <div className="px-5 py-3 border-b flex items-center justify-between">
-          <div>
+      <div className="bg-white rounded-xl border max-w-full overflow-hidden">
+        <div className="px-5 py-3 border-b flex items-center justify-between gap-3 flex-wrap">
+          <div className="min-w-0">
             <h3 className="font-semibold text-gray-800 flex items-center gap-1.5"><Grid3x3 size={16} /> Branch × Product CE% Matrix</h3>
-            <p className="text-xs text-gray-500">Colour shows CE%. Click any cell to drill into that branch-product slice.</p>
+            <p className="text-xs text-gray-500">
+              {matrixTrimmed && !matrixExpanded
+                ? `Showing top ${visibleMatrix.branches.length} branches × ${visibleMatrix.products.length} products by book size (of ${matrix.branches.length} × ${matrix.products.length}).`
+                : `Colour shows CE%. Click any cell to drill into that branch-product slice.`}
+            </p>
           </div>
-          <div className="flex items-center gap-1.5 text-[10px]">
-            <span className="px-1.5 py-0.5 rounded bg-red-600 text-white">&lt;50%</span>
-            <span className="px-1.5 py-0.5 rounded bg-orange-500 text-white">50-70</span>
-            <span className="px-1.5 py-0.5 rounded bg-amber-400 text-gray-900">70-85</span>
-            <span className="px-1.5 py-0.5 rounded bg-emerald-400 text-white">85-95</span>
-            <span className="px-1.5 py-0.5 rounded bg-emerald-600 text-white">95%+</span>
+          <div className="flex items-center gap-2">
+            {matrixTrimmed && (
+              <button
+                onClick={() => setMatrixExpanded(v => !v)}
+                className="text-xs px-2 py-1 border rounded-md hover:bg-gray-50 text-gray-700">
+                {matrixExpanded ? "Show top only" : `Show all ${matrix.branches.length}×${matrix.products.length}`}
+              </button>
+            )}
+            <div className="flex items-center gap-1.5 text-[10px]">
+              <span className="px-1.5 py-0.5 rounded bg-red-600 text-white">&lt;50%</span>
+              <span className="px-1.5 py-0.5 rounded bg-orange-500 text-white">50-70</span>
+              <span className="px-1.5 py-0.5 rounded bg-amber-400 text-gray-900">70-85</span>
+              <span className="px-1.5 py-0.5 rounded bg-emerald-400 text-white">85-95</span>
+              <span className="px-1.5 py-0.5 rounded bg-emerald-600 text-white">95%+</span>
+            </div>
           </div>
         </div>
         <div className="overflow-x-auto max-h-[600px] overflow-y-auto">
-          {matrix.branches.length === 0 ? (
+          {visibleMatrix.branches.length === 0 ? (
             <div className="text-center text-gray-400 py-10">No matrix data.</div>
           ) : (
             <table className="text-[10px] border-separate border-spacing-0.5 p-2">
               <thead className="sticky top-0 bg-white z-10">
                 <tr>
                   <th className="sticky left-0 bg-white text-left px-2 py-2 text-gray-500 uppercase tracking-wide min-w-[140px] z-20">Branch ↓ / Product →</th>
-                  {matrix.products.map(p => (
+                  {visibleMatrix.products.map(p => (
                     <th key={p.product} className="px-2 py-2 text-gray-600 font-semibold min-w-[90px] text-center">
                       <div className="truncate max-w-[100px]" title={p.product}>{p.product}</div>
                       <div className={`text-[9px] ${ceColor(p.cePct)}`}>{p.cePct == null ? "—" : formatPct(p.cePct, 0)}</div>
@@ -3103,14 +3139,14 @@ function ProductPerformanceView({ openDrill }) {
                 </tr>
               </thead>
               <tbody>
-                {matrix.branches.map(b => (
+                {visibleMatrix.branches.map(b => (
                   <tr key={b.branch}>
                     <td className="sticky left-0 bg-white text-left px-2 py-1 font-medium text-gray-800 z-10 cursor-pointer hover:text-teal-700"
                         onClick={() => drill(null, b.branch)}>
                       <div className="truncate max-w-[130px]" title={b.branch}>{b.branch}</div>
                       <div className={`text-[9px] ${ceColor(b.cePct)}`}>{b.cePct == null ? "—" : formatPct(b.cePct, 0)}</div>
                     </td>
-                    {matrix.products.map(p => {
+                    {visibleMatrix.products.map(p => {
                       const cell = matrixLookup.get(`${b.branch}||${p.product}`);
                       const ce = cell ? cell.cePct : null;
                       const empty = !cell;
