@@ -297,7 +297,7 @@ const REPORT_KINDS = [
   },
 ];
 
-export function DataUploadPage({ user }) {
+export function DataUploadPage({ user, canUpload }) {
   const [files, setFiles] = useState({});
   const [dates, setDates] = useState(() => {
     const today = new Date().toISOString().slice(0, 10);
@@ -375,11 +375,15 @@ export function DataUploadPage({ user }) {
     }
   };
 
-  const isUploader = user.role === "admin" || user.role === "elevated_staff";
+  // Permission: controlled by App.jsx (canUpload prop). Fall back to the
+  // legacy role check if the prop is not supplied, so direct mounts still work.
+  const isUploader = canUpload != null
+    ? !!canUpload
+    : (user.role === "admin" || user.role === "elevated_staff");
   if (!isUploader) {
     return (
       <div className="p-8 text-center text-gray-500">
-        <AlertTriangle className="mx-auto mb-2" /> You don't have permission to upload OD data.
+        <AlertTriangle className="mx-auto mb-2" /> You don't have permission to upload OD data. Ask an admin to grant OD Upload access.
       </div>
     );
   }

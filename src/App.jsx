@@ -3380,6 +3380,61 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
               );
             })()}
           </div>
+          {/* OD Upload access control — mirror of OD Insights, independent list */}
+          <div className="bg-white rounded-xl border p-5">
+            <h3 className="font-semibold text-gray-800 mb-1 flex items-center gap-2"><Upload size={18} className="text-teal-600" /> OD Upload Access</h3>
+            <p className="text-xs text-gray-500 mb-4">Admins and MIS Staff always have access. Toggle which other users can upload OD report CSVs (Pool, Accrued, Overdue, Collections, Client-Wise).</p>
+            {(() => {
+              const accessList = Array.isArray(config.odUploadAccessUserIds) ? config.odUploadAccessUserIds : [];
+              const toggleAccess = (uid) => {
+                const next = accessList.includes(uid) ? accessList.filter(id => id !== uid) : [...accessList, uid];
+                handleConfigChange("odUploadAccessUserIds", next);
+              };
+              // "Always on" for admin + elevated_staff; togglable only for regular staff.
+              const togglable = users.filter(u => u.role !== "admin" && u.role !== "elevated_staff");
+              const grantedCount = togglable.filter(u => accessList.includes(u.id)).length;
+              const setAll = (grant) => {
+                handleConfigChange("odUploadAccessUserIds", grant ? togglable.map(u => u.id) : []);
+              };
+              return (
+                <>
+                  <div className="flex items-center gap-2 mb-3">
+                    <button onClick={() => setAll(true)} className="text-xs px-3 py-1.5 bg-teal-50 text-teal-700 rounded-lg hover:bg-teal-100 border border-teal-100">Grant all</button>
+                    <button onClick={() => setAll(false)} className="text-xs px-3 py-1.5 bg-gray-50 text-gray-600 rounded-lg hover:bg-gray-100 border">Revoke all</button>
+                    <span className="text-xs text-gray-500 ml-2">{grantedCount} of {togglable.length} staff granted</span>
+                  </div>
+                  <div className="max-h-80 overflow-y-auto border rounded-lg divide-y">
+                    {users.map(u => {
+                      const alwaysOn = u.role === "admin" || u.role === "elevated_staff";
+                      const granted = alwaysOn || accessList.includes(u.id);
+                      const roleLabel = u.role === "elevated_staff" ? "MIS Staff" : u.role === "admin" ? "Admin" : "Staff";
+                      const roleColor = u.role === "admin" ? "bg-purple-100 text-purple-700" : u.role === "elevated_staff" ? "bg-amber-100 text-amber-700" : "bg-blue-100 text-blue-700";
+                      return (
+                        <div key={u.id} className="flex items-center justify-between px-3 py-2.5">
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-2">
+                              <p className="text-sm font-medium text-gray-800 truncate">{u.name}</p>
+                              <span className={`px-2 py-0.5 rounded-full text-[10px] font-medium ${roleColor}`}>{roleLabel}</span>
+                              {!u.active && <span className="text-[10px] text-gray-400">(inactive)</span>}
+                            </div>
+                            <p className="text-xs text-gray-500 truncate">@{u.username}{u.branch ? ` • ${u.branch}` : ""}</p>
+                          </div>
+                          {alwaysOn ? (
+                            <span className="text-xs text-gray-400 px-2">Always on</span>
+                          ) : (
+                            <button onClick={() => toggleAccess(u.id)}
+                              className={`w-11 h-6 rounded-full transition-colors flex-shrink-0 ${granted ? "bg-teal-600" : "bg-gray-300"}`}>
+                              <div className={`w-5 h-5 bg-white rounded-full shadow transition-transform ${granted ? "translate-x-5" : "translate-x-0.5"}`} />
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </>
+              );
+            })()}
+          </div>
           <div className="bg-white rounded-xl border p-5">
             <h3 className="font-semibold text-amber-700 mb-1 flex items-center gap-2"><AlertTriangle size={18} /> Data Fix</h3>
             <p className="text-xs text-gray-500 mb-3">If Individual OD entries were imported with incorrect waiver amounts (the unpaid balance was mistakenly recorded as a waiver), use this to zero out waivers on all Individual OD entries.</p>
@@ -3618,6 +3673,10 @@ export default function App() {
 
   const isAdmin = user.role === "admin";
   const isElevated = user.role === "elevated_staff";
+  // Per-user overrides from Admin panel. Admin is always granted; elevated_staff
+  // keeps automatic Upload access for backward compatibility.
+  const canViewInsights = isAdmin || (Array.isArray(config.odInsightsAccessUserIds) && config.odInsightsAccessUserIds.includes(user.id));
+  const canUploadOD    = isAdmin || isElevated || (Array.isArray(config.odUploadAccessUserIds) && config.odUploadAccessUserIds.includes(user.id));
 
   const unreadNotificationsCount = notifications.filter(n =>
     (user.role === "admin" || user.role === "elevated_staff" ? true : n.forUserId === user.id) && (!n.read || n.type === "ptp_pending")
@@ -3628,8 +3687,8 @@ export default function App() {
     { key: "entry", icon: Plus, label: "New Entry" },
     { key: "records", icon: FileText, label: "Group OD" },
     { key: "ind_records", icon: FileText, label: "Individual OD" },
-    ...((isAdmin || (Array.isArray(config.odInsightsAccessUserIds) && config.odInsightsAccessUserIds.includes(user.id))) ? [{ key: "od_insights", icon: TrendingUp, label: "OD Insights" }] : []),
-    ...(isAdmin || isElevated ? [{ key: "od_upload", icon: Upload, label: "OD Upload" }] : []),
+    ...(canViewInsights ? [{ key: "od_insights", icon: TrendingUp, label: "OD Insights" }] : []),
+    ...(canUploadOD ? [{ key: "od_upload", icon: Upload, label: "OD Upload" }] : []),
     { key: "notifications", icon: Bell, label: "Notifications", badge: unreadNotificationsCount > 0 ? unreadNotificationsCount : null },
     ...(isAdmin ? [{ key: "admin", icon: Shield, label: "Admin" }] : []),
   ];
@@ -3705,8 +3764,8 @@ export default function App() {
           )}
           {page === "records" && <RecordsTable user={user} entries={entries} setEntries={setEntries} config={config} branches={branches} notifications={notifications} setNotifications={setNotifications} odTypeFilter="Group OD" />}
           {page === "ind_records" && <RecordsTable user={user} entries={entries} setEntries={setEntries} config={config} branches={branches} notifications={notifications} setNotifications={setNotifications} odTypeFilter="Individual OD" />}
-          {page === "od_insights" && (isAdmin || (Array.isArray(config.odInsightsAccessUserIds) && config.odInsightsAccessUserIds.includes(user.id))) && <CollectionDashboard user={user} entries={entries} branches={branches} />}
-          {page === "od_upload" && (isAdmin || isElevated) && <DataUploadPage user={user} />}
+          {page === "od_insights" && canViewInsights && <CollectionDashboard user={user} entries={entries} branches={branches} />}
+          {page === "od_upload" && canUploadOD && <DataUploadPage user={user} canUpload={canUploadOD} />}
           {page === "notifications" && <NotificationsPage user={user} users={users} notifications={notifications} setNotifications={setNotifications} />}
           {page === "admin" && user.role === "admin" && <AdminPanel users={users} setUsers={setUsers} branches={branches} setBranches={setBranches} config={config} setConfig={setConfig} entries={entries} setEntries={setEntries} notifications={notifications} setNotifications={setNotifications} />}
         </main>

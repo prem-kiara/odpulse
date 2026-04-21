@@ -44,7 +44,7 @@ const DEFAULT_USERS = [
   { id: "u_dinesh", username: "dinesh", password: "Dhanam@123", role: "elevated_staff", name: "Dinesh", branch: "Head Office", active: true, mustChangePassword: true },
 ];
 
-const DEFAULT_CONFIG = { companyName: "OD Pulse - MFI Recovery Tracker", allowStaffEdit: false, allowStaffDelete: false, staffSeeAllBranches: false, odInsightsAccessUserIds: [] };
+const DEFAULT_CONFIG = { companyName: "OD Pulse - MFI Recovery Tracker", allowStaffEdit: false, allowStaffDelete: false, staffSeeAllBranches: false, odInsightsAccessUserIds: [], odUploadAccessUserIds: [] };
 
 // ─── File helpers ───────────────────────────────────────────────────────────
 function loadJSON(filename, fallback) {
@@ -343,10 +343,16 @@ function uploadField(fieldName) {
 
 function requireUploader(req, res, next) {
   const role = req.header("x-od-role") || "";
-  if (role !== "admin" && role !== "elevated_staff") {
-    return res.status(403).json({ error: "Only admin or elevated_staff can upload OD data." });
+  const userId = req.header("x-od-user") || "";
+  // Admin + elevated_staff always allowed. Regular staff can also be granted
+  // access via config.odUploadAccessUserIds (managed in the Admin panel).
+  if (role === "admin" || role === "elevated_staff") return next();
+  if (userId) {
+    const cfg = loadJSON("config.json", DEFAULT_CONFIG);
+    const allowed = Array.isArray(cfg?.odUploadAccessUserIds) ? cfg.odUploadAccessUserIds : [];
+    if (allowed.includes(userId)) return next();
   }
-  next();
+  return res.status(403).json({ error: "You do not have permission to upload OD data. Ask an admin to grant OD Upload access." });
 }
 
 function todayIso() { return new Date().toISOString().slice(0, 10); }
