@@ -3741,7 +3741,13 @@ export default function App() {
         {sidebarOpen && <div className="fixed inset-0 bg-black/30 z-20 lg:hidden" onClick={() => setSidebarOpen(false)} />}
 
         {/* Main content */}
-        <main className="flex-1 p-4 lg:p-6 min-h-[calc(100vh-60px)]">
+        {/* min-w-0 is LOAD-BEARING: without it this flex item inherits
+            min-width: auto, which lets a wide child (e.g. the Branch × Product
+            heatmap with hundreds of columns) grow <main> past its flex share
+            and trigger a horizontal page scroll. With min-w-0, inner
+            overflow-x-auto wrappers on tables actually work and the page
+            width stays anchored to the flex column. */}
+        <main className="flex-1 min-w-0 p-4 lg:p-6 min-h-[calc(100vh-60px)]">
           {page === "dashboard" && <Dashboard user={user} entries={entries} branches={branches} config={config} />}
           {page === "entry" && (
             <div>

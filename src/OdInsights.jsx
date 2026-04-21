@@ -840,11 +840,11 @@ export function CollectionDashboard({ user, entries, branches }) {
   ];
 
   return (
-    // min-w-0 + overflow-x-hidden enforces that no child can push the OD Insights
-    // page wider than its column in the app shell. Without this, the Branch ×
-    // Product heatmap (up to 80k cells, ~34k px wide) escapes its own
-    // overflow-x-auto wrapper in some layouts and drags the whole page with it.
-    <div className="space-y-6 min-w-0 overflow-x-hidden">
+    // min-w-0 cooperates with the parent <main>'s min-w-0 to keep this page
+    // pinned to the flex column width. Inner overflow-x-auto wrappers then
+    // handle wide tables (scorecard, heatmap) as designed — with scrollbars
+    // instead of clipping or page-wide overflow.
+    <div className="space-y-6 min-w-0">
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div>
           <h2 className="text-2xl font-bold text-gray-900">OD Insights</h2>
@@ -1238,16 +1238,19 @@ function KpiCard({ icon, label, value, sub, color, onClick }) {
     amber:  "bg-amber-50 border-amber-200 text-amber-800",
   }[color] || "bg-gray-50 border-gray-200 text-gray-800";
   const interactive = typeof onClick === "function";
-  const baseClass = `rounded-xl border p-4 ${palette} ${interactive ? "cursor-pointer transition-all hover:shadow-md hover:-translate-y-0.5 active:translate-y-0 relative group" : ""}`;
+  // min-w-0 lets the card shrink below its content's intrinsic width inside a
+  // grid cell — critical so long values (e.g. "GOLD_HALFYEARLY — 1857%") wrap
+  // cleanly instead of pushing the card (and the whole KPI row) wider.
+  const baseClass = `rounded-xl border p-4 min-w-0 ${palette} ${interactive ? "cursor-pointer transition-all hover:shadow-md hover:-translate-y-0.5 active:translate-y-0 relative group" : ""}`;
   const content = (
     <>
-      <div className="flex items-center gap-2 text-xs uppercase tracking-wide opacity-70">
+      <div className="flex items-center gap-2 text-xs uppercase tracking-wide opacity-70 min-w-0">
         {icon && React.cloneElement(icon, { size: 14 })}
-        {label}
-        {interactive && <ChevronRight size={12} className="ml-auto opacity-40 group-hover:opacity-100 group-hover:translate-x-0.5 transition" />}
+        <span className="truncate">{label}</span>
+        {interactive && <ChevronRight size={12} className="ml-auto opacity-40 group-hover:opacity-100 group-hover:translate-x-0.5 transition shrink-0" />}
       </div>
-      <div className="text-xl font-bold mt-1">{value}</div>
-      {sub && <div className="text-[11px] opacity-70 mt-1">{sub}</div>}
+      <div className="text-xl font-bold mt-1 break-words">{value}</div>
+      {sub && <div className="text-[11px] opacity-70 mt-1 break-words">{sub}</div>}
     </>
   );
   return interactive ? (
