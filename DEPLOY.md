@@ -108,14 +108,63 @@ When you make changes and push to GitHub:
 # SSH into EC2
 ssh -i your-key.pem ubuntu@3.110.0.79
 
-# Pull latest code and rebuild
+# Pull latest code
 cd /home/ubuntu/odpulse
 git pull origin main
+
+# Frontend: install + build
 npm install
 npm run build
 
-# That's it! Nginx already serves from dist/
-# No restart needed for static files
+# Backend: install + rebuild native modules, then restart
+cd server
+npm install
+# better-sqlite3 is a native module — rebuild it to match the server's Node ABI,
+# otherwise startup crashes with a NODE_MODULE_VERSION mismatch.
+npm rebuild better-sqlite3
+cd ..
+
+# Restart the API service (PM2 is used for the Express server).
+pm2 restart odpulse-api
+```
+
+---
+
+## IF THE NGINX CONFIG CHANGED
+
+After pulling a commit that modifies `nginx-odpulse.conf` (upload size limits,
+proxy timeouts, new locations, etc.) the changes don't take effect until you
+copy the file and reload nginx:
+
+```bash
+sudo cp /home/ubuntu/odpulse/nginx-odpulse.conf /etc/nginx/sites-available/odpulse
+sudo nginx -t                       # validate
+sudo systemctl reload nginx         # zero-downtime reload
+```
+
+Symptom that usually means you forgot this step:
+`413 Request Entity Too Large` on big uploads (pool / accrued reports).
+
+---
+
+## RUNTIME DATA FILES — DO NOT COMMIT
+
+`server/data/*.sqlite*`, `users.json`, `entries.json`, `notifications.json`,
+and `config.json` are runtime state and are **not tracked in git**. Each
+production server owns its own copy. First-time setup:
+
+```bash
+mkdir -p /home/ubuntu/odpulse/server/data
+# If restoring from backup:
+cp /path/to/backup/odpulse.sqlite /home/ubuntu/odpulse/server/data/
+# If starting fresh: the server auto-creates the DB on first boot.
+```
+
+Taking a backup (recommended: daily cron):
+
+```bash
+sqlite3 /home/ubuntu/odpulse/server/data/odpulse.sqlite \
+  ".backup /home/ubuntu/backups/odpulse-$(date +%F).sqlite"
 ```
 
 ---

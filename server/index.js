@@ -5,18 +5,22 @@ const path = require("path");
 const cron = require("node-cron");
 const nodemailer = require("nodemailer");
 const multer = require("multer");
+const iconv = require("iconv-lite");
 
 const db = require("./db");
-const { ingestPool, ingestAccrued, purgeOldSnapshots } = require("./ingest");
+const { ingestPool, ingestAccrued, ingestOverdue, ingestCollections, ingestClientPeriod, purgeOldSnapshots } = require("./ingest");
 
 const app = express();
 const PORT = 3001;
 const DATA_DIR = path.join(__dirname, "data");
+const UPLOAD_TMP_DIR = path.join(__dirname, "uploads");
 const BRANCHES_FILE = path.join(DATA_DIR, "branches.json");
 const RETENTION_DAYS = 90;
+const MAX_UPLOAD_BYTES = 150 * 1024 * 1024; // 150 MB
 
-// ─── Ensure data directory exists ───────────────────────────────────────────
+// ─── Ensure data + upload directories exist ─────────────────────────────────
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+if (!fs.existsSync(UPLOAD_TMP_DIR)) fs.mkdirSync(UPLOAD_TMP_DIR, { recursive: true });
 
 // ─── Default data ───────────────────────────────────────────────────────────
 const DEFAULT_BRANCHES = [
@@ -251,16 +255,86 @@ app.get("/api/customers/lookup", (req, res) => {
 // suspenders check. Read endpoints are unrestricted (same pattern as existing
 // /api/:collection routes).
 
-const uploader = multer({ limits: { fileSize: 150 * 1024 * 1024 } });
+// Disk-backed storage so 100+ MB uploads don't sit in Node's heap.
+// Files land in server/uploads/ and are unlinked after processing.
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, UPLOAD_TMP_DIR),
+  filename: (req, file, cb) => {
+    const safe = String(file.originalname || "upload").replace(/[^A-Za-z0-9_.-]+/g, "_");
+    cb(null, `${Date.now()}-${Math.random().toString(36).slice(2,8)}-${safe}`);
+  },
+});
 
-// Wraps multer.single() so Multer errors (file-size, disk, etc.) always come back
-// as JSON with a meaningful message instead of crashing Express into a blank body.
+// Reject anything that isn't a CSV/TXT at the multer level so garbage
+// (exe, pdf, xlsx, etc.) never touches disk.
+function csvFileFilter(req, file, cb) {
+  const name = String(file.originalname || "").toLowerCase();
+  const ok =
+    name.endsWith(".csv") ||
+    name.endsWith(".txt") ||
+    /^text\//.test(file.mimetype) ||
+    file.mimetype === "application/vnd.ms-excel" || // some browsers tag CSV as this
+    file.mimetype === "application/octet-stream";   // conservative fallback
+  if (!ok) {
+    const err = new Error(`Only .csv / .txt files are accepted (got ${file.originalname || file.mimetype}).`);
+    err.code = "UNSUPPORTED_TYPE";
+    return cb(err);
+  }
+  cb(null, true);
+}
+
+const uploader = multer({
+  storage,
+  limits: { fileSize: MAX_UPLOAD_BYTES },
+  fileFilter: csvFileFilter,
+});
+
+// Safely unlink a tmp file; never throws.
+function cleanupTmp(filePath) {
+  if (!filePath) return;
+  fs.unlink(filePath, (err) => {
+    if (err && err.code !== "ENOENT") {
+      console.warn(`[UPLOAD] failed to remove tmp file ${filePath}:`, err.message);
+    }
+  });
+}
+
+// Read an uploaded file and decode it as UTF-8 even when the bank sends
+// CP1252/latin1 (common for Tamil/Windows exports). Detects BOM first.
+function readUploadAsUtf8(filePath) {
+  const buf = fs.readFileSync(filePath);
+  if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) {
+    return buf.slice(3).toString("utf8");
+  }
+  if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xfe) {
+    return iconv.decode(buf.slice(2), "utf-16le");
+  }
+  if (buf.length >= 2 && buf[0] === 0xfe && buf[1] === 0xff) {
+    return iconv.decode(buf.slice(2), "utf-16be");
+  }
+  // Heuristic: if the buffer decoded as UTF-8 contains U+FFFD (replacement
+  // character), it probably isn't UTF-8. Fall back to CP1252 which is a
+  // superset of latin1 and the usual Windows-India default.
+  const asUtf8 = buf.toString("utf8");
+  if (asUtf8.includes("\uFFFD")) {
+    return iconv.decode(buf, "win1252");
+  }
+  return asUtf8;
+}
+
+// Wraps multer.single() so Multer errors (file-size, wrong type, disk, etc.)
+// always come back as JSON with a meaningful message instead of crashing
+// Express into a blank body.
 function uploadField(fieldName) {
   return (req, res, next) => {
     uploader.single(fieldName)(req, res, (err) => {
       if (err) {
         console.error(`[UPLOAD:${fieldName}] multer error:`, err);
-        return res.status(400).json({ error: `Upload error: ${err.message || err.code || "unknown"}` });
+        let msg = err.message || err.code || "unknown upload error";
+        if (err.code === "LIMIT_FILE_SIZE") {
+          msg = `File exceeds the ${Math.round(MAX_UPLOAD_BYTES / 1024 / 1024)} MB upload limit.`;
+        }
+        return res.status(400).json({ error: msg });
       }
       next();
     });
@@ -277,40 +351,149 @@ function requireUploader(req, res, next) {
 
 function todayIso() { return new Date().toISOString().slice(0, 10); }
 
+// Accept strict YYYY-MM-DD; reject "yesterday", "2026-13-40", etc.
+// Empty/missing value is treated as "today" (existing behaviour).
+function validateSnapshotDate(raw) {
+  if (raw == null || raw === "") return { ok: true, value: todayIso() };
+  const s = String(raw).slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return { ok: false, error: `Invalid snapshotDate "${raw}" — expected YYYY-MM-DD.` };
+  const d = new Date(s + "T00:00:00Z");
+  if (isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== s) {
+    return { ok: false, error: `Invalid calendar date "${raw}".` };
+  }
+  return { ok: true, value: s };
+}
+
 // POST /api/od/pool/upload — ingest Compressed Pool Report (pipe-delimited)
 app.post("/api/od/pool/upload", requireUploader, uploadField("file"), (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+  const tmpPath = req.file.path;
   const t0 = Date.now();
   try {
-    const snapshotDate = (req.body.snapshotDate || todayIso()).slice(0, 10);
+    const dateCheck = validateSnapshotDate(req.body.snapshotDate);
+    if (!dateCheck.ok) return res.status(400).json({ error: dateCheck.error });
+    const snapshotDate = dateCheck.value;
     const uploadedBy = req.header("x-od-user") || "unknown";
     console.log(`[POOL UPLOAD] ${req.file.originalname} (${(req.file.size/1024/1024).toFixed(2)}MB) for ${snapshotDate}`);
-    const result = ingestPool(req.file.buffer.toString("utf8"), {
+    const text = readUploadAsUtf8(tmpPath);
+    const result = ingestPool(text, {
       snapshotDate, branchesFile: BRANCHES_FILE, uploadedBy, filename: req.file.originalname,
     });
     console.log(`[POOL UPLOAD] done in ${Date.now()-t0}ms — ${result.rowCount} rows, ${result.newBranches} new branches`);
     res.json({ ok: true, snapshotDate, ...result });
   } catch (err) {
     console.error("[POOL UPLOAD] error:", err);
-    if (!res.headersSent) res.status(500).json({ error: err.message || String(err) });
+    if (!res.headersSent) {
+      const code = err.statusCode || 500;
+      res.status(code).json({ error: err.message || String(err) });
+    }
+  } finally {
+    cleanupTmp(tmpPath);
   }
 });
 
 // POST /api/od/accrued/upload — ingest Interest Accrued Not Due Report (comma)
 app.post("/api/od/accrued/upload", requireUploader, uploadField("file"), (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+  const tmpPath = req.file.path;
   const t0 = Date.now();
   try {
-    const snapshotDate = (req.body.snapshotDate || todayIso()).slice(0, 10);
+    const dateCheck = validateSnapshotDate(req.body.snapshotDate);
+    if (!dateCheck.ok) return res.status(400).json({ error: dateCheck.error });
+    const snapshotDate = dateCheck.value;
     const uploadedBy = req.header("x-od-user") || "unknown";
     console.log(`[ACCRUED UPLOAD] ${req.file.originalname} (${(req.file.size/1024/1024).toFixed(2)}MB) for ${snapshotDate}`);
-    const result = ingestAccrued(req.file.buffer.toString("utf8"), {
+    const text = readUploadAsUtf8(tmpPath);
+    const result = ingestAccrued(text, {
       snapshotDate, branchesFile: BRANCHES_FILE, uploadedBy, filename: req.file.originalname,
     });
     console.log(`[ACCRUED UPLOAD] done in ${Date.now()-t0}ms — ${result.rowCount} rows, col=${result.currentAccruedColumn}`);
     res.json({ ok: true, snapshotDate, ...result });
   } catch (err) {
     console.error("[ACCRUED UPLOAD] error:", err);
+    if (!res.headersSent) {
+      const code = err.statusCode || 500;
+      res.status(code).json({ error: err.message || String(err) });
+    }
+  } finally {
+    cleanupTmp(tmpPath);
+  }
+});
+
+// POST /api/od/overdue/upload — ingest Overdue Report (pipe-delimited)
+app.post("/api/od/overdue/upload", requireUploader, uploadField("file"), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+  const t0 = Date.now();
+  try {
+    const snapshotDate = (req.body.snapshotDate || todayIso()).slice(0, 10);
+    const uploadedBy = req.header("x-od-user") || "unknown";
+    console.log(`[OVERDUE UPLOAD] ${req.file.originalname} (${(req.file.size/1024/1024).toFixed(2)}MB) for ${snapshotDate}`);
+    const result = ingestOverdue(req.file.buffer.toString("utf8"), {
+      snapshotDate, branchesFile: BRANCHES_FILE, uploadedBy, filename: req.file.originalname,
+    });
+    console.log(`[OVERDUE UPLOAD] done in ${Date.now()-t0}ms — ${result.rowCount} rows, ${result.newBranches} new branches`);
+    res.json({ ok: true, snapshotDate, ...result });
+  } catch (err) {
+    console.error("[OVERDUE UPLOAD] error:", err);
+    if (!res.headersSent) res.status(500).json({ error: err.message || String(err) });
+  }
+});
+
+// Helper: pull a yyyy-mm-dd period window from a Finflux filename like
+// "CollectionReport_20260401_20260421.csv" or fall back to user-supplied values.
+function extractPeriodFromFilename(name) {
+  if (!name) return null;
+  const m = String(name).match(/(\d{4})(\d{2})(\d{2}).*?(\d{4})(\d{2})(\d{2})/);
+  if (!m) return null;
+  return {
+    periodStart: `${m[1]}-${m[2]}-${m[3]}`,
+    periodEnd: `${m[4]}-${m[5]}-${m[6]}`,
+  };
+}
+
+// POST /api/od/collections/upload — ingest Collection Report (pipe-delimited)
+// Idempotent per receipt_no so re-uploading the same extract is safe.
+app.post("/api/od/collections/upload", requireUploader, uploadField("file"), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+  const t0 = Date.now();
+  try {
+    const uploadedBy = req.header("x-od-user") || "unknown";
+    console.log(`[COLLECTIONS UPLOAD] ${req.file.originalname} (${(req.file.size/1024/1024).toFixed(2)}MB)`);
+    const result = ingestCollections(req.file.buffer.toString("utf8"), {
+      branchesFile: BRANCHES_FILE, uploadedBy, filename: req.file.originalname,
+    });
+    console.log(`[COLLECTIONS UPLOAD] done in ${Date.now()-t0}ms — ${result.rowsInserted} inserted, ${result.rowsSkipped} duplicates skipped`);
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    console.error("[COLLECTIONS UPLOAD] error:", err);
+    if (!res.headersSent) res.status(500).json({ error: err.message || String(err) });
+  }
+});
+
+// POST /api/od/client-period/upload — ingest Client-wise Collection Report
+// Period window: request body periodStart/periodEnd, else parse from filename.
+app.post("/api/od/client-period/upload", requireUploader, uploadField("file"), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+  const t0 = Date.now();
+  try {
+    const uploadedBy = req.header("x-od-user") || "unknown";
+    let periodStart = (req.body.periodStart || "").slice(0, 10);
+    let periodEnd = (req.body.periodEnd || "").slice(0, 10);
+    if (!periodStart || !periodEnd) {
+      const p = extractPeriodFromFilename(req.file.originalname);
+      if (p) { periodStart = periodStart || p.periodStart; periodEnd = periodEnd || p.periodEnd; }
+    }
+    if (!periodStart || !periodEnd) {
+      return res.status(400).json({ error: "periodStart and periodEnd are required (YYYY-MM-DD) or must be derivable from the filename." });
+    }
+    console.log(`[CLIENT-PERIOD UPLOAD] ${req.file.originalname} (${(req.file.size/1024/1024).toFixed(2)}MB) for ${periodStart}..${periodEnd}`);
+    const result = ingestClientPeriod(req.file.buffer.toString("utf8"), {
+      periodStart, periodEnd, branchesFile: BRANCHES_FILE, uploadedBy, filename: req.file.originalname,
+    });
+    console.log(`[CLIENT-PERIOD UPLOAD] done in ${Date.now()-t0}ms — ${result.rowCount} rows, ${result.principalCols} PO snapshot cols`);
+    res.json({ ok: true, periodStart, periodEnd, ...result });
+  } catch (err) {
+    console.error("[CLIENT-PERIOD UPLOAD] error:", err);
     if (!res.headersSent) res.status(500).json({ error: err.message || String(err) });
   }
 });
@@ -598,6 +781,824 @@ app.get("/api/od/metrics/ptp-conversion", (req, res) => {
   res.json({ totalPTPs: filtered.length, paid, pending, missed, conversionPct });
 });
 
+// ── Analytics endpoints for the new dashboards ─────────────────────────────
+// All read-only; no role gating (same as existing metrics endpoints).
+//
+// Helper: return the latest client-period window (so the UI can default to the
+// most recent upload). Used by dashboards that default to "latest period".
+function latestPeriod() {
+  const row = db.prepare(
+    `SELECT period_start, period_end FROM od_client_period
+      ORDER BY period_end DESC, period_start DESC LIMIT 1`
+  ).get();
+  return row || null;
+}
+
+// GET /api/od/analytics/periods — list periods we have in client_period table
+app.get("/api/od/analytics/periods", (req, res) => {
+  const rows = db.prepare(
+    `SELECT DISTINCT period_start, period_end FROM od_client_period
+      ORDER BY period_end DESC, period_start DESC LIMIT 24`
+  ).all();
+  res.json({ periods: rows });
+});
+
+// GET /api/od/analytics/collection-efficiency?periodStart=&periodEnd=&groupBy=
+//   groupBy ∈ branch | officer | product | funder | center
+//   Returns: { headline: {demand, collected, cePct}, breakdown: [{group, demand, collected, cePct, accounts}] }
+app.get("/api/od/analytics/collection-efficiency", (req, res) => {
+  const groupBy = String(req.query.groupBy || "branch").toLowerCase();
+  const fieldMap = {
+    branch: "branch_name", officer: "officer_name", product: "product_name",
+    funder: "funder_name", center: "center_name",
+  };
+  const col = fieldMap[groupBy] || "branch_name";
+  let { periodStart, periodEnd } = req.query;
+  if (!periodStart || !periodEnd) {
+    const p = latestPeriod();
+    if (p) { periodStart = p.period_start; periodEnd = p.period_end; }
+  }
+  if (!periodStart || !periodEnd) return res.json({ headline: null, breakdown: [], period: null });
+
+  const headline = db.prepare(`
+    SELECT
+      SUM(principal_demand + interest_demand) AS demand,
+      SUM(principal_collected + interest_collected) AS collected,
+      SUM(principal_demand) AS principal_demand,
+      SUM(principal_collected) AS principal_collected,
+      SUM(interest_demand) AS interest_demand,
+      SUM(interest_collected) AS interest_collected,
+      COUNT(*) AS accounts
+    FROM od_client_period
+    WHERE period_start = ? AND period_end = ?
+  `).get(periodStart, periodEnd);
+  const cePct = headline && headline.demand > 0 ? (headline.collected / headline.demand) * 100 : 0;
+
+  const breakdown = db.prepare(`
+    SELECT
+      COALESCE(NULLIF(${col},''),'(unspecified)') AS label,
+      SUM(principal_demand + interest_demand) AS demand,
+      SUM(principal_collected + interest_collected) AS collected,
+      SUM(principal_overdue) AS principal_overdue,
+      SUM(interest_overdue) AS interest_overdue,
+      COUNT(*) AS accounts
+    FROM od_client_period
+    WHERE period_start = ? AND period_end = ?
+    GROUP BY label
+    HAVING demand > 0 OR collected > 0 OR principal_overdue > 0
+    ORDER BY demand DESC
+    LIMIT 500
+  `).all(periodStart, periodEnd).map(r => ({
+    ...r, cePct: r.demand > 0 ? (r.collected / r.demand) * 100 : 0,
+  }));
+
+  res.json({ headline: { ...headline, cePct }, breakdown, period: { periodStart, periodEnd } });
+});
+
+// GET /api/od/analytics/officer-scorecard?periodStart=&periodEnd=
+// Combines Client-Wise summary (demand/collected) with Collections ledger
+// (rupees actually posted, mode mix, cash handled) on officer_code.
+app.get("/api/od/analytics/officer-scorecard", (req, res) => {
+  let { periodStart, periodEnd } = req.query;
+  if (!periodStart || !periodEnd) {
+    const p = latestPeriod();
+    if (p) { periodStart = p.period_start; periodEnd = p.period_end; }
+  }
+
+  // Demand/collected roll-up from client-period (officer owns the account).
+  const owned = periodStart && periodEnd ? db.prepare(`
+    SELECT
+      COALESCE(NULLIF(officer_code,''),'(unknown)') AS officer_code,
+      MAX(officer_name) AS officer_name,
+      MAX(branch_name) AS branch_name,
+      COUNT(*) AS accounts,
+      SUM(principal_demand + interest_demand) AS demand,
+      SUM(principal_collected + interest_collected) AS collected,
+      SUM(principal_overdue + interest_overdue) AS overdue_end,
+      SUM(principal_outstanding_start - principal_outstanding_end) AS principal_reduced
+    FROM od_client_period
+    WHERE period_start = ? AND period_end = ?
+    GROUP BY officer_code
+  `).all(periodStart, periodEnd) : [];
+
+  // Actual receipt activity — credited to the PAYMENT officer (who physically
+  // collected), not necessarily the relationship officer.
+  const collWhere = [];
+  const collArgs = [];
+  if (periodStart) { collWhere.push("payment_date >= ?"); collArgs.push(periodStart); }
+  if (periodEnd)   { collWhere.push("payment_date <= ?"); collArgs.push(periodEnd); }
+  const collWhereSql = collWhere.length ? "WHERE " + collWhere.join(" AND ") : "";
+  const posted = db.prepare(`
+    SELECT
+      COALESCE(NULLIF(payment_officer_code,''),'(unknown)') AS officer_code,
+      MAX(payment_officer_name) AS officer_name,
+      COUNT(*) AS receipts,
+      SUM(amount) AS posted_amount,
+      SUM(CASE WHEN UPPER(mode)='CASH' THEN amount ELSE 0 END) AS cash_amount,
+      SUM(CASE WHEN UPPER(mode) IN ('UPI','BHIM','PHONE PE','GPAY','PAYTM') THEN amount ELSE 0 END) AS upi_amount,
+      SUM(CASE WHEN UPPER(mode) IN ('CHEQUE','CHECK','DD') THEN amount ELSE 0 END) AS cheque_amount,
+      SUM(CASE WHEN mode IS NULL OR mode='' THEN amount ELSE 0 END) AS unknown_mode_amount
+    FROM od_collections
+    ${collWhereSql}
+    GROUP BY officer_code
+  `).all(...collArgs);
+
+  // Merge by officer_code.
+  const byCode = new Map();
+  for (const o of owned) {
+    byCode.set(o.officer_code, { ...o, receipts: 0, posted_amount: 0, cash_amount: 0, upi_amount: 0, cheque_amount: 0, unknown_mode_amount: 0 });
+  }
+  for (const p of posted) {
+    const existing = byCode.get(p.officer_code) || {
+      officer_code: p.officer_code, officer_name: p.officer_name, branch_name: "",
+      accounts: 0, demand: 0, collected: 0, overdue_end: 0, principal_reduced: 0,
+    };
+    existing.receipts = p.receipts;
+    existing.posted_amount = p.posted_amount;
+    existing.cash_amount = p.cash_amount;
+    existing.upi_amount = p.upi_amount;
+    existing.cheque_amount = p.cheque_amount;
+    existing.unknown_mode_amount = p.unknown_mode_amount;
+    if (!existing.officer_name) existing.officer_name = p.officer_name;
+    byCode.set(p.officer_code, existing);
+  }
+  const rows = [...byCode.values()].map(r => ({
+    ...r,
+    cePct: r.demand > 0 ? (r.collected / r.demand) * 100 : null,
+    cashPct: r.posted_amount > 0 ? (r.cash_amount / r.posted_amount) * 100 : null,
+  })).sort((a, b) => (b.demand || 0) - (a.demand || 0));
+
+  res.json({ rows, period: { periodStart, periodEnd } });
+});
+
+// GET /api/od/analytics/daily-collections?from=&to=&branch=
+// Day × branch × mode heatmap data for the Daily Collections dashboard.
+app.get("/api/od/analytics/daily-collections", (req, res) => {
+  const { from, to, branch } = req.query;
+  const where = [];
+  const args = [];
+  if (from)   { where.push("payment_date >= ?"); args.push(String(from)); }
+  if (to)     { where.push("payment_date <= ?"); args.push(String(to)); }
+  if (branch) { where.push("branch_name = ?"); args.push(String(branch)); }
+  const whereSql = where.length ? "WHERE " + where.join(" AND ") : "";
+
+  const byDay = db.prepare(`
+    SELECT payment_date AS day,
+           COUNT(*) AS receipts,
+           SUM(amount) AS total,
+           SUM(CASE WHEN UPPER(mode)='CASH' THEN amount ELSE 0 END) AS cash,
+           SUM(CASE WHEN UPPER(mode) IN ('UPI','BHIM','PHONE PE','GPAY','PAYTM') THEN amount ELSE 0 END) AS upi,
+           SUM(CASE WHEN UPPER(mode) IN ('CHEQUE','CHECK','DD') THEN amount ELSE 0 END) AS cheque,
+           SUM(CASE WHEN mode IS NULL OR mode='' THEN amount ELSE 0 END) AS unknown_mode
+    FROM od_collections
+    ${whereSql}
+    GROUP BY payment_date
+    ORDER BY payment_date ASC
+  `).all(...args);
+
+  const byBranch = db.prepare(`
+    SELECT COALESCE(NULLIF(branch_name,''),'(unspecified)') AS branch,
+           COUNT(*) AS receipts,
+           SUM(amount) AS total,
+           SUM(CASE WHEN UPPER(mode)='CASH' THEN amount ELSE 0 END) AS cash,
+           SUM(CASE WHEN UPPER(mode) IN ('UPI','BHIM','PHONE PE','GPAY','PAYTM') THEN amount ELSE 0 END) AS upi,
+           SUM(CASE WHEN UPPER(mode) IN ('CHEQUE','CHECK','DD') THEN amount ELSE 0 END) AS cheque
+    FROM od_collections
+    ${whereSql}
+    GROUP BY branch
+    ORDER BY total DESC
+    LIMIT 200
+  `).all(...args);
+
+  const modeMix = db.prepare(`
+    SELECT COALESCE(NULLIF(mode,''),'(unspecified)') AS mode,
+           COUNT(*) AS receipts,
+           SUM(amount) AS total
+    FROM od_collections
+    ${whereSql}
+    GROUP BY mode
+    ORDER BY total DESC
+  `).all(...args);
+
+  res.json({ byDay, byBranch, modeMix });
+});
+
+// GET /api/od/analytics/npa-ageing?snapshotDate=  (defaults to latest)
+// Returns: buckets of NPA duration (first NPA → today) and top stranded accounts.
+app.get("/api/od/analytics/npa-ageing", (req, res) => {
+  let snap = String(req.query.snapshotDate || "").slice(0, 10);
+  if (!snap) {
+    const r = db.prepare(`SELECT MAX(snapshot_date) AS d FROM od_overdue`).get();
+    snap = r && r.d ? r.d : "";
+  }
+  if (!snap) return res.json({ snapshotDate: null, buckets: [], top: [] });
+
+  const rows = db.prepare(`
+    SELECT loan_account_no, customer_name, branch_name, officer_name, principal_outstanding,
+           interest_outstanding, first_npa_date, current_npa_date, dpd_classification,
+           installments_due, max_principal_overdue_days
+    FROM od_overdue WHERE snapshot_date = ? AND UPPER(dpd_classification) = 'NPA'
+  `).all(snap);
+
+  const today = new Date(snap);
+  const bucketize = (months) => {
+    if (months == null || !Number.isFinite(months)) return "Unknown";
+    if (months < 3) return "0-3 months";
+    if (months < 6) return "3-6 months";
+    if (months < 12) return "6-12 months";
+    if (months < 24) return "12-24 months";
+    return "24+ months";
+  };
+  const counts = new Map();
+  const stranded = [];
+  for (const r of rows) {
+    let months = null;
+    if (r.first_npa_date) {
+      const d = new Date(r.first_npa_date);
+      if (!isNaN(d)) months = Math.max(0, (today - d) / (1000 * 60 * 60 * 24 * 30.44));
+    }
+    const bucket = bucketize(months);
+    const cur = counts.get(bucket) || { bucket, accounts: 0, principal: 0, interest: 0 };
+    cur.accounts++;
+    cur.principal += r.principal_outstanding || 0;
+    cur.interest += r.interest_outstanding || 0;
+    counts.set(bucket, cur);
+    stranded.push({ ...r, monthsAsNpa: months });
+  }
+  const ORDER = ["0-3 months","3-6 months","6-12 months","12-24 months","24+ months","Unknown"];
+  const buckets = ORDER.map(b => counts.get(b)).filter(Boolean);
+  stranded.sort((a, b) => (b.monthsAsNpa || 0) - (a.monthsAsNpa || 0));
+  res.json({ snapshotDate: snap, buckets, top: stranded.slice(0, 100), totalNpaAccounts: rows.length });
+});
+
+// GET /api/od/analytics/death-cases?snapshotDate=
+app.get("/api/od/analytics/death-cases", (req, res) => {
+  let snap = String(req.query.snapshotDate || "").slice(0, 10);
+  if (!snap) {
+    const r = db.prepare(`SELECT MAX(snapshot_date) AS d FROM od_overdue`).get();
+    snap = r && r.d ? r.d : "";
+  }
+  if (!snap) return res.json({ snapshotDate: null, rows: [] });
+  const rows = db.prepare(`
+    SELECT loan_account_no, customer_name, branch_name, officer_name, guarantor_name,
+           principal_outstanding, interest_outstanding, fee_insurance_outstanding,
+           death_case_remark, death_flagged_date, dpd_classification, product
+    FROM od_overdue
+    WHERE snapshot_date = ? AND (death_case_remark != '' OR death_flagged_date != '')
+    ORDER BY death_flagged_date DESC, principal_outstanding DESC
+  `).all(snap);
+  const totals = rows.reduce((a, r) => ({
+    accounts: a.accounts + 1,
+    principal: a.principal + (r.principal_outstanding || 0),
+    interest: a.interest + (r.interest_outstanding || 0),
+  }), { accounts: 0, principal: 0, interest: 0 });
+  res.json({ snapshotDate: snap, rows, totals });
+});
+
+// GET /api/od/analytics/installments-due?snapshotDate=
+// Bucketed distribution of # Installments Due for action playbook triage.
+app.get("/api/od/analytics/installments-due", (req, res) => {
+  let snap = String(req.query.snapshotDate || "").slice(0, 10);
+  if (!snap) {
+    const r = db.prepare(`SELECT MAX(snapshot_date) AS d FROM od_overdue`).get();
+    snap = r && r.d ? r.d : "";
+  }
+  if (!snap) return res.json({ snapshotDate: null, buckets: [] });
+  const rows = db.prepare(`
+    SELECT installments_due AS n, COUNT(*) AS accounts,
+           SUM(principal_outstanding) AS principal,
+           SUM(interest_outstanding) AS interest
+    FROM od_overdue WHERE snapshot_date = ? GROUP BY installments_due
+  `).all(snap);
+  const buckets = [
+    { bucket: "1 installment", min: 1, max: 1, accounts: 0, principal: 0, interest: 0 },
+    { bucket: "2-3 installments", min: 2, max: 3, accounts: 0, principal: 0, interest: 0 },
+    { bucket: "4-6 installments", min: 4, max: 6, accounts: 0, principal: 0, interest: 0 },
+    { bucket: "7-12 installments", min: 7, max: 12, accounts: 0, principal: 0, interest: 0 },
+    { bucket: "13+ installments", min: 13, max: 999, accounts: 0, principal: 0, interest: 0 },
+  ];
+  for (const r of rows) {
+    const n = r.n || 0;
+    if (n < 1) continue;
+    const b = buckets.find(b => n >= b.min && n <= b.max);
+    if (!b) continue;
+    b.accounts += r.accounts;
+    b.principal += r.principal || 0;
+    b.interest += r.interest || 0;
+  }
+  res.json({ snapshotDate: snap, buckets });
+});
+
+// GET /api/od/analytics/funder-mix?periodStart=&periodEnd=
+app.get("/api/od/analytics/funder-mix", (req, res) => {
+  let { periodStart, periodEnd } = req.query;
+  if (!periodStart || !periodEnd) {
+    const p = latestPeriod();
+    if (p) { periodStart = p.period_start; periodEnd = p.period_end; }
+  }
+  if (!periodStart || !periodEnd) return res.json({ rows: [], period: null });
+  const rows = db.prepare(`
+    SELECT
+      COALESCE(NULLIF(funder_name,''),'(unspecified)') AS funder,
+      COALESCE(NULLIF(fund_source_name,''),'(unspecified)') AS fund_source,
+      COUNT(*) AS accounts,
+      SUM(principal_demand + interest_demand) AS demand,
+      SUM(principal_collected + interest_collected) AS collected,
+      SUM(principal_overdue + interest_overdue) AS overdue_end,
+      SUM(principal_outstanding_end) AS principal_outstanding_end
+    FROM od_client_period
+    WHERE period_start = ? AND period_end = ?
+    GROUP BY funder, fund_source
+    ORDER BY principal_outstanding_end DESC
+  `).all(periodStart, periodEnd).map(r => ({
+    ...r, cePct: r.demand > 0 ? (r.collected / r.demand) * 100 : null,
+  }));
+  res.json({ rows, period: { periodStart, periodEnd } });
+});
+
+// GET /api/od/analytics/recovery-velocity?periodStart=&periodEnd=&limit=50
+// Top accounts by principal reduction over the period (real recovery).
+app.get("/api/od/analytics/recovery-velocity", (req, res) => {
+  let { periodStart, periodEnd } = req.query;
+  const limit = Math.min(parseInt(req.query.limit || "50", 10), 500);
+  if (!periodStart || !periodEnd) {
+    const p = latestPeriod();
+    if (p) { periodStart = p.period_start; periodEnd = p.period_end; }
+  }
+  if (!periodStart || !periodEnd) return res.json({ rows: [], period: null });
+  const rows = db.prepare(`
+    SELECT loan_account_no, customer_name, branch_name, officer_name, product_name,
+           principal_outstanding_start, principal_outstanding_end,
+           (principal_outstanding_start - principal_outstanding_end) AS principal_reduced,
+           principal_collected, interest_collected, total_collection,
+           advance_amount, principal_overdue, interest_overdue
+    FROM od_client_period
+    WHERE period_start = ? AND period_end = ?
+    ORDER BY principal_reduced DESC
+    LIMIT ?
+  `).all(periodStart, periodEnd, limit);
+  res.json({ rows, period: { periodStart, periodEnd } });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  BRANCH PERFORMANCE / PRODUCT PERFORMANCE / DRILLDOWN
+//  Added for the Branch Performance & Product Performance dashboards.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Helper: resolve a "period or latest" pair from query.
+function resolvePeriod(req) {
+  let { periodStart, periodEnd } = req.query;
+  if (!periodStart || !periodEnd) {
+    const p = latestPeriod();
+    if (p) { periodStart = p.period_start; periodEnd = p.period_end; }
+  }
+  return { periodStart: periodStart || null, periodEnd: periodEnd || null };
+}
+
+// Helper: latest overdue snapshot date (used for NPA/DPD counts).
+function latestOverdueSnapshot() {
+  const row = db.prepare(`SELECT MAX(snapshot_date) AS d FROM od_overdue`).get();
+  return row?.d || null;
+}
+
+// GET /api/od/analytics/branch-scorecard?periodStart=&periodEnd=
+//   Per-branch scorecard: book, demand, collected, CE%, receipts, cash%,
+//   NPA accounts, officers on that branch.
+app.get("/api/od/analytics/branch-scorecard", (req, res) => {
+  const { periodStart, periodEnd } = resolvePeriod(req);
+  if (!periodStart || !periodEnd) return res.json({ rows: [], period: null });
+
+  // Demand + collected + book from client-period
+  const core = db.prepare(`
+    SELECT
+      COALESCE(NULLIF(branch_name,''),'(unspecified)') AS branch,
+      COUNT(DISTINCT loan_account_no) AS accounts,
+      COUNT(DISTINCT officer_code) AS officers,
+      SUM(principal_outstanding_end) AS principal_outstanding,
+      SUM(principal_demand + interest_demand) AS demand,
+      SUM(principal_collected + interest_collected) AS collected,
+      SUM(principal_overdue) AS principal_overdue,
+      SUM(interest_overdue) AS interest_overdue,
+      SUM(principal_outstanding_start - principal_outstanding_end) AS principal_reduced
+    FROM od_client_period
+    WHERE period_start = ? AND period_end = ?
+    GROUP BY branch
+  `).all(periodStart, periodEnd);
+
+  // Receipts posted in the same window — payment date based.
+  const receipts = db.prepare(`
+    SELECT
+      COALESCE(NULLIF(branch_name,''),'(unspecified)') AS branch,
+      COUNT(*) AS receipts,
+      SUM(amount) AS posted_amount,
+      SUM(CASE WHEN UPPER(mode)='CASH' THEN amount ELSE 0 END) AS cash_amount,
+      SUM(CASE WHEN UPPER(mode) IN ('UPI','DIGITAL','ONLINE') THEN amount ELSE 0 END) AS upi_amount,
+      SUM(CASE WHEN UPPER(mode) IN ('CHEQUE','DD') THEN amount ELSE 0 END) AS cheque_amount
+    FROM od_collections
+    WHERE payment_date >= ? AND payment_date <= ?
+    GROUP BY branch
+  `).all(periodStart, periodEnd);
+  const rByBranch = new Map(receipts.map(r => [r.branch, r]));
+
+  // NPA counts from the latest overdue snapshot.
+  const snap = latestOverdueSnapshot();
+  const npaRows = snap ? db.prepare(`
+    SELECT
+      COALESCE(NULLIF(branch_name,''),'(unspecified)') AS branch,
+      SUM(CASE WHEN first_npa_date IS NOT NULL AND first_npa_date <> '' THEN 1 ELSE 0 END) AS npa_accounts,
+      SUM(CASE WHEN dpd_classification IN ('DPD-91-180','DPD-180+','SMA2','NPA') THEN 1 ELSE 0 END) AS severe_accounts
+    FROM od_overdue
+    WHERE snapshot_date = ?
+    GROUP BY branch
+  `).all(snap) : [];
+  const nByBranch = new Map(npaRows.map(r => [r.branch, r]));
+
+  const rows = core.map(c => {
+    const r = rByBranch.get(c.branch) || {};
+    const n = nByBranch.get(c.branch) || {};
+    const cePct = c.demand > 0 ? (c.collected / c.demand) * 100 : null;
+    const cashPct = r.posted_amount > 0 ? (r.cash_amount / r.posted_amount) * 100 : null;
+    return {
+      branch: c.branch,
+      accounts: c.accounts || 0,
+      officers: c.officers || 0,
+      principal_outstanding: c.principal_outstanding || 0,
+      demand: c.demand || 0,
+      collected: c.collected || 0,
+      cePct,
+      principal_overdue: c.principal_overdue || 0,
+      interest_overdue: c.interest_overdue || 0,
+      principal_reduced: c.principal_reduced || 0,
+      receipts: r.receipts || 0,
+      posted_amount: r.posted_amount || 0,
+      cash_amount: r.cash_amount || 0,
+      upi_amount: r.upi_amount || 0,
+      cheque_amount: r.cheque_amount || 0,
+      cashPct,
+      npa_accounts: n.npa_accounts || 0,
+      severe_accounts: n.severe_accounts || 0,
+    };
+  }).sort((a, b) => b.principal_outstanding - a.principal_outstanding);
+
+  res.json({ rows, period: { periodStart, periodEnd }, snapshotDate: snap });
+});
+
+// GET /api/od/analytics/product-scorecard?periodStart=&periodEnd=
+//   Per-product roll-up: accounts, book, demand, collected, CE%, NPA.
+app.get("/api/od/analytics/product-scorecard", (req, res) => {
+  const { periodStart, periodEnd } = resolvePeriod(req);
+  if (!periodStart || !periodEnd) return res.json({ rows: [], period: null });
+
+  const core = db.prepare(`
+    SELECT
+      COALESCE(NULLIF(product_name,''),'(unspecified)') AS product,
+      COUNT(DISTINCT loan_account_no) AS accounts,
+      COUNT(DISTINCT branch_name) AS branches,
+      SUM(principal_outstanding_end) AS principal_outstanding,
+      SUM(principal_demand + interest_demand) AS demand,
+      SUM(principal_collected + interest_collected) AS collected,
+      SUM(principal_overdue) AS principal_overdue,
+      SUM(interest_overdue) AS interest_overdue,
+      SUM(principal_outstanding_start - principal_outstanding_end) AS principal_reduced
+    FROM od_client_period
+    WHERE period_start = ? AND period_end = ?
+    GROUP BY product
+  `).all(periodStart, periodEnd);
+
+  // Receipts by product for the period
+  const receipts = db.prepare(`
+    SELECT
+      COALESCE(NULLIF(product,''),'(unspecified)') AS product,
+      COUNT(*) AS receipts,
+      SUM(amount) AS posted_amount,
+      SUM(CASE WHEN UPPER(mode)='CASH' THEN amount ELSE 0 END) AS cash_amount,
+      SUM(CASE WHEN UPPER(mode) IN ('UPI','DIGITAL','ONLINE') THEN amount ELSE 0 END) AS upi_amount,
+      SUM(CASE WHEN UPPER(mode) IN ('CHEQUE','DD') THEN amount ELSE 0 END) AS cheque_amount
+    FROM od_collections
+    WHERE payment_date >= ? AND payment_date <= ?
+    GROUP BY product
+  `).all(periodStart, periodEnd);
+  const rByProduct = new Map(receipts.map(r => [r.product, r]));
+
+  // NPA counts from the latest overdue snapshot.
+  const snap = latestOverdueSnapshot();
+  const npaRows = snap ? db.prepare(`
+    SELECT
+      COALESCE(NULLIF(product,''),'(unspecified)') AS product,
+      SUM(CASE WHEN first_npa_date IS NOT NULL AND first_npa_date <> '' THEN 1 ELSE 0 END) AS npa_accounts,
+      SUM(CASE WHEN dpd_classification IN ('DPD-91-180','DPD-180+','SMA2','NPA') THEN 1 ELSE 0 END) AS severe_accounts
+    FROM od_overdue
+    WHERE snapshot_date = ?
+    GROUP BY product
+  `).all(snap) : [];
+  const nByProduct = new Map(npaRows.map(r => [r.product, r]));
+
+  const rows = core.map(c => {
+    const r = rByProduct.get(c.product) || {};
+    const n = nByProduct.get(c.product) || {};
+    const cePct = c.demand > 0 ? (c.collected / c.demand) * 100 : null;
+    const cashPct = r.posted_amount > 0 ? (r.cash_amount / r.posted_amount) * 100 : null;
+    return {
+      product: c.product,
+      accounts: c.accounts || 0,
+      branches: c.branches || 0,
+      principal_outstanding: c.principal_outstanding || 0,
+      demand: c.demand || 0,
+      collected: c.collected || 0,
+      cePct,
+      principal_overdue: c.principal_overdue || 0,
+      interest_overdue: c.interest_overdue || 0,
+      principal_reduced: c.principal_reduced || 0,
+      receipts: r.receipts || 0,
+      posted_amount: r.posted_amount || 0,
+      cash_amount: r.cash_amount || 0,
+      upi_amount: r.upi_amount || 0,
+      cheque_amount: r.cheque_amount || 0,
+      cashPct,
+      npa_accounts: n.npa_accounts || 0,
+      severe_accounts: n.severe_accounts || 0,
+    };
+  }).sort((a, b) => b.principal_outstanding - a.principal_outstanding);
+
+  res.json({ rows, period: { periodStart, periodEnd }, snapshotDate: snap });
+});
+
+// GET /api/od/analytics/collections-by-product?from=&to=
+//   Slice of receipts by product with mode mix and daily trend.
+app.get("/api/od/analytics/collections-by-product", (req, res) => {
+  const from = req.query.from || null;
+  const to = req.query.to || null;
+  const where = [];
+  const args = [];
+  if (from) { where.push("payment_date >= ?"); args.push(from); }
+  if (to)   { where.push("payment_date <= ?"); args.push(to); }
+  const whereSql = where.length ? "WHERE " + where.join(" AND ") : "";
+
+  const rows = db.prepare(`
+    SELECT
+      COALESCE(NULLIF(product,''),'(unspecified)') AS product,
+      COUNT(*) AS receipts,
+      SUM(amount) AS total,
+      COUNT(DISTINCT loan_account_no) AS accounts,
+      COUNT(DISTINCT branch_name) AS branches,
+      SUM(CASE WHEN UPPER(mode)='CASH' THEN amount ELSE 0 END) AS cash,
+      SUM(CASE WHEN UPPER(mode) IN ('UPI','DIGITAL','ONLINE') THEN amount ELSE 0 END) AS upi,
+      SUM(CASE WHEN UPPER(mode) IN ('CHEQUE','DD') THEN amount ELSE 0 END) AS cheque,
+      AVG(amount) AS avg_receipt
+    FROM od_collections
+    ${whereSql}
+    GROUP BY product
+    ORDER BY total DESC
+  `).all(...args).map(r => ({
+    ...r,
+    cashPct: r.total > 0 ? (r.cash / r.total) * 100 : null,
+    digitalPct: r.total > 0 ? (r.upi / r.total) * 100 : null,
+  }));
+
+  const byDay = db.prepare(`
+    SELECT payment_date AS day,
+      COALESCE(NULLIF(product,''),'(unspecified)') AS product,
+      SUM(amount) AS total,
+      COUNT(*) AS receipts
+    FROM od_collections
+    ${whereSql}
+    GROUP BY day, product
+    ORDER BY day
+  `).all(...args);
+
+  res.json({ rows, byDay, from, to });
+});
+
+// GET /api/od/analytics/branch-product-matrix?periodStart=&periodEnd=
+//   Branch × Product heatmap (CE% per intersection).
+app.get("/api/od/analytics/branch-product-matrix", (req, res) => {
+  const { periodStart, periodEnd } = resolvePeriod(req);
+  if (!periodStart || !periodEnd) return res.json({ branches: [], products: [], matrix: [], period: null });
+
+  const rows = db.prepare(`
+    SELECT
+      COALESCE(NULLIF(branch_name,''),'(unspecified)') AS branch,
+      COALESCE(NULLIF(product_name,''),'(unspecified)') AS product,
+      COUNT(DISTINCT loan_account_no) AS accounts,
+      SUM(principal_outstanding_end) AS principal_outstanding,
+      SUM(principal_demand + interest_demand) AS demand,
+      SUM(principal_collected + interest_collected) AS collected,
+      SUM(principal_overdue + interest_overdue) AS total_overdue
+    FROM od_client_period
+    WHERE period_start = ? AND period_end = ?
+    GROUP BY branch, product
+    HAVING demand > 0 OR collected > 0 OR principal_outstanding > 0
+  `).all(periodStart, periodEnd).map(r => ({
+    ...r,
+    cePct: r.demand > 0 ? (r.collected / r.demand) * 100 : null,
+  }));
+
+  const branchTotals = new Map();
+  const productTotals = new Map();
+  for (const r of rows) {
+    const b = branchTotals.get(r.branch) || { branch: r.branch, principal_outstanding: 0, demand: 0, collected: 0 };
+    b.principal_outstanding += r.principal_outstanding || 0;
+    b.demand += r.demand || 0;
+    b.collected += r.collected || 0;
+    branchTotals.set(r.branch, b);
+
+    const p = productTotals.get(r.product) || { product: r.product, principal_outstanding: 0, demand: 0, collected: 0 };
+    p.principal_outstanding += r.principal_outstanding || 0;
+    p.demand += r.demand || 0;
+    p.collected += r.collected || 0;
+    productTotals.set(r.product, p);
+  }
+  const branches = Array.from(branchTotals.values())
+    .sort((a, b) => b.principal_outstanding - a.principal_outstanding)
+    .map(x => ({ ...x, cePct: x.demand > 0 ? (x.collected / x.demand) * 100 : null }));
+  const products = Array.from(productTotals.values())
+    .sort((a, b) => b.principal_outstanding - a.principal_outstanding)
+    .map(x => ({ ...x, cePct: x.demand > 0 ? (x.collected / x.demand) * 100 : null }));
+
+  res.json({ branches, products, matrix: rows, period: { periodStart, periodEnd } });
+});
+
+// GET /api/od/drilldown?branch=&product=&bucket=&periodStart=&periodEnd=&from=&to=&limit=
+//   Unified drilldown for any slice.
+//   bucket: one of DPD classifications (optional) to filter via od_overdue.
+//   Returns: { summary, customers[], trend[], receipts[], filters }
+app.get("/api/od/drilldown", (req, res) => {
+  const branch = (req.query.branch || "").trim();
+  const product = (req.query.product || "").trim();
+  const bucket = (req.query.bucket || "").trim();
+  const mode = (req.query.mode || "").trim().toUpperCase(); // CASH, UPI, CHEQUE, etc.
+  const npaOnly = req.query.npaOnly === "1" || req.query.npaOnly === "true";
+  const deathOnly = req.query.deathOnly === "1" || req.query.deathOnly === "true";
+  const nonContact = req.query.nonContact === "1" || req.query.nonContact === "true";
+  const minInstallmentsDue = parseInt(req.query.minInstallmentsDue || "0", 10);
+  const minMonthsStranded = parseInt(req.query.minMonthsStranded || "0", 10);
+  const limit = Math.min(parseInt(req.query.limit || "500", 10), 2000);
+  const { periodStart, periodEnd } = resolvePeriod(req);
+  const from = req.query.from || periodStart;
+  const to = req.query.to || periodEnd;
+  const snap = latestOverdueSnapshot();
+
+  // ── Build WHEREs per source table ──
+  const cpWhere = ["period_start = ?", "period_end = ?"];
+  const cpArgs = [periodStart, periodEnd];
+  if (branch)  { cpWhere.push("COALESCE(NULLIF(branch_name,''),'(unspecified)') = ?"); cpArgs.push(branch); }
+  if (product) { cpWhere.push("COALESCE(NULLIF(product_name,''),'(unspecified)') = ?"); cpArgs.push(product); }
+  const cpWhereSql = "WHERE " + cpWhere.join(" AND ");
+
+  const rWhere = [];
+  const rArgs = [];
+  if (from) { rWhere.push("payment_date >= ?"); rArgs.push(from); }
+  if (to)   { rWhere.push("payment_date <= ?"); rArgs.push(to); }
+  if (branch)  { rWhere.push("COALESCE(NULLIF(branch_name,''),'(unspecified)') = ?"); rArgs.push(branch); }
+  if (product) { rWhere.push("COALESCE(NULLIF(product,''),'(unspecified)') = ?"); rArgs.push(product); }
+  if (mode) {
+    if (mode === "UPI") rWhere.push("UPPER(mode) IN ('UPI','DIGITAL','ONLINE')");
+    else if (mode === "CHEQUE") rWhere.push("UPPER(mode) IN ('CHEQUE','DD')");
+    else { rWhere.push("UPPER(mode) = ?"); rArgs.push(mode); }
+  }
+  const rWhereSql = rWhere.length ? "WHERE " + rWhere.join(" AND ") : "";
+
+  // ── od_overdue filter (bucket / NPA / death / installments / months stranded) ──
+  // When any overdue-report filter is given we pull the matching loan list from
+  // od_overdue and intersect with the customer list from client_period.
+  let bucketAccounts = null;
+  const useOvFilter = (bucket || npaOnly || deathOnly || minInstallmentsDue > 0 || minMonthsStranded > 0);
+  if (useOvFilter && snap) {
+    const ovWhere = ["snapshot_date = ?"];
+    const ovArgs = [snap];
+    if (bucket)      { ovWhere.push("dpd_classification = ?"); ovArgs.push(bucket); }
+    if (npaOnly)     { ovWhere.push("first_npa_date IS NOT NULL AND first_npa_date <> ''"); }
+    if (deathOnly)   { ovWhere.push("(death_flagged_date IS NOT NULL AND death_flagged_date <> '' OR COALESCE(death_case_remark,'') <> '')"); }
+    if (minInstallmentsDue > 0) { ovWhere.push("installments_due >= ?"); ovArgs.push(minInstallmentsDue); }
+    if (minMonthsStranded > 0 && snap) {
+      // approx: snap - first_npa_date in months
+      ovWhere.push("first_npa_date IS NOT NULL AND first_npa_date <> '' AND (julianday(?) - julianday(first_npa_date)) / 30.44 >= ?");
+      ovArgs.push(snap, minMonthsStranded);
+    }
+    if (branch)  { ovWhere.push("COALESCE(NULLIF(branch_name,''),'(unspecified)') = ?"); ovArgs.push(branch); }
+    if (product) { ovWhere.push("COALESCE(NULLIF(product,''),'(unspecified)') = ?"); ovArgs.push(product); }
+    const ovRows = db.prepare(
+      `SELECT loan_account_no FROM od_overdue WHERE ${ovWhere.join(" AND ")}`
+    ).all(...ovArgs);
+    bucketAccounts = new Set(ovRows.map(r => r.loan_account_no));
+  }
+
+  // ── Summary from client-period ──
+  let summary = { accounts: 0, principal_outstanding: 0, demand: 0, collected: 0, cePct: null, principal_overdue: 0, interest_overdue: 0, receipts: 0, posted_amount: 0, cash_amount: 0, upi_amount: 0 };
+  if (periodStart && periodEnd) {
+    const s = db.prepare(`
+      SELECT COUNT(*) AS accounts,
+        SUM(principal_outstanding_end) AS principal_outstanding,
+        SUM(principal_demand + interest_demand) AS demand,
+        SUM(principal_collected + interest_collected) AS collected,
+        SUM(principal_overdue) AS principal_overdue,
+        SUM(interest_overdue) AS interest_overdue
+      FROM od_client_period
+      ${cpWhereSql}
+    `).get(...cpArgs);
+    if (s) {
+      summary.accounts = s.accounts || 0;
+      summary.principal_outstanding = s.principal_outstanding || 0;
+      summary.demand = s.demand || 0;
+      summary.collected = s.collected || 0;
+      summary.principal_overdue = s.principal_overdue || 0;
+      summary.interest_overdue = s.interest_overdue || 0;
+      summary.cePct = s.demand > 0 ? (s.collected / s.demand) * 100 : null;
+    }
+  }
+  const r = db.prepare(`
+    SELECT COUNT(*) AS receipts,
+      SUM(amount) AS posted_amount,
+      SUM(CASE WHEN UPPER(mode)='CASH' THEN amount ELSE 0 END) AS cash_amount,
+      SUM(CASE WHEN UPPER(mode) IN ('UPI','DIGITAL','ONLINE') THEN amount ELSE 0 END) AS upi_amount
+    FROM od_collections
+    ${rWhereSql}
+  `).get(...rArgs);
+  if (r) {
+    summary.receipts = r.receipts || 0;
+    summary.posted_amount = r.posted_amount || 0;
+    summary.cash_amount = r.cash_amount || 0;
+    summary.upi_amount = r.upi_amount || 0;
+  }
+
+  // ── Customer list from client-period (richer than od_overdue) ──
+  let customers = [];
+  if (periodStart && periodEnd) {
+    customers = db.prepare(`
+      SELECT
+        loan_account_no, customer_name, customer_number,
+        branch_name, officer_name, officer_code, product_name,
+        principal_outstanding_end AS principal_outstanding,
+        principal_overdue, interest_overdue,
+        (principal_overdue + interest_overdue) AS total_overdue,
+        principal_demand, principal_collected, interest_demand, interest_collected,
+        (principal_demand + interest_demand) AS demand,
+        (principal_collected + interest_collected) AS collected,
+        last_principal_collected_date, last_interest_collected_date,
+        funder_name, account_status, disbursement_date
+      FROM od_client_period
+      ${cpWhereSql}
+      ORDER BY (principal_overdue + interest_overdue) DESC, principal_outstanding_end DESC
+      LIMIT ?
+    `).all(...cpArgs, limit).map(c => ({
+      ...c,
+      cePct: c.demand > 0 ? (c.collected / c.demand) * 100 : null,
+    }));
+    if (bucketAccounts) customers = customers.filter(c => bucketAccounts.has(c.loan_account_no));
+  }
+
+  // Enrich with phone numbers from customers master
+  if (customers.length > 0) {
+    const loans = customers.map(c => c.loan_account_no);
+    const placeholders = loans.map(() => "?").join(",");
+    const phoneRows = db.prepare(
+      `SELECT loan_account_no, mobile_number, residence_phone FROM customers WHERE loan_account_no IN (${placeholders})`
+    ).all(...loans);
+    const pMap = new Map(phoneRows.map(p => [p.loan_account_no, p]));
+    customers = customers.map(c => ({
+      ...c,
+      mobile_number: pMap.get(c.loan_account_no)?.mobile_number || null,
+      residence_phone: pMap.get(c.loan_account_no)?.residence_phone || null,
+    }));
+    // Non-contactable: keep only customers with no phone on file
+    if (nonContact) {
+      customers = customers.filter(c => !c.mobile_number && !c.residence_phone);
+    }
+  }
+
+  // ── Daily trend for receipts in range ──
+  const trend = db.prepare(`
+    SELECT payment_date AS day,
+      SUM(amount) AS total,
+      SUM(CASE WHEN UPPER(mode)='CASH' THEN amount ELSE 0 END) AS cash,
+      SUM(CASE WHEN UPPER(mode) IN ('UPI','DIGITAL','ONLINE') THEN amount ELSE 0 END) AS upi,
+      COUNT(*) AS receipts
+    FROM od_collections
+    ${rWhereSql}
+    GROUP BY day
+    ORDER BY day
+  `).all(...rArgs);
+
+  // ── Recent receipts (latest 100) ──
+  const receipts = db.prepare(`
+    SELECT receipt_no, loan_account_no, customer_name, branch_name, product,
+           amount, mode, payment_date, payment_officer_name, paid_by
+    FROM od_collections
+    ${rWhereSql}
+    ORDER BY payment_date DESC
+    LIMIT 100
+  `).all(...rArgs);
+
+  res.json({
+    summary,
+    customers,
+    trend,
+    receipts,
+    filters: { branch: branch || null, product: product || null, bucket: bucket || null, periodStart, periodEnd, from, to },
+    snapshotDate: snap,
+  });
+});
+
 // GET /api/od/upload-history
 app.get("/api/od/upload-history", (req, res) => {
   const uploads = db.prepare(`SELECT * FROM upload_log ORDER BY uploaded_at DESC LIMIT 50`).all();
@@ -605,13 +1606,154 @@ app.get("/api/od/upload-history", (req, res) => {
     WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM pool_snapshots)`).get();
   const latestAccrued = db.prepare(`SELECT snapshot_date, COUNT(*) AS rows FROM accrued_snapshots
     WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM accrued_snapshots)`).get();
+  const latestOverdue = db.prepare(`SELECT snapshot_date, COUNT(*) AS rows FROM od_overdue
+    WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM od_overdue)`).get();
+  const latestClientPeriod = db.prepare(`SELECT period_start, period_end, COUNT(*) AS rows FROM od_client_period
+    WHERE (period_start, period_end) = (SELECT period_start, period_end FROM od_client_period ORDER BY period_end DESC LIMIT 1)`).get();
   const totalCustomers = db.prepare(`SELECT COUNT(*) AS n FROM customers`).get().n;
-  res.json({ uploads, latestPool, latestAccrued, totalCustomers, retentionDays: RETENTION_DAYS });
+  const totalCollections = db.prepare(`SELECT COUNT(*) AS n, SUM(amount) AS total FROM od_collections`).get();
+  res.json({
+    uploads, latestPool, latestAccrued, latestOverdue, latestClientPeriod,
+    totalCustomers, totalCollections, retentionDays: RETENTION_DAYS,
+  });
 });
 
 // POST /api/od/retention/run — manual retention trigger (admin)
 app.post("/api/od/retention/run", requireUploader, (req, res) => {
   res.json(purgeOldSnapshots(RETENTION_DAYS));
+});
+
+// ── Pool Data (SQLite) helpers & routes ──────────────────────────────────────
+
+const POOL_JOIN = `
+  SELECT
+    c.loan_account_no, c.customer_number, c.customer_name, c.branch,
+    c.center_name, c.group_name, c.mobile_number, c.aadhaar_number,
+    c.product_interest_rate, c.loan_amount, c.officer_name,
+    c.disbursement_date, c.last_payment_date,
+    p.snapshot_date, p.principal_outstanding, p.interest_outstanding,
+    p.principal_overdue, p.interest_overdue, p.current_od,
+    p.overdue_days, p.loan_status, p.account_dpd_classification,
+    p.customer_dpd, p.customer_dpd_classification, p.total_interest_collected
+  FROM customers c
+  LEFT JOIN pool_snapshots p ON c.loan_account_no = p.loan_account_no
+`;
+
+function mapPoolRow(r) {
+  return {
+    loanNumber:             r.loan_account_no || "",
+    customerNumber:         r.customer_number || "",
+    memberName:             r.customer_name || "",
+    officeName:             r.branch || "",
+    centerName:             r.center_name || "",
+    groupName:              r.group_name || "",
+    phone:                  String(r.mobile_number || "").replace(/\D/g, ""),
+    aadhaar:                String(r.aadhaar_number || "").replace(/\D/g, ""),
+    interestRate:           Number(r.product_interest_rate) || 0,
+    loanAmount:             Number(r.loan_amount) || 0,
+    principalOutstanding:   Number(r.principal_outstanding) || 0,
+    interestOutstanding:    Number(r.interest_outstanding) || 0,
+    principalOverdue:       Number(r.principal_overdue) || 0,
+    interestOverdue:        Number(r.interest_overdue) || 0,
+    currentOD:              Number(r.current_od) || 0,
+    overdueDays:            Number(r.overdue_days) || 0,
+    loanStatus:             r.loan_status || "",
+    accountDPD:             r.account_dpd_classification || "",
+    customerDPD:            Number(r.customer_dpd) || 0,
+    customerDPDClass:       r.customer_dpd_classification || "",
+    totalInterestCollected: Number(r.total_interest_collected) || 0,
+    reportDate:             r.snapshot_date || "",
+  };
+}
+
+function calcInterestTillDate(record) {
+  const reportDate = new Date(record.reportDate + "T00:00:00");
+  const today = new Date(); today.setHours(0,0,0,0);
+  const daysSinceReport = Math.max(0, Math.floor((today - reportDate) / 86400000));
+  const dailyRate = record.interestRate / 100 / 365;
+  const additionalInterest = record.principalOverdue * dailyRate * daysSinceReport;
+  const interestOverdueTillDate = Math.round((record.interestOverdue + additionalInterest) * 100) / 100;
+  return {
+    ...record, daysSinceReport,
+    additionalInterest:    Math.round(additionalInterest * 100) / 100,
+    interestOverdueTillDate,
+    arrearAmount:          Math.round((record.principalOverdue + record.interestOverdue) * 100) / 100,
+    arrearAmountTillDate:  Math.round((record.principalOverdue + interestOverdueTillDate) * 100) / 100,
+  };
+}
+
+function poolAggregates(members) {
+  const CLOSED_S   = ["Closed", "Written Off"];
+  const DELINQ_DPD = ["SMA-0", "SMA-1", "SMA-2", "NPA"];
+  const closedCount     = members.filter(r => CLOSED_S.includes(r.loanStatus)).length;
+  const delinquentCount = members.filter(r => !CLOSED_S.includes(r.loanStatus) && DELINQ_DPD.includes(r.customerDPDClass)).length;
+  const activeCount     = members.filter(r => !CLOSED_S.includes(r.loanStatus) && !DELINQ_DPD.includes(r.customerDPDClass)).length;
+  const nonClosed       = members.filter(r => !CLOSED_S.includes(r.loanStatus));
+  const totalPrincipalOverdue = members.reduce((s, r) => s + r.principalOverdue, 0);
+  const totalInterestOverdue  = members.reduce((s, r) => s + r.interestOverdueTillDate, 0);
+  const totalArrear           = members.reduce((s, r) => s + r.arrearAmountTillDate, 0);
+  return {
+    count: members.length, activeCount, delinquentCount, closedCount,
+    nonClosedCount: nonClosed.length,
+    totalPrincipalOverdue: Math.round(totalPrincipalOverdue * 100) / 100,
+    totalInterestOverdue:  Math.round(totalInterestOverdue  * 100) / 100,
+    totalArrear:           Math.round(totalArrear           * 100) / 100,
+    perMemberArrear: nonClosed.length > 0 ? Math.round(totalArrear / nonClosed.length * 100) / 100 : 0,
+  };
+}
+
+// GET /api/pool/lookup?loan=|?phone=|?aadhaar=
+app.get("/api/pool/lookup", (req, res) => {
+  try {
+    const { loan, phone, aadhaar } = req.query;
+    let rows = [];
+    if (loan) {
+      rows = db.prepare(POOL_JOIN + " WHERE c.loan_account_no = ?").all(String(loan).trim());
+    } else if (phone) {
+      const key = String(phone).replace(/\D/g, "");
+      rows = db.prepare(POOL_JOIN + " WHERE REPLACE(REPLACE(c.mobile_number,' ',''),'-','') LIKE ?").all("%" + key + "%");
+    } else if (aadhaar) {
+      const key = String(aadhaar).replace(/\D/g, "");
+      rows = db.prepare(POOL_JOIN + " WHERE REPLACE(c.aadhaar_number,' ','') = ?").all(key);
+    }
+    const results = rows.map(mapPoolRow).map(calcInterestTillDate);
+    const reportDate = results[0]?.reportDate || "";
+    res.json({ found: results.length > 0, count: results.length, reportDate, results });
+  } catch (e) {
+    console.error("[pool/lookup]", e.message);
+    res.json({ found: false, count: 0, results: [] });
+  }
+});
+
+// GET /api/pool/center?name=XXXX
+app.get("/api/pool/center", (req, res) => {
+  try {
+    const { name } = req.query;
+    if (!name) return res.json({ found: false, members: [], count: 0 });
+    const rows = db.prepare(POOL_JOIN + " WHERE LOWER(c.center_name) = LOWER(?)").all(name.trim());
+    const members = rows.map(mapPoolRow).map(calcInterestTillDate);
+    const agg = poolAggregates(members);
+    const reportDate = members[0]?.reportDate || "";
+    res.json({ found: members.length > 0, centerName: name, ...agg, members, reportDate });
+  } catch (e) {
+    console.error("[pool/center]", e.message);
+    res.json({ found: false, members: [], count: 0 });
+  }
+});
+
+// GET /api/pool/search?name=XXXX
+app.get("/api/pool/search", (req, res) => {
+  try {
+    const { name } = req.query;
+    if (!name || name.trim().length < 2) return res.json({ found: false, count: 0, results: [] });
+    const rows = db.prepare(POOL_JOIN + " WHERE UPPER(c.customer_name) LIKE ? LIMIT 50").all("%" + name.trim().toUpperCase() + "%");
+    const results = rows.map(mapPoolRow).map(calcInterestTillDate);
+    const reportDate = results[0]?.reportDate || "";
+    res.json({ found: results.length > 0, count: results.length, reportDate, results });
+  } catch (e) {
+    console.error("[pool/search]", e.message);
+    res.json({ found: false, count: 0, results: [] });
+  }
 });
 
 // ── Generic CRUD (wildcard — must be LAST) ──

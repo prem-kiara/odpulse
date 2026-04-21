@@ -100,6 +100,164 @@ CREATE TABLE IF NOT EXISTS upload_log (
   uploaded_by TEXT,
   uploaded_at TEXT
 );
+
+-- ─── Overdue report ────────────────────────────────────────────────────────
+-- Per-account per-snapshot "bad-book" view with NPA dates, installments due,
+-- death-case flag, and earliest/latest unpaid demand dates.
+CREATE TABLE IF NOT EXISTS od_overdue (
+  snapshot_date TEXT NOT NULL,
+  loan_account_no TEXT NOT NULL,
+  customer_number TEXT,
+  customer_name TEXT,
+  telephone TEXT,
+  guarantor_name TEXT,
+  branch_name TEXT,
+  branch_code TEXT,
+  officer_name TEXT,
+  officer_code TEXT,
+  center_name TEXT,
+  center_code TEXT,
+  group_name TEXT,
+  date_of_birth TEXT,
+  religious_group TEXT,
+  caste TEXT,
+  locale TEXT,
+  state TEXT,
+  product TEXT,
+  loan_amount REAL,
+  loan_cycle INTEGER,
+  last_payment_approp_date TEXT,
+  last_payment_approp_amount REAL,
+  repayment_frequency TEXT,
+  maturity_date TEXT,
+  interest_rate REAL,
+  emi REAL,
+  purpose_category TEXT,
+  purpose TEXT,
+  fund_source TEXT,
+  principal_outstanding REAL,
+  interest_outstanding REAL,
+  fee_insurance_outstanding REAL,
+  disbursement_date TEXT,
+  installments_due INTEGER,
+  earliest_unpaid_demand_date TEXT,
+  latest_unpaid_demand_date TEXT,
+  principal_default REAL,
+  interest_default REAL,
+  min_principal_overdue_days INTEGER,
+  max_principal_overdue_days INTEGER,
+  account_status TEXT,
+  death_case_remark TEXT,
+  death_flagged_date TEXT,
+  moratorium_availed TEXT,
+  is_restructured TEXT,
+  dpd_classification TEXT,
+  npa_date TEXT,
+  first_npa_date TEXT,
+  current_npa_date TEXT,
+  PRIMARY KEY (snapshot_date, loan_account_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_overdue_loan ON od_overdue(loan_account_no);
+CREATE INDEX IF NOT EXISTS idx_overdue_date ON od_overdue(snapshot_date);
+CREATE INDEX IF NOT EXISTS idx_overdue_branch ON od_overdue(branch_name);
+CREATE INDEX IF NOT EXISTS idx_overdue_officer ON od_overdue(officer_code);
+CREATE INDEX IF NOT EXISTS idx_overdue_dpd ON od_overdue(dpd_classification);
+CREATE INDEX IF NOT EXISTS idx_overdue_first_npa ON od_overdue(first_npa_date);
+
+-- ─── Collections ledger ────────────────────────────────────────────────────
+-- Immutable ledger, one row per receipt. INSERT OR IGNORE on receipt_no makes
+-- re-uploading the same extract idempotent.
+CREATE TABLE IF NOT EXISTS od_collections (
+  receipt_no TEXT PRIMARY KEY,
+  loan_account_no TEXT,
+  customer_number TEXT,
+  customer_name TEXT,
+  branch_name TEXT,
+  branch_code TEXT,
+  center_name TEXT,
+  center_code TEXT,
+  meeting_time TEXT,
+  officer_name TEXT,
+  officer_code TEXT,
+  payment_officer_name TEXT,
+  payment_officer_code TEXT,
+  username TEXT,
+  amount REAL,
+  paid_by TEXT,
+  payment_date TEXT,
+  payment_status TEXT,
+  disbursement_date TEXT,
+  mode TEXT,
+  app_local_posting_time TEXT,
+  posting_time TEXT,
+  product TEXT,
+  payment_app TEXT,
+  narration TEXT,
+  upi_txn_number TEXT,
+  upi_rrn TEXT,
+  uploaded_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_coll_payment_date ON od_collections(payment_date);
+CREATE INDEX IF NOT EXISTS idx_coll_branch ON od_collections(branch_name);
+CREATE INDEX IF NOT EXISTS idx_coll_officer ON od_collections(officer_code);
+CREATE INDEX IF NOT EXISTS idx_coll_payment_officer ON od_collections(payment_officer_code);
+CREATE INDEX IF NOT EXISTS idx_coll_mode ON od_collections(mode);
+CREATE INDEX IF NOT EXISTS idx_coll_account ON od_collections(loan_account_no);
+
+-- ─── Client-wise period summary ────────────────────────────────────────────
+-- Demand vs Collected per account for a period window (period_start..period_end).
+-- Period is taken from the file / caller; dates captured as text YYYY-MM-DD.
+CREATE TABLE IF NOT EXISTS od_client_period (
+  period_start TEXT NOT NULL,
+  period_end TEXT NOT NULL,
+  loan_account_no TEXT NOT NULL,
+  customer_number TEXT,
+  customer_name TEXT,
+  branch_name TEXT,
+  branch_code TEXT,
+  center_name TEXT,
+  center_code TEXT,
+  officer_name TEXT,
+  officer_code TEXT,
+  product_name TEXT,
+  account_status TEXT,
+  disbursement_date TEXT,
+  closing_date TEXT,
+  installments_remaining INTEGER,
+  principal_outstanding_start REAL,
+  principal_outstanding_mid REAL,
+  principal_outstanding_end REAL,
+  interest_outstanding REAL,
+  principal_demand REAL,
+  principal_prepayment REAL,
+  interest_prepayment REAL,
+  last_principal_demand_date TEXT,
+  principal_collected REAL,
+  last_principal_collected_date TEXT,
+  interest_demand REAL,
+  last_interest_demand_date TEXT,
+  interest_collected REAL,
+  differential_interest REAL,
+  last_interest_collected_date TEXT,
+  other_charges REAL,
+  moratorium_interest_collection REAL,
+  total_collection REAL,
+  advance_amount REAL,
+  principal_overdue REAL,
+  interest_overdue REAL,
+  funder_name TEXT,
+  fund_source_name TEXT,
+  PRIMARY KEY (period_start, period_end, loan_account_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_cp_branch ON od_client_period(branch_name);
+CREATE INDEX IF NOT EXISTS idx_cp_officer ON od_client_period(officer_code);
+CREATE INDEX IF NOT EXISTS idx_cp_funder ON od_client_period(funder_name);
+CREATE INDEX IF NOT EXISTS idx_cp_product ON od_client_period(product_name);
+CREATE INDEX IF NOT EXISTS idx_cp_period_end ON od_client_period(period_end);
+CREATE INDEX IF NOT EXISTS idx_cp_loan ON od_client_period(loan_account_no);
 `);
 
 module.exports = db;

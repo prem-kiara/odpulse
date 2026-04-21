@@ -13,6 +13,8 @@ import {
 import {
   Upload, CheckCircle, AlertTriangle, Clock, FileText, Database, RefreshCw,
   Search, Download, Users, TrendingUp, Phone, PhoneOff, Target, DollarSign,
+  Activity, Calendar, Skull, Wallet, Layers, Gauge, X, ChevronRight, Package,
+  Building2, Grid3x3,
 } from "lucide-react";
 
 const API_BASE = "/api";
@@ -50,6 +52,51 @@ const formatDateDMY = (isoDate) => {
   const [y, m, d] = String(isoDate).slice(0, 10).split("-");
   if (!y || !m || !d) return isoDate;
   return `${d}-${m}-${y}`;
+};
+
+const formatPct = (n, digits = 1) => {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return "—";
+  return `${v.toFixed(digits)}%`;
+};
+
+// Tailwind colour ramp for CE% (red → green)
+const ceColor = (pct) => {
+  if (pct == null || !Number.isFinite(pct)) return "text-gray-500";
+  if (pct >= 95) return "text-emerald-700";
+  if (pct >= 85) return "text-green-700";
+  if (pct >= 70) return "text-amber-700";
+  if (pct >= 50) return "text-orange-700";
+  return "text-red-700";
+};
+
+const downloadCSV = (rows, filename) => {
+  if (!rows?.length) return;
+  const keys = Object.keys(rows[0]);
+  const esc = (v) => {
+    if (v == null) return "";
+    const s = String(v);
+    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const csv = [keys.join(","), ...rows.map(r => keys.map(k => esc(r[k])).join(","))].join("\n");
+  // Prepend UTF-8 BOM so Excel renders Tamil / non-ASCII characters correctly.
+  const blob = new Blob(["\uFEFF", csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = filename; a.click();
+  URL.revokeObjectURL(url);
+};
+
+// Hook: fetch periods list once and expose latest
+const useLatestPeriod = () => {
+  const [periods, setPeriods] = useState([]);
+  useEffect(() => {
+    fetch(`${API_BASE}/od/analytics/periods`).then(r => r.json())
+      .then(j => setPeriods(Array.isArray(j?.periods) ? j.periods : []))
+      .catch(() => setPeriods([]));
+  }, []);
+  const latest = periods[0] || null;
+  return { periods, latest };
 };
 
 // ─── CustomerInfoPanel ─────────────────────────────────────────────────────
@@ -212,14 +259,57 @@ export function CustomerInfoPanel({ loanAccountNo, customerId, compact = false, 
 }
 
 // ─── DataUploadPage ────────────────────────────────────────────────────────
+// Five report types — each an independent tile so any upload can be re-run
+// separately. The server handles idempotency where appropriate:
+//   pool/accrued/overdue → REPLACE by (snapshot_date, loan_account_no)
+//   collections          → IGNORE by receipt_no (ledger is append-only)
+//   client-period        → REPLACE by (period_start, period_end, loan_account_no)
+const REPORT_KINDS = [
+  {
+    key: "pool", slug: "pool",
+    title: "Compressed Pool Report",
+    hint: "Pipe-delimited. Customer master + pool snapshot (Principal Outstanding, Interest OverDue, DPD, etc.).",
+    accent: "teal", needsSnapshot: true,
+  },
+  {
+    key: "accrued", slug: "accrued",
+    title: "Interest Accrued Not Due Report",
+    hint: "Pipe or comma delimited (auto-detected). Per-BOD accrued interest — latest Accrued Interest column is auto-picked as \"current\".",
+    accent: "indigo", needsSnapshot: true,
+  },
+  {
+    key: "overdue", slug: "overdue",
+    title: "Overdue Report",
+    hint: "Pipe-delimited. Only delinquent accounts — earliest/latest unpaid demand, installments due, NPA dates, death-case flag.",
+    accent: "red", needsSnapshot: true,
+  },
+  {
+    key: "collections", slug: "collections",
+    title: "Collection Report",
+    hint: "Pipe-delimited. Receipts ledger — one row per payment. Idempotent on receipt number, safe to re-upload.",
+    accent: "emerald", needsSnapshot: false,
+  },
+  {
+    key: "client-period", slug: "client-period",
+    title: "Client-Wise Collection Report",
+    hint: "Pipe-delimited. Per-account demand vs collected for a period. Period is parsed from the filename or entered below.",
+    accent: "amber", needsSnapshot: false, needsPeriod: true,
+  },
+];
+
 export function DataUploadPage({ user }) {
-  const [poolFile, setPoolFile] = useState(null);
-  const [accruedFile, setAccruedFile] = useState(null);
-  const [poolDate, setPoolDate] = useState(new Date().toISOString().slice(0, 10));
-  const [accruedDate, setAccruedDate] = useState(new Date().toISOString().slice(0, 10));
-  const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState(null); // {kind: "success"|"error", text}
-  const [history, setHistory] = useState({ uploads: [], latestPool: null, latestAccrued: null, totalCustomers: 0, retentionDays: 90 });
+  const [files, setFiles] = useState({});
+  const [dates, setDates] = useState(() => {
+    const today = new Date().toISOString().slice(0, 10);
+    return { pool: today, accrued: today, overdue: today };
+  });
+  const [period, setPeriod] = useState({ start: "", end: "" });
+  const [busyKind, setBusyKind] = useState("");
+  const [msg, setMsg] = useState(null);
+  const [history, setHistory] = useState({
+    uploads: [], latestPool: null, latestAccrued: null, latestOverdue: null, latestClientPeriod: null,
+    totalCustomers: 0, totalCollections: { n: 0, total: 0 }, retentionDays: 90,
+  });
 
   const loadHistory = useCallback(() => {
     fetch(`${API_BASE}/od/upload-history`)
@@ -231,46 +321,57 @@ export function DataUploadPage({ user }) {
   useEffect(() => { loadHistory(); }, [loadHistory]);
 
   const upload = async (kind) => {
-    const f = kind === "pool" ? poolFile : accruedFile;
-    const d = kind === "pool" ? poolDate : accruedDate;
+    const f = files[kind];
     if (!f) { setMsg({ kind: "error", text: `Choose a ${kind} file first.` }); return; }
-    setBusy(true);
+    setBusyKind(kind);
     setMsg(null);
     try {
       const fd = new FormData();
       fd.append("file", f);
-      fd.append("snapshotDate", d);
-      const res = await fetch(`${API_BASE}/od/${kind}/upload`, {
-        method: "POST",
-        headers: { "x-od-role": user.role, "x-od-user": user.username || user.id },
-        body: fd,
-      });
-
-      // Read body as text first so we can surface non-JSON errors (HTML error pages,
-      // proxy timeouts that return empty bodies, etc.) instead of a useless
-      // "Unexpected end of JSON input".
+      if (["pool", "accrued", "overdue"].includes(kind)) fd.append("snapshotDate", dates[kind] || "");
+      if (kind === "client-period") {
+        if (period.start) fd.append("periodStart", period.start);
+        if (period.end) fd.append("periodEnd", period.end);
+      }
+      let res;
+      try {
+        res = await fetch(`${API_BASE}/od/${kind}/upload`, {
+          method: "POST",
+          headers: { "x-od-role": user.role, "x-od-user": user.username || user.id },
+          body: fd,
+        });
+      } catch (networkErr) {
+        // fetch() itself rejected — usually means the dev proxy / backend is unreachable.
+        throw new Error("Backend API unreachable — is the server running on port 3001? (Run `npm run dev:server` or `npm run dev:all` from the project root.)");
+      }
       const raw = await res.text();
       let json = null;
-      if (raw) {
-        try { json = JSON.parse(raw); } catch { /* non-JSON */ }
-      }
+      if (raw) { try { json = JSON.parse(raw); } catch {} }
       if (!res.ok) {
-        const msg = (json && json.error) || raw || `HTTP ${res.status}`;
-        throw new Error(msg.slice(0, 500));
+        // Vite proxy surfaces ECONNREFUSED as a 500 with an HTML body and no JSON error.
+        const looksLikeProxyError = !json && (res.status === 500 || res.status === 502 || res.status === 503 || res.status === 504) && (!raw || /<html|ECONNREFUSED|proxy error/i.test(raw));
+        if (looksLikeProxyError) {
+          throw new Error("Backend API unreachable — is the server running on port 3001? (Run `npm run dev:server` or `npm run dev:all` from the project root.)");
+        }
+        const errMsg = (json && json.error) || raw || `HTTP ${res.status}`;
+        throw new Error(errMsg.slice(0, 500));
       }
-      if (!json) {
-        throw new Error("Server returned an empty response — the upload may have timed out. Check the server console.");
+      if (!json) throw new Error("Server returned an empty response — the upload may have timed out. Check the server console.");
+
+      let summary = `${kind} uploaded: `;
+      if (kind === "collections") {
+        summary += `${json.rowsInserted} new receipts, ${json.rowsSkipped} duplicates skipped`;
+      } else {
+        summary += `${json.rowCount} rows`;
       }
-      setMsg({
-        kind: "success",
-        text: `${kind === "pool" ? "Pool" : "Accrued"} uploaded: ${json.rowCount} rows${json.newBranches ? `, ${json.newBranches} new branch(es)` : ""}.`,
-      });
-      if (kind === "pool") setPoolFile(null); else setAccruedFile(null);
+      if (json.newBranches) summary += `, ${json.newBranches} new branch(es)`;
+      setMsg({ kind: "success", text: summary });
+      setFiles(prev => ({ ...prev, [kind]: null }));
       loadHistory();
     } catch (err) {
       setMsg({ kind: "error", text: err.message });
     } finally {
-      setBusy(false);
+      setBusyKind("");
     }
   };
 
@@ -283,30 +384,57 @@ export function DataUploadPage({ user }) {
     );
   }
 
+  const accentCls = (accent) => ({
+    teal:    { icon: "text-teal-600", ring: "focus:ring-teal-500", fileBg: "file:bg-teal-50 file:text-teal-700", btn: "bg-teal-600 hover:bg-teal-700" },
+    indigo:  { icon: "text-indigo-600", ring: "focus:ring-indigo-500", fileBg: "file:bg-indigo-50 file:text-indigo-700", btn: "bg-indigo-600 hover:bg-indigo-700" },
+    red:     { icon: "text-red-600", ring: "focus:ring-red-500", fileBg: "file:bg-red-50 file:text-red-700", btn: "bg-red-600 hover:bg-red-700" },
+    emerald: { icon: "text-emerald-600", ring: "focus:ring-emerald-500", fileBg: "file:bg-emerald-50 file:text-emerald-700", btn: "bg-emerald-600 hover:bg-emerald-700" },
+    amber:   { icon: "text-amber-600", ring: "focus:ring-amber-500", fileBg: "file:bg-amber-50 file:text-amber-700", btn: "bg-amber-600 hover:bg-amber-700" },
+  }[accent] || { icon: "text-gray-600", ring: "focus:ring-gray-500", fileBg: "file:bg-gray-50 file:text-gray-700", btn: "bg-gray-600 hover:bg-gray-700" });
+
+  const totalCollectionsRupees = history.totalCollections?.total || 0;
+
   return (
-    <div className="max-w-5xl mx-auto">
+    <div className="max-w-6xl mx-auto">
       <div className="mb-6">
-        <h2 className="text-2xl font-bold text-gray-900">Daily OD Data Upload</h2>
+        <h2 className="text-2xl font-bold text-gray-900">OD Data Upload</h2>
         <p className="text-sm text-gray-500 mt-1">
-          Upload the two daily reports. Data is de-duplicated per snapshot date. Retention: {history.retentionDays || 90} days.
+          Upload any of the five Finflux extracts. Snapshot-based reports are de-duplicated per date; the Collection ledger is idempotent per receipt. Retention: {history.retentionDays || 90} days.
         </p>
       </div>
 
       {/* Status tiles */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-5">
-        <div className="bg-white border rounded-xl p-4">
-          <div className="text-xs uppercase text-gray-500">Customers on Record</div>
-          <div className="text-2xl font-bold text-gray-900 mt-1">{(history.totalCustomers || 0).toLocaleString()}</div>
+      <div className="grid grid-cols-2 md:grid-cols-6 gap-3 mb-5">
+        <div className="bg-white border rounded-xl p-3">
+          <div className="text-[10px] uppercase text-gray-500">Customers</div>
+          <div className="text-xl font-bold text-gray-900 mt-0.5">{(history.totalCustomers || 0).toLocaleString()}</div>
         </div>
-        <div className="bg-white border rounded-xl p-4">
-          <div className="text-xs uppercase text-gray-500">Latest Pool Snapshot</div>
-          <div className="text-lg font-bold text-teal-700 mt-1">{history.latestPool?.snapshot_date ? formatDateDMY(history.latestPool.snapshot_date) : "—"}</div>
-          <div className="text-[11px] text-gray-500 mt-0.5">{(history.latestPool?.rows || 0).toLocaleString()} rows</div>
+        <div className="bg-white border rounded-xl p-3">
+          <div className="text-[10px] uppercase text-gray-500">Latest Pool</div>
+          <div className="text-sm font-bold text-teal-700 mt-0.5">{history.latestPool?.snapshot_date ? formatDateDMY(history.latestPool.snapshot_date) : "—"}</div>
+          <div className="text-[10px] text-gray-500">{(history.latestPool?.rows || 0).toLocaleString()} rows</div>
         </div>
-        <div className="bg-white border rounded-xl p-4">
-          <div className="text-xs uppercase text-gray-500">Latest Accrued Snapshot</div>
-          <div className="text-lg font-bold text-indigo-700 mt-1">{history.latestAccrued?.snapshot_date ? formatDateDMY(history.latestAccrued.snapshot_date) : "—"}</div>
-          <div className="text-[11px] text-gray-500 mt-0.5">{(history.latestAccrued?.rows || 0).toLocaleString()} rows</div>
+        <div className="bg-white border rounded-xl p-3">
+          <div className="text-[10px] uppercase text-gray-500">Latest Accrued</div>
+          <div className="text-sm font-bold text-indigo-700 mt-0.5">{history.latestAccrued?.snapshot_date ? formatDateDMY(history.latestAccrued.snapshot_date) : "—"}</div>
+          <div className="text-[10px] text-gray-500">{(history.latestAccrued?.rows || 0).toLocaleString()} rows</div>
+        </div>
+        <div className="bg-white border rounded-xl p-3">
+          <div className="text-[10px] uppercase text-gray-500">Latest Overdue</div>
+          <div className="text-sm font-bold text-red-700 mt-0.5">{history.latestOverdue?.snapshot_date ? formatDateDMY(history.latestOverdue.snapshot_date) : "—"}</div>
+          <div className="text-[10px] text-gray-500">{(history.latestOverdue?.rows || 0).toLocaleString()} rows</div>
+        </div>
+        <div className="bg-white border rounded-xl p-3">
+          <div className="text-[10px] uppercase text-gray-500">Collections Ledger</div>
+          <div className="text-sm font-bold text-emerald-700 mt-0.5">{(history.totalCollections?.n || 0).toLocaleString()} receipts</div>
+          <div className="text-[10px] text-gray-500">{formatLakhs(totalCollectionsRupees)}</div>
+        </div>
+        <div className="bg-white border rounded-xl p-3">
+          <div className="text-[10px] uppercase text-gray-500">Latest Period</div>
+          <div className="text-sm font-bold text-amber-700 mt-0.5">
+            {history.latestClientPeriod?.period_end ? formatDateDMY(history.latestClientPeriod.period_end) : "—"}
+          </div>
+          <div className="text-[10px] text-gray-500">{(history.latestClientPeriod?.rows || 0).toLocaleString()} accts</div>
         </div>
       </div>
 
@@ -317,48 +445,56 @@ export function DataUploadPage({ user }) {
         </div>
       )}
 
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8">
-        {/* Pool upload */}
-        <div className="bg-white rounded-xl border p-5">
-          <div className="flex items-center gap-2 mb-2">
-            <FileText className="text-teal-600" size={18} />
-            <h3 className="font-semibold text-gray-900">Compressed Pool Report</h3>
-          </div>
-          <p className="text-xs text-gray-500 mb-4">Pipe-delimited. Customer master + pool snapshot (Principal Outstanding, Interest OverDue, DPD, etc.).</p>
-          <label className="block text-xs font-medium text-gray-600 mb-1">Snapshot Date</label>
-          <input type="date" value={poolDate} onChange={e => setPoolDate(e.target.value)}
-            className="w-full mb-3 px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500 text-sm" />
-          <label className="block text-xs font-medium text-gray-600 mb-1">CSV File</label>
-          <input type="file" accept=".csv,.txt" onChange={e => setPoolFile(e.target.files?.[0] || null)}
-            className="w-full text-sm mb-3 file:mr-3 file:py-2 file:px-3 file:rounded-lg file:border-0 file:bg-teal-50 file:text-teal-700 file:font-medium file:cursor-pointer" />
-          {poolFile && <div className="text-xs text-gray-500 mb-3">Selected: {poolFile.name} ({(poolFile.size / 1024 / 1024).toFixed(2)} MB)</div>}
-          <button onClick={() => upload("pool")} disabled={busy || !poolFile}
-            className="w-full py-2.5 bg-teal-600 text-white rounded-lg font-semibold text-sm hover:bg-teal-700 disabled:bg-gray-300 flex items-center justify-center gap-2">
-            {busy ? <RefreshCw size={14} className="animate-spin" /> : <Upload size={14} />}
-            Upload Pool Report
-          </button>
-        </div>
-
-        {/* Accrued upload */}
-        <div className="bg-white rounded-xl border p-5">
-          <div className="flex items-center gap-2 mb-2">
-            <FileText className="text-indigo-600" size={18} />
-            <h3 className="font-semibold text-gray-900">Interest Accrued Not Due Report</h3>
-          </div>
-          <p className="text-xs text-gray-500 mb-4">Pipe or comma delimited (auto-detected). Per-BOD accrued interest values. Latest Accrued Interest column is auto-picked as "current".</p>
-          <label className="block text-xs font-medium text-gray-600 mb-1">Snapshot Date</label>
-          <input type="date" value={accruedDate} onChange={e => setAccruedDate(e.target.value)}
-            className="w-full mb-3 px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500 text-sm" />
-          <label className="block text-xs font-medium text-gray-600 mb-1">CSV File</label>
-          <input type="file" accept=".csv,.txt" onChange={e => setAccruedFile(e.target.files?.[0] || null)}
-            className="w-full text-sm mb-3 file:mr-3 file:py-2 file:px-3 file:rounded-lg file:border-0 file:bg-indigo-50 file:text-indigo-700 file:font-medium file:cursor-pointer" />
-          {accruedFile && <div className="text-xs text-gray-500 mb-3">Selected: {accruedFile.name} ({(accruedFile.size / 1024 / 1024).toFixed(2)} MB)</div>}
-          <button onClick={() => upload("accrued")} disabled={busy || !accruedFile}
-            className="w-full py-2.5 bg-indigo-600 text-white rounded-lg font-semibold text-sm hover:bg-indigo-700 disabled:bg-gray-300 flex items-center justify-center gap-2">
-            {busy ? <RefreshCw size={14} className="animate-spin" /> : <Upload size={14} />}
-            Upload Accrued Report
-          </button>
-        </div>
+      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 mb-8">
+        {REPORT_KINDS.map((k) => {
+          const cls = accentCls(k.accent);
+          const f = files[k.key];
+          const busy = busyKind === k.key;
+          return (
+            <div key={k.key} className="bg-white rounded-xl border p-5">
+              <div className="flex items-center gap-2 mb-2">
+                <FileText className={cls.icon} size={18} />
+                <h3 className="font-semibold text-gray-900">{k.title}</h3>
+              </div>
+              <p className="text-xs text-gray-500 mb-4">{k.hint}</p>
+              {k.needsSnapshot && (
+                <>
+                  <label className="block text-xs font-medium text-gray-600 mb-1">Snapshot Date</label>
+                  <input type="date" value={dates[k.key] || ""}
+                    onChange={e => setDates(prev => ({ ...prev, [k.key]: e.target.value }))}
+                    className={`w-full mb-3 px-3 py-2 border rounded-lg focus:ring-2 text-sm ${cls.ring}`} />
+                </>
+              )}
+              {k.needsPeriod && (
+                <div className="grid grid-cols-2 gap-2 mb-3">
+                  <div>
+                    <label className="block text-xs font-medium text-gray-600 mb-1">Period Start</label>
+                    <input type="date" value={period.start}
+                      onChange={e => setPeriod(prev => ({ ...prev, start: e.target.value }))}
+                      className={`w-full px-2 py-2 border rounded-lg focus:ring-2 text-sm ${cls.ring}`} />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-gray-600 mb-1">Period End</label>
+                    <input type="date" value={period.end}
+                      onChange={e => setPeriod(prev => ({ ...prev, end: e.target.value }))}
+                      className={`w-full px-2 py-2 border rounded-lg focus:ring-2 text-sm ${cls.ring}`} />
+                  </div>
+                  <div className="col-span-2 text-[10px] text-gray-500 -mt-1">Leave blank to auto-detect from filename.</div>
+                </div>
+              )}
+              <label className="block text-xs font-medium text-gray-600 mb-1">CSV File</label>
+              <input type="file" accept=".csv,.txt"
+                onChange={e => setFiles(prev => ({ ...prev, [k.key]: e.target.files?.[0] || null }))}
+                className={`w-full text-sm mb-3 file:mr-3 file:py-2 file:px-3 file:rounded-lg file:border-0 ${cls.fileBg} file:font-medium file:cursor-pointer`} />
+              {f && <div className="text-xs text-gray-500 mb-3 truncate">Selected: {f.name} ({(f.size / 1024 / 1024).toFixed(2)} MB)</div>}
+              <button onClick={() => upload(k.key)} disabled={busy || !f}
+                className={`w-full py-2.5 text-white rounded-lg font-semibold text-sm disabled:bg-gray-300 flex items-center justify-center gap-2 ${cls.btn}`}>
+                {busy ? <RefreshCw size={14} className="animate-spin" /> : <Upload size={14} />}
+                Upload
+              </button>
+            </div>
+          );
+        })}
       </div>
 
       {/* Upload history */}
@@ -499,35 +635,61 @@ export function CollectionDashboard({ user, entries, branches }) {
     return { count: rows.length, overdueAmount };
   }, [nonContact]);
 
-  const downloadCSV = (rows, filename) => {
-    if (!rows?.length) return;
-    const keys = Object.keys(rows[0]);
-    const esc = (v) => {
-      if (v == null) return "";
-      const s = String(v);
-      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-    };
-    const csv = [keys.join(","), ...rows.map(r => keys.map(k => esc(r[k])).join(","))].join("\n");
-    const blob = new Blob([csv], { type: "text/csv" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url; a.download = filename; a.click();
-    URL.revokeObjectURL(url);
-  };
+  const [tab, setTab] = useState("portfolio");
+  // Shared drilldown drawer state — any descendant view can open it.
+  const [drill, setDrill] = useState(null);
+  const openDrill = useCallback((slice) => setDrill(slice), []);
+  const closeDrill = useCallback(() => setDrill(null), []);
+
+  const tabs = [
+    { key: "portfolio",  label: "Portfolio Health",     icon: <Gauge size={14} /> },
+    { key: "branches",   label: "Branch Performance",   icon: <Building2 size={14} /> },
+    { key: "products",   label: "Product Performance",  icon: <Package size={14} /> },
+    { key: "efficiency", label: "Collection Efficiency", icon: <Target size={14} /> },
+    { key: "scorecard",  label: "Officer Scorecard",    icon: <Activity size={14} /> },
+    { key: "daily",      label: "Daily Collections",    icon: <Calendar size={14} /> },
+    { key: "risk",       label: "Risk Triage",          icon: <AlertTriangle size={14} /> },
+  ];
 
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div>
           <h2 className="text-2xl font-bold text-gray-900">OD Insights</h2>
-          <p className="text-sm text-gray-500">Live from daily Pool + Accrued snapshots. Snapshot date: {dpd?.snapshotDate ? formatDateDMY(dpd.snapshotDate) : "—"}</p>
+          <p className="text-sm text-gray-500">
+            {tab === "portfolio"  && <>Live from daily Pool + Accrued snapshots. Snapshot date: {dpd?.snapshotDate ? formatDateDMY(dpd.snapshotDate) : "—"}</>}
+            {tab === "branches"   && <>Per-branch scorecard — book, CE%, receipts, cash exposure, NPA. Click any row or tile for customer-level detail.</>}
+            {tab === "products"   && <>Per-product performance with branch × product matrix and collections split by product.</>}
+            {tab === "efficiency" && <>Demand vs Collected per period — the number your lenders look at.</>}
+            {tab === "scorecard"  && <>Officer-level book, receipts, and mode mix (cash exposure).</>}
+            {tab === "daily"      && <>Day-by-day receipt activity with branch and mode breakdown.</>}
+            {tab === "risk"       && <>NPA ageing, death cases, and installments-due triage from the Overdue Report.</>}
+          </p>
         </div>
-        <button onClick={loadAll}
-          className="flex items-center gap-1.5 px-3 py-2 bg-white border rounded-lg text-sm hover:bg-gray-50">
-          <RefreshCw size={14} className={loading ? "animate-spin" : ""} /> Refresh
-        </button>
+        {tab === "portfolio" && (
+          <button onClick={loadAll}
+            className="flex items-center gap-1.5 px-3 py-2 bg-white border rounded-lg text-sm hover:bg-gray-50">
+            <RefreshCw size={14} className={loading ? "animate-spin" : ""} /> Refresh
+          </button>
+        )}
       </div>
 
+      {/* Tab bar */}
+      <div className="flex flex-wrap gap-1 border-b border-gray-200">
+        {tabs.map(t => (
+          <button key={t.key} onClick={() => setTab(t.key)}
+            className={`flex items-center gap-1.5 px-4 py-2 text-sm font-medium border-b-2 -mb-px transition-colors ${
+              tab === t.key
+                ? "border-teal-600 text-teal-700"
+                : "border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300"
+            }`}>
+            {t.icon} {t.label}
+          </button>
+        ))}
+      </div>
+
+      {tab === "portfolio" && (
+      <>
       {/* Filters */}
       <div className="bg-white rounded-xl border p-4 grid grid-cols-2 md:grid-cols-5 gap-3 items-end">
         <div>
@@ -567,16 +729,42 @@ export function CollectionDashboard({ user, entries, branches }) {
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <KpiCard icon={<DollarSign />} label="Total OD (Principal + Int.)" color="teal"
           value={formatLakhs(dpdTotals.overdueAmount)}
-          sub={`${dpdTotals.accounts.toLocaleString()} accounts`} />
+          sub={`${dpdTotals.accounts.toLocaleString()} accounts · click for detail`}
+          onClick={() => openDrill({
+            branch: branchFilter || undefined,
+            from: fromDate, to: toDate,
+            title: "Total OD Exposure",
+            subtitle: `All overdue accounts${branchFilter ? ` in ${branchFilter}` : ""}`,
+          })} />
         <KpiCard icon={<AlertTriangle />} label="90+ DPD Exposure" color="red"
           value={formatLakhs(severeDpd.overdueAmount)}
-          sub={`${severeDpd.accounts.toLocaleString()} accounts`} />
+          sub={`${severeDpd.accounts.toLocaleString()} accounts · click for detail`}
+          onClick={() => openDrill({
+            branch: branchFilter || undefined,
+            bucket: "DPD-91-180",
+            from: fromDate, to: toDate,
+            title: "90+ DPD Accounts",
+            subtitle: `Severe delinquency${branchFilter ? ` in ${branchFilter}` : ""}`,
+          })} />
         <KpiCard icon={<Target />} label="Period Efficiency" color="indigo"
           value={efficiency?.efficiencyPct != null ? `${Number(efficiency.efficiencyPct).toFixed(1)}%` : "—"}
-          sub={efficiency ? `${formatLakhs(efficiency.totalCollected || 0)} collected vs ${formatLakhs(efficiency.openingBook || 0)} book` : ""} />
+          sub={efficiency ? `${formatLakhs(efficiency.totalCollected || 0)} collected · click for detail` : ""}
+          onClick={() => openDrill({
+            branch: branchFilter || undefined,
+            from: fromDate, to: toDate,
+            title: "Period Efficiency",
+            subtitle: `Collected ${formatLakhs(efficiency?.totalCollected || 0)} vs book ${formatLakhs(efficiency?.openingBook || 0)}`,
+          })} />
         <KpiCard icon={<PhoneOff />} label="Non-contactable" color="amber"
           value={nonContactSummary.count.toLocaleString()}
-          sub={`${formatLakhs(nonContactSummary.overdueAmount)} exposure`} />
+          sub={`${formatLakhs(nonContactSummary.overdueAmount)} exposure · click for detail`}
+          onClick={() => openDrill({
+            branch: branchFilter || undefined,
+            nonContact: true,
+            from: fromDate, to: toDate,
+            title: "Non-contactable Accounts",
+            subtitle: "Overdue customers with both phone numbers missing",
+          })} />
       </div>
 
       {/* Row 1: DPD buckets + OD Trend */}
@@ -694,9 +882,15 @@ export function CollectionDashboard({ user, entries, branches }) {
               <XAxis type="number" fontSize={10} tickFormatter={v => `${Math.round(v / 100000)}L`} />
               <YAxis dataKey="branch" type="category" fontSize={10} width={100} />
               <Tooltip formatter={v => formatLakhs(v)} />
-              <Bar dataKey="overdue_amount" fill="#0f766e" name="Overdue" />
+              <Bar dataKey="overdue_amount" fill="#0f766e" name="Overdue"
+                onClick={(d) => d?.branch && openDrill({
+                  branch: d.branch, from: fromDate, to: toDate,
+                  title: `Branch: ${d.branch}`, subtitle: "OD exposure drilldown",
+                })}
+                style={{ cursor: "pointer" }} />
             </BarChart>
           </ResponsiveContainer>
+          <p className="text-[10px] text-gray-400 mt-1 text-center">Click a branch bar to see customers</p>
         </div>
 
         <div className="bg-white rounded-xl border p-4">
@@ -762,7 +956,13 @@ export function CollectionDashboard({ user, entries, branches }) {
                 {foreOpp.length === 0 ? (
                   <tr><td colSpan={5} className="py-4 text-center text-gray-400">None.</td></tr>
                 ) : foreOpp.slice(0, 100).map((f, i) => (
-                  <tr key={i} className="border-b">
+                  <tr key={i} className="border-b hover:bg-teal-50/50 cursor-pointer"
+                      onClick={() => openDrill({
+                        branch: f.branch,
+                        from: fromDate, to: toDate,
+                        title: f.customer_name || f.loan_account_no,
+                        subtitle: `Foreclosure candidate · ${f.branch}`,
+                      })}>
                     <td className="py-1.5 pr-2">
                       <div className="font-medium">{f.customer_name || "—"}</div>
                       <div className="text-[10px] text-gray-400">{f.loan_account_no}</div>
@@ -801,7 +1001,13 @@ export function CollectionDashboard({ user, entries, branches }) {
                 {nonContact.length === 0 ? (
                   <tr><td colSpan={4} className="py-4 text-center text-gray-400">None.</td></tr>
                 ) : nonContact.slice(0, 100).map((n, i) => (
-                  <tr key={i} className="border-b">
+                  <tr key={i} className="border-b hover:bg-amber-50/50 cursor-pointer"
+                      onClick={() => openDrill({
+                        branch: n.branch,
+                        from: fromDate, to: toDate,
+                        title: n.customer_name || n.loan_account_no,
+                        subtitle: `Non-contactable · ${n.branch}`,
+                      })}>
                     <td className="py-1.5 pr-2">
                       <div className="font-medium">{n.customer_name || "—"}</div>
                       <div className="text-[10px] text-gray-400">{n.loan_account_no}</div>
@@ -816,26 +1022,324 @@ export function CollectionDashboard({ user, entries, branches }) {
           </div>
         </div>
       </div>
+      </>
+      )}
+
+      {tab === "branches"   && <BranchPerformanceView openDrill={openDrill} />}
+      {tab === "products"   && <ProductPerformanceView openDrill={openDrill} />}
+      {tab === "efficiency" && <CollectionEfficiencyView branches={branches} openDrill={openDrill} />}
+      {tab === "scorecard"  && <OfficerScorecardView openDrill={openDrill} />}
+      {tab === "daily"      && <DailyCollectionsView branches={branches} openDrill={openDrill} />}
+      {tab === "risk"       && <RiskTriageView openDrill={openDrill} />}
+
+      {/* Shared drilldown drawer */}
+      <DrilldownDrawer slice={drill} onClose={closeDrill} />
     </div>
   );
 }
 
-function KpiCard({ icon, label, value, sub, color }) {
+function KpiCard({ icon, label, value, sub, color, onClick }) {
   const palette = {
     teal:   "bg-teal-50 border-teal-200 text-teal-800",
     red:    "bg-red-50 border-red-200 text-red-800",
     indigo: "bg-indigo-50 border-indigo-200 text-indigo-800",
     amber:  "bg-amber-50 border-amber-200 text-amber-800",
   }[color] || "bg-gray-50 border-gray-200 text-gray-800";
-  return (
-    <div className={`rounded-xl border p-4 ${palette}`}>
+  const interactive = typeof onClick === "function";
+  const baseClass = `rounded-xl border p-4 ${palette} ${interactive ? "cursor-pointer transition-all hover:shadow-md hover:-translate-y-0.5 active:translate-y-0 relative group" : ""}`;
+  const content = (
+    <>
       <div className="flex items-center gap-2 text-xs uppercase tracking-wide opacity-70">
         {icon && React.cloneElement(icon, { size: 14 })}
         {label}
+        {interactive && <ChevronRight size={12} className="ml-auto opacity-40 group-hover:opacity-100 group-hover:translate-x-0.5 transition" />}
       </div>
       <div className="text-xl font-bold mt-1">{value}</div>
       {sub && <div className="text-[11px] opacity-70 mt-1">{sub}</div>}
-    </div>
+    </>
+  );
+  return interactive ? (
+    <button type="button" onClick={onClick} className={`${baseClass} text-left w-full`}>{content}</button>
+  ) : (
+    <div className={baseClass}>{content}</div>
+  );
+}
+
+// ─── DrilldownDrawer ───────────────────────────────────────────────────────
+// Right-side slide-out drawer. Accepts a `slice` object
+// ({branch, product, bucket, periodStart, periodEnd, from, to, title, subtitle})
+// and loads a unified summary + customer list + receipts + trend via
+// /api/od/drilldown. Safe to render at any time — when `slice` is null it
+// renders nothing.
+function DrilldownDrawer({ slice, onClose }) {
+  const [loading, setLoading] = useState(false);
+  const [data, setData] = useState(null);
+  const [tab, setTab] = useState("customers");
+  const [query, setQuery] = useState("");
+  const [sortKey, setSortKey] = useState("total_overdue");
+  const [sortDir, setSortDir] = useState("desc");
+
+  // Fetch whenever slice changes
+  useEffect(() => {
+    if (!slice) return;
+    setLoading(true); setData(null); setQuery(""); setTab("customers");
+    const p = new URLSearchParams();
+    for (const k of ["branch", "product", "bucket", "mode", "periodStart", "periodEnd", "from", "to", "minInstallmentsDue", "minMonthsStranded", "limit"]) {
+      if (slice[k] != null && slice[k] !== "") p.set(k, slice[k]);
+    }
+    for (const k of ["npaOnly", "deathOnly", "nonContact"]) {
+      if (slice[k]) p.set(k, "1");
+    }
+    fetch(`${API_BASE}/od/drilldown?${p.toString()}`)
+      .then(r => r.json())
+      .then(j => setData(j))
+      .catch(() => setData(null))
+      .finally(() => setLoading(false));
+  }, [slice]);
+
+  // Escape to close
+  useEffect(() => {
+    if (!slice) return;
+    const h = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, [slice, onClose]);
+
+  const customers = data?.customers || [];
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    let arr = q ? customers.filter(c =>
+      (c.customer_name || "").toLowerCase().includes(q) ||
+      (c.loan_account_no || "").toLowerCase().includes(q) ||
+      (c.customer_number || "").toLowerCase().includes(q) ||
+      (c.branch_name || "").toLowerCase().includes(q) ||
+      (c.officer_name || "").toLowerCase().includes(q)
+    ) : [...customers];
+    arr.sort((a, b) => {
+      const av = a[sortKey], bv = b[sortKey];
+      const an = Number(av), bn = Number(bv);
+      const numeric = Number.isFinite(an) && Number.isFinite(bn);
+      const cmp = numeric ? an - bn : String(av ?? "").localeCompare(String(bv ?? ""));
+      return sortDir === "asc" ? cmp : -cmp;
+    });
+    return arr;
+  }, [customers, query, sortKey, sortDir]);
+
+  const summary = data?.summary || {};
+  const trend = data?.trend || [];
+  const receipts = data?.receipts || [];
+
+  const sortBtn = (key, label) => (
+    <button
+      onClick={() => {
+        if (sortKey === key) setSortDir(sortDir === "asc" ? "desc" : "asc");
+        else { setSortKey(key); setSortDir("desc"); }
+      }}
+      className={`flex items-center gap-0.5 ${sortKey === key ? "text-teal-700 font-semibold" : "text-gray-500"}`}>
+      {label}{sortKey === key ? (sortDir === "asc" ? " ▲" : " ▼") : ""}
+    </button>
+  );
+
+  if (!slice) return null;
+
+  return (
+    <>
+      {/* Backdrop */}
+      <div
+        className="fixed inset-0 bg-black/40 z-40 transition-opacity"
+        onClick={onClose}
+      />
+      {/* Drawer */}
+      <div className="fixed top-0 right-0 h-full w-full md:w-[780px] lg:w-[920px] bg-white shadow-2xl z-50 flex flex-col animate-in slide-in-from-right">
+        {/* Header */}
+        <div className="px-5 py-3 border-b flex items-start justify-between bg-gradient-to-r from-teal-50 to-white">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 text-[10px] uppercase tracking-wide text-teal-700 font-semibold">
+              <Gauge size={12} /> Drilldown
+            </div>
+            <h2 className="text-lg font-bold text-gray-900 truncate">{slice.title || "Details"}</h2>
+            {slice.subtitle && <p className="text-xs text-gray-500 mt-0.5">{slice.subtitle}</p>}
+            <div className="flex items-center gap-1.5 flex-wrap mt-1.5">
+              {slice.branch && <span className="px-2 py-0.5 rounded-full bg-teal-100 text-teal-800 text-[10px]">Branch: {slice.branch}</span>}
+              {slice.product && <span className="px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-800 text-[10px]">Product: {slice.product}</span>}
+              {slice.bucket && <span className="px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 text-[10px]">DPD: {slice.bucket}</span>}
+              {slice.periodStart && slice.periodEnd && (
+                <span className="px-2 py-0.5 rounded-full bg-gray-100 text-gray-700 text-[10px]">
+                  {formatDateDMY(slice.periodStart)} → {formatDateDMY(slice.periodEnd)}
+                </span>
+              )}
+            </div>
+          </div>
+          <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-gray-100 text-gray-500">
+            <X size={18} />
+          </button>
+        </div>
+
+        {/* Summary stats */}
+        <div className="px-5 py-3 border-b bg-white grid grid-cols-2 md:grid-cols-4 gap-2">
+          <Stat label="Accounts" value={(summary.accounts || 0).toLocaleString()} />
+          <Stat label="Principal O/S" value={formatLakhs(summary.principal_outstanding || 0)} />
+          <Stat label="Total OD" value={formatLakhs((summary.principal_overdue || 0) + (summary.interest_overdue || 0))} tone="red" />
+          <Stat label="CE%" value={summary.cePct == null ? "—" : formatPct(summary.cePct, 1)} tone={summary.cePct >= 85 ? "green" : summary.cePct >= 50 ? "amber" : "red"} />
+          <Stat label="Demand" value={formatLakhs(summary.demand || 0)} />
+          <Stat label="Collected" value={formatLakhs(summary.collected || 0)} tone="green" />
+          <Stat label="Receipts" value={(summary.receipts || 0).toLocaleString()} />
+          <Stat label="Cash %" value={summary.posted_amount > 0 ? formatPct((summary.cash_amount / summary.posted_amount) * 100, 0) : "—"} tone="amber" />
+        </div>
+
+        {/* Tabs */}
+        <div className="px-5 border-b flex gap-1">
+          {[
+            { k: "customers", label: `Customers (${customers.length})` },
+            { k: "trend",     label: "Trend" },
+            { k: "receipts",  label: `Receipts (${receipts.length})` },
+          ].map(t => (
+            <button key={t.k} onClick={() => setTab(t.k)}
+              className={`px-3 py-2 text-xs font-medium border-b-2 -mb-px ${
+                tab === t.k ? "border-teal-600 text-teal-700" : "border-transparent text-gray-500 hover:text-gray-700"
+              }`}>
+              {t.label}
+            </button>
+          ))}
+          <div className="ml-auto flex items-center gap-2 py-2">
+            {tab === "customers" && customers.length > 0 && (
+              <>
+                <div className="relative">
+                  <Search size={13} className="absolute left-2 top-1/2 -translate-y-1/2 text-gray-400" />
+                  <input type="text" value={query} onChange={e => setQuery(e.target.value)}
+                    placeholder="Search name / loan / officer…"
+                    className="pl-7 pr-3 py-1.5 text-xs border rounded-lg w-56" />
+                </div>
+                <button onClick={() => downloadCSV(filtered, `drilldown-customers-${Date.now()}.csv`)}
+                  className="text-xs text-teal-700 flex items-center gap-1"><Download size={12} /> CSV</button>
+              </>
+            )}
+            {tab === "receipts" && receipts.length > 0 && (
+              <button onClick={() => downloadCSV(receipts, `drilldown-receipts-${Date.now()}.csv`)}
+                className="text-xs text-teal-700 flex items-center gap-1"><Download size={12} /> CSV</button>
+            )}
+          </div>
+        </div>
+
+        {/* Body */}
+        <div className="flex-1 overflow-y-auto px-5 py-3">
+          {loading && <div className="text-sm text-gray-500 text-center py-10"><RefreshCw size={18} className="animate-spin inline mr-2" /> Loading…</div>}
+
+          {!loading && tab === "customers" && (
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead className="sticky top-0 bg-white shadow-sm z-10">
+                  <tr className="text-left text-gray-500 border-b">
+                    <th className="py-2 pr-2">{sortBtn("customer_name", "Customer / Loan")}</th>
+                    <th className="py-2 pr-2">{sortBtn("branch_name", "Branch")}</th>
+                    <th className="py-2 pr-2">Officer</th>
+                    <th className="py-2 pr-2">Product</th>
+                    <th className="py-2 pr-2 text-right">{sortBtn("principal_outstanding", "Principal O/S")}</th>
+                    <th className="py-2 pr-2 text-right">{sortBtn("total_overdue", "Total OD")}</th>
+                    <th className="py-2 pr-2 text-right">{sortBtn("cePct", "CE%")}</th>
+                    <th className="py-2 pr-2">Phone</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filtered.length === 0 ? (
+                    <tr><td colSpan={8} className="py-6 text-center text-gray-400">No customers for this slice.</td></tr>
+                  ) : filtered.map((c, i) => (
+                    <tr key={c.loan_account_no + "-" + i} className="border-b hover:bg-gray-50">
+                      <td className="py-1.5 pr-2">
+                        <div className="font-medium text-gray-800">{c.customer_name || "—"}</div>
+                        <div className="text-[10px] text-gray-400">{c.loan_account_no}</div>
+                      </td>
+                      <td className="py-1.5 pr-2">{c.branch_name || "—"}</td>
+                      <td className="py-1.5 pr-2">
+                        <div>{c.officer_name || "—"}</div>
+                        {c.officer_code && <div className="text-[10px] text-gray-400">{c.officer_code}</div>}
+                      </td>
+                      <td className="py-1.5 pr-2 text-gray-600">{c.product_name || "—"}</td>
+                      <td className="py-1.5 pr-2 text-right">{formatLakhs(c.principal_outstanding)}</td>
+                      <td className="py-1.5 pr-2 text-right font-semibold text-red-700">{formatLakhs(c.total_overdue)}</td>
+                      <td className={`py-1.5 pr-2 text-right font-semibold ${ceColor(c.cePct)}`}>{c.cePct == null ? "—" : formatPct(c.cePct, 0)}</td>
+                      <td className="py-1.5 pr-2 text-gray-600">
+                        {c.mobile_number ? (
+                          <a href={`tel:${c.mobile_number}`} className="flex items-center gap-1 hover:text-teal-700">
+                            <Phone size={10} /> {c.mobile_number}
+                          </a>
+                        ) : <span className="text-gray-400 flex items-center gap-1"><PhoneOff size={10} /> —</span>}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {!loading && tab === "trend" && (
+            <div>
+              {trend.length === 0 ? (
+                <div className="text-center text-gray-400 py-10">No receipts in this window.</div>
+              ) : (
+                <>
+                  <h3 className="font-semibold text-gray-800 mb-2">Daily collections</h3>
+                  <ResponsiveContainer width="100%" height={260}>
+                    <BarChart data={trend.map(d => ({ ...d, day: d.day ? d.day.slice(5) : d.day }))}>
+                      <CartesianGrid strokeDasharray="3 3" />
+                      <XAxis dataKey="day" fontSize={10} />
+                      <YAxis fontSize={10} tickFormatter={v => `${Math.round(v / 1000)}K`} />
+                      <Tooltip formatter={v => formatLakhs(v)} />
+                      <Legend />
+                      <Bar dataKey="cash" stackId="a" fill="#f59e0b" name="Cash" />
+                      <Bar dataKey="upi" stackId="a" fill="#10b981" name="UPI / Digital" />
+                    </BarChart>
+                  </ResponsiveContainer>
+                  <div className="mt-4 text-xs text-gray-500">{trend.length} day(s) with activity · {(summary.receipts || 0).toLocaleString()} receipts · {formatLakhs(summary.posted_amount || 0)} posted</div>
+                </>
+              )}
+            </div>
+          )}
+
+          {!loading && tab === "receipts" && (
+            <div className="overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead className="sticky top-0 bg-white shadow-sm">
+                  <tr className="text-left text-gray-500 border-b">
+                    <th className="py-2 pr-2">Date</th>
+                    <th className="py-2 pr-2">Receipt</th>
+                    <th className="py-2 pr-2">Customer / Loan</th>
+                    <th className="py-2 pr-2">Branch</th>
+                    <th className="py-2 pr-2">Mode</th>
+                    <th className="py-2 pr-2 text-right">Amount</th>
+                    <th className="py-2 pr-2">Officer</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {receipts.length === 0 ? (
+                    <tr><td colSpan={7} className="py-6 text-center text-gray-400">No receipts.</td></tr>
+                  ) : receipts.map((r, i) => (
+                    <tr key={r.receipt_no + "-" + i} className="border-b hover:bg-gray-50">
+                      <td className="py-1.5 pr-2 text-gray-600">{formatDateDMY(r.payment_date)}</td>
+                      <td className="py-1.5 pr-2 font-mono text-[10px] text-gray-500">{r.receipt_no}</td>
+                      <td className="py-1.5 pr-2">
+                        <div className="font-medium">{r.customer_name || "—"}</div>
+                        <div className="text-[10px] text-gray-400">{r.loan_account_no}</div>
+                      </td>
+                      <td className="py-1.5 pr-2">{r.branch_name || "—"}</td>
+                      <td className="py-1.5 pr-2">
+                        <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${
+                          (r.mode || "").toUpperCase() === "CASH" ? "bg-amber-100 text-amber-800" :
+                          ["UPI","DIGITAL","ONLINE"].includes((r.mode || "").toUpperCase()) ? "bg-emerald-100 text-emerald-800" :
+                          "bg-indigo-100 text-indigo-800"
+                        }`}>{r.mode || "—"}</span>
+                      </td>
+                      <td className="py-1.5 pr-2 text-right font-semibold text-teal-700">{formatINR(r.amount)}</td>
+                      <td className="py-1.5 pr-2 text-gray-600">{r.payment_officer_name || "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      </div>
+    </>
   );
 }
 
@@ -848,6 +1352,1599 @@ function Stat({ label, value, tone }) {
     <div className="bg-gray-50 rounded-lg p-2 text-center">
       <div className="text-[10px] text-gray-500 uppercase">{label}</div>
       <div className={`text-lg font-bold ${color}`}>{value}</div>
+    </div>
+  );
+}
+
+// ─── CollectionEfficiencyView ──────────────────────────────────────────────
+// Demand vs Collected for a period, grouped by branch/officer/product/funder/center.
+// The headline CE% is the number lenders care about; the breakdown is the drill-down.
+function CollectionEfficiencyView({ openDrill }) {
+  const { periods, latest } = useLatestPeriod();
+  const [period, setPeriod] = useState({ start: "", end: "" });
+  const [groupBy, setGroupBy] = useState("branch");
+  const [data, setData] = useState(null);
+  const [funderMix, setFunderMix] = useState([]);
+  const [recovery, setRecovery] = useState([]);
+  const [loading, setLoading] = useState(false);
+
+  // Default to latest period once loaded
+  useEffect(() => {
+    if (latest && !period.start) setPeriod({ start: latest.period_start, end: latest.period_end });
+  }, [latest]); // eslint-disable-line
+
+  const load = useCallback(async () => {
+    if (!period.start || !period.end) return;
+    setLoading(true);
+    try {
+      const qs = `periodStart=${period.start}&periodEnd=${period.end}`;
+      const [ce, fm, rv] = await Promise.all([
+        fetch(`${API_BASE}/od/analytics/collection-efficiency?${qs}&groupBy=${groupBy}`).then(r => r.json()).catch(() => null),
+        fetch(`${API_BASE}/od/analytics/funder-mix?${qs}`).then(r => r.json()).catch(() => ({ rows: [] })),
+        fetch(`${API_BASE}/od/analytics/recovery-velocity?${qs}&limit=50`).then(r => r.json()).catch(() => ({ rows: [] })),
+      ]);
+      setData(ce);
+      setFunderMix(Array.isArray(fm?.rows) ? fm.rows : []);
+      setRecovery(Array.isArray(rv?.rows) ? rv.rows : []);
+    } finally { setLoading(false); }
+  }, [period.start, period.end, groupBy]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const headline = data?.headline || null;
+  const breakdown = Array.isArray(data?.breakdown) ? data.breakdown : [];
+  const top15 = useMemo(() => breakdown.slice(0, 15).map(r => ({
+    label: r.label?.length > 18 ? r.label.slice(0, 16) + "…" : r.label,
+    fullLabel: r.label, cePct: Number(r.cePct || 0),
+    demand: r.demand || 0, collected: r.collected || 0,
+  })), [breakdown]);
+
+  return (
+    <div className="space-y-4">
+      {/* Period + groupBy selector */}
+      <div className="bg-white rounded-xl border p-4 grid grid-cols-2 md:grid-cols-5 gap-3 items-end">
+        <div>
+          <label className="block text-xs text-gray-500 mb-1">Period</label>
+          <select
+            value={period.start && period.end ? `${period.start}__${period.end}` : ""}
+            onChange={e => {
+              const [s, ed] = e.target.value.split("__");
+              setPeriod({ start: s, end: ed });
+            }}
+            className="w-full px-2.5 py-2 border rounded-lg text-sm">
+            {periods.length === 0 && <option>No periods uploaded</option>}
+            {periods.map(p => (
+              <option key={`${p.period_start}__${p.period_end}`} value={`${p.period_start}__${p.period_end}`}>
+                {formatDateDMY(p.period_start)} → {formatDateDMY(p.period_end)}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <label className="block text-xs text-gray-500 mb-1">Group By</label>
+          <select value={groupBy} onChange={e => setGroupBy(e.target.value)}
+            className="w-full px-2.5 py-2 border rounded-lg text-sm">
+            <option value="branch">Branch</option>
+            <option value="officer">Officer</option>
+            <option value="product">Product</option>
+            <option value="funder">Funder</option>
+            <option value="center">Center</option>
+          </select>
+        </div>
+        <div className="md:col-span-2 text-xs text-gray-500">
+          {loading ? "Loading…" : headline && headline.demand > 0 ? (
+            <>Demand <b>{formatLakhs(headline.demand)}</b> · Collected <b>{formatLakhs(headline.collected)}</b> · {breakdown.length} {groupBy}s · {headline.accounts?.toLocaleString() || 0} accts</>
+          ) : "—"}
+        </div>
+        <button onClick={load}
+          className="w-full py-2 bg-teal-600 text-white rounded-lg text-sm font-medium hover:bg-teal-700">
+          Refresh
+        </button>
+      </div>
+
+      {/* Headline KPIs */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <button type="button"
+          onClick={() => openDrill && openDrill({
+            periodStart: period.start, periodEnd: period.end,
+            from: period.start, to: period.end,
+            title: "Collection Efficiency",
+            subtitle: headline ? `${formatLakhs(headline.collected)} of ${formatLakhs(headline.demand)} demanded` : "",
+          })}
+          className="rounded-xl border p-4 bg-gradient-to-br from-teal-50 to-cyan-50 border-teal-200 text-left w-full cursor-pointer transition-all hover:shadow-md hover:-translate-y-0.5 active:translate-y-0 relative group">
+          <div className="flex items-center gap-2 text-xs uppercase tracking-wide text-teal-700 opacity-80">
+            <Gauge size={14} /> Collection Efficiency
+            <ChevronRight size={12} className="ml-auto opacity-40 group-hover:opacity-100 group-hover:translate-x-0.5 transition" />
+          </div>
+          <div className={`text-3xl font-bold mt-1 ${ceColor(headline?.cePct)}`}>
+            {headline ? formatPct(headline.cePct, 2) : "—"}
+          </div>
+          <div className="text-[11px] text-gray-500 mt-1">
+            {headline ? `${formatLakhs(headline.collected)} of ${formatLakhs(headline.demand)} demanded` : ""}
+          </div>
+        </button>
+        <KpiCard icon={<DollarSign />} label="Principal Demand" color="indigo"
+          value={formatLakhs(headline?.principal_demand || 0)}
+          sub={`Collected ${formatLakhs(headline?.principal_collected || 0)} · click for detail`}
+          onClick={() => openDrill && openDrill({
+            periodStart: period.start, periodEnd: period.end,
+            from: period.start, to: period.end,
+            title: "Principal Demand",
+            subtitle: `${formatLakhs(headline?.principal_demand || 0)} demanded · ${formatLakhs(headline?.principal_collected || 0)} collected`,
+          })} />
+        <KpiCard icon={<DollarSign />} label="Interest Demand" color="amber"
+          value={formatLakhs(headline?.interest_demand || 0)}
+          sub={`Collected ${formatLakhs(headline?.interest_collected || 0)} · click for detail`}
+          onClick={() => openDrill && openDrill({
+            periodStart: period.start, periodEnd: period.end,
+            from: period.start, to: period.end,
+            title: "Interest Demand",
+            subtitle: `${formatLakhs(headline?.interest_demand || 0)} demanded · ${formatLakhs(headline?.interest_collected || 0)} collected`,
+          })} />
+        <KpiCard icon={<Users />} label="Accounts with Demand" color="teal"
+          value={(headline?.accounts || 0).toLocaleString()}
+          sub={`${breakdown.length} ${groupBy}s tracked · click for detail`}
+          onClick={() => openDrill && openDrill({
+            periodStart: period.start, periodEnd: period.end,
+            from: period.start, to: period.end,
+            title: "Accounts with Demand",
+            subtitle: `${(headline?.accounts || 0).toLocaleString()} accounts in period`,
+          })} />
+      </div>
+
+      {/* Ranked CE% bar chart */}
+      <div className="bg-white rounded-xl border p-4">
+        <div className="flex items-center justify-between mb-3">
+          <div>
+            <h3 className="font-semibold text-gray-800">Collection Efficiency by {groupBy.charAt(0).toUpperCase() + groupBy.slice(1)}</h3>
+            <p className="text-xs text-gray-500">Top 15 by demand. Bars coloured by CE% (red &lt; 50%, amber 50-85%, green 85%+).</p>
+          </div>
+          <button onClick={() => downloadCSV(breakdown, `ce-${groupBy}-${period.end}.csv`)}
+            className="text-xs text-teal-700 flex items-center gap-1"><Download size={12} /> CSV</button>
+        </div>
+        <ResponsiveContainer width="100%" height={Math.max(260, top15.length * 28)}>
+          <BarChart data={top15} layout="vertical" margin={{ left: 100 }}>
+            <CartesianGrid strokeDasharray="3 3" />
+            <XAxis type="number" domain={[0, (dataMax) => Math.max(100, Math.ceil(dataMax))]} fontSize={11} tickFormatter={v => `${v}%`} />
+            <YAxis dataKey="label" type="category" fontSize={10} width={120} />
+            <Tooltip
+              formatter={(v, n, p) => n === "cePct" ? [`${Number(v).toFixed(1)}%`, "CE%"] : [v, n]}
+              labelFormatter={(l, p) => p?.[0]?.payload?.fullLabel || l} />
+            <Bar dataKey="cePct" name="CE%" radius={[0, 4, 4, 0]}>
+              {top15.map((r, i) => {
+                const c = r.cePct >= 95 ? "#059669" : r.cePct >= 85 ? "#10b981" : r.cePct >= 70 ? "#f59e0b" : r.cePct >= 50 ? "#f97316" : "#ef4444";
+                return <Cell key={i} fill={c} />;
+              })}
+            </Bar>
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+
+      {/* Full breakdown table */}
+      <div className="bg-white rounded-xl border">
+        <div className="px-5 py-3 border-b flex items-center justify-between">
+          <h3 className="font-semibold text-gray-800">Full Breakdown</h3>
+          <span className="text-xs text-gray-500">{breakdown.length.toLocaleString()} rows</span>
+        </div>
+        <div className="overflow-x-auto max-h-96 overflow-y-auto">
+          <table className="w-full text-xs">
+            <thead className="sticky top-0 bg-gray-50 text-gray-600 uppercase text-[10px]">
+              <tr>
+                <th className="text-left px-4 py-2">{groupBy.charAt(0).toUpperCase() + groupBy.slice(1)}</th>
+                <th className="text-right px-4 py-2">Accts</th>
+                <th className="text-right px-4 py-2">Demand</th>
+                <th className="text-right px-4 py-2">Collected</th>
+                <th className="text-right px-4 py-2">CE%</th>
+                <th className="text-right px-4 py-2">Prin. Overdue</th>
+                <th className="text-right px-4 py-2">Int. Overdue</th>
+              </tr>
+            </thead>
+            <tbody>
+              {breakdown.length === 0 ? (
+                <tr><td colSpan={7} className="text-center text-gray-400 py-6">No data for selected period.</td></tr>
+              ) : breakdown.map((r, i) => {
+                // Map groupBy → drilldown slice key
+                const slice = {
+                  periodStart: period.start, periodEnd: period.end,
+                  from: period.start, to: period.end,
+                  title: `${groupBy.charAt(0).toUpperCase() + groupBy.slice(1)}: ${r.label}`,
+                  subtitle: `${formatDateDMY(period.start)} → ${formatDateDMY(period.end)} · CE% ${formatPct(r.cePct, 1)}`,
+                };
+                if (groupBy === "branch")  slice.branch = r.label;
+                if (groupBy === "product") slice.product = r.label;
+                // officer/funder/center not supported in drilldown filter today; click still opens a branch-less drill.
+                const drillable = groupBy === "branch" || groupBy === "product";
+                return (
+                  <tr key={i}
+                      onClick={drillable && openDrill ? () => openDrill(slice) : undefined}
+                      className={`border-t hover:bg-gray-50 ${drillable ? "cursor-pointer" : ""}`}>
+                    <td className="px-4 py-1.5 font-medium text-gray-800">{r.label}</td>
+                    <td className="px-4 py-1.5 text-right">{(r.accounts || 0).toLocaleString()}</td>
+                    <td className="px-4 py-1.5 text-right">{formatLakhs(r.demand)}</td>
+                    <td className="px-4 py-1.5 text-right text-teal-700 font-medium">{formatLakhs(r.collected)}</td>
+                    <td className={`px-4 py-1.5 text-right font-semibold ${ceColor(r.cePct)}`}>{formatPct(r.cePct)}</td>
+                    <td className="px-4 py-1.5 text-right text-red-600">{formatLakhs(r.principal_overdue)}</td>
+                    <td className="px-4 py-1.5 text-right text-amber-600">{formatLakhs(r.interest_overdue)}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Funder mix + Recovery velocity */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div className="bg-white rounded-xl border p-4">
+          <div className="flex items-center justify-between mb-3">
+            <div>
+              <h3 className="font-semibold text-gray-800">Funder / Fund Source Mix</h3>
+              <p className="text-xs text-gray-500">CE% broken out by funder — helpful when reporting to each lender.</p>
+            </div>
+            <button onClick={() => downloadCSV(funderMix, `funder-mix-${period.end}.csv`)}
+              className="text-xs text-teal-700 flex items-center gap-1"><Download size={12} /> CSV</button>
+          </div>
+          <div className="overflow-y-auto max-h-72">
+            <table className="w-full text-xs">
+              <thead className="sticky top-0 bg-white">
+                <tr className="text-left text-gray-500 border-b">
+                  <th className="py-2 pr-2">Funder</th>
+                  <th className="py-2 pr-2">Fund Source</th>
+                  <th className="py-2 pr-2 text-right">POS End</th>
+                  <th className="py-2 pr-2 text-right">Demand</th>
+                  <th className="py-2 pr-2 text-right">Collected</th>
+                  <th className="py-2 pr-2 text-right">CE%</th>
+                </tr>
+              </thead>
+              <tbody>
+                {funderMix.length === 0 ? (
+                  <tr><td colSpan={6} className="py-4 text-center text-gray-400">None.</td></tr>
+                ) : funderMix.map((f, i) => (
+                  <tr key={i} className="border-b">
+                    <td className="py-1.5 pr-2 font-medium">{f.funder}</td>
+                    <td className="py-1.5 pr-2 text-gray-600">{f.fund_source}</td>
+                    <td className="py-1.5 pr-2 text-right">{formatLakhs(f.principal_outstanding_end)}</td>
+                    <td className="py-1.5 pr-2 text-right">{formatLakhs(f.demand)}</td>
+                    <td className="py-1.5 pr-2 text-right text-teal-700">{formatLakhs(f.collected)}</td>
+                    <td className={`py-1.5 pr-2 text-right font-semibold ${ceColor(f.cePct)}`}>{formatPct(f.cePct)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div className="bg-white rounded-xl border p-4">
+          <div className="flex items-center justify-between mb-3">
+            <div>
+              <h3 className="font-semibold text-gray-800">Top Recovery Velocity</h3>
+              <p className="text-xs text-gray-500">Accounts with the largest principal reduction in this period — real recovery wins.</p>
+            </div>
+            <button onClick={() => downloadCSV(recovery, `recovery-velocity-${period.end}.csv`)}
+              className="text-xs text-teal-700 flex items-center gap-1"><Download size={12} /> CSV</button>
+          </div>
+          <div className="overflow-y-auto max-h-72">
+            <table className="w-full text-xs">
+              <thead className="sticky top-0 bg-white">
+                <tr className="text-left text-gray-500 border-b">
+                  <th className="py-2 pr-2">Customer</th>
+                  <th className="py-2 pr-2">Branch</th>
+                  <th className="py-2 pr-2 text-right">POS Start</th>
+                  <th className="py-2 pr-2 text-right">POS End</th>
+                  <th className="py-2 pr-2 text-right">Reduced</th>
+                </tr>
+              </thead>
+              <tbody>
+                {recovery.length === 0 ? (
+                  <tr><td colSpan={5} className="py-4 text-center text-gray-400">None.</td></tr>
+                ) : recovery.map((r, i) => (
+                  <tr key={i} className="border-b">
+                    <td className="py-1.5 pr-2">
+                      <div className="font-medium">{r.customer_name || "—"}</div>
+                      <div className="text-[10px] text-gray-400">{r.loan_account_no}</div>
+                    </td>
+                    <td className="py-1.5 pr-2">{r.branch_name}</td>
+                    <td className="py-1.5 pr-2 text-right text-gray-500">{formatLakhs(r.principal_outstanding_start)}</td>
+                    <td className="py-1.5 pr-2 text-right">{formatLakhs(r.principal_outstanding_end)}</td>
+                    <td className="py-1.5 pr-2 text-right font-semibold text-emerald-700">{formatLakhs(r.principal_reduced)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── OfficerScorecardView ──────────────────────────────────────────────────
+// Merges owned-book (from client-period, keyed on officer_code = relationship officer)
+// with posted receipts (from od_collections, keyed on payment_officer_code = who
+// physically collected). Cash % flags officers with heavy cash exposure.
+function OfficerScorecardView({ openDrill }) {
+  const { periods, latest } = useLatestPeriod();
+  const [period, setPeriod] = useState({ start: "", end: "" });
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [sortKey, setSortKey] = useState("demand");
+  const [sortDir, setSortDir] = useState("desc");
+  const [query, setQuery] = useState("");
+
+  useEffect(() => {
+    if (latest && !period.start) setPeriod({ start: latest.period_start, end: latest.period_end });
+  }, [latest]); // eslint-disable-line
+
+  const load = useCallback(async () => {
+    if (!period.start || !period.end) return;
+    setLoading(true);
+    try {
+      const j = await fetch(`${API_BASE}/od/analytics/officer-scorecard?periodStart=${period.start}&periodEnd=${period.end}`).then(r => r.json());
+      setRows(Array.isArray(j?.rows) ? j.rows : []);
+    } finally { setLoading(false); }
+  }, [period.start, period.end]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    let r = q ? rows.filter(o =>
+      (o.officer_name || "").toLowerCase().includes(q) ||
+      (o.officer_code || "").toLowerCase().includes(q) ||
+      (o.branch_name || "").toLowerCase().includes(q)
+    ) : [...rows];
+    r.sort((a, b) => {
+      const av = a[sortKey], bv = b[sortKey];
+      const an = Number(av), bn = Number(bv);
+      const numeric = Number.isFinite(an) && Number.isFinite(bn);
+      const cmp = numeric ? an - bn : String(av ?? "").localeCompare(String(bv ?? ""));
+      return sortDir === "asc" ? cmp : -cmp;
+    });
+    return r;
+  }, [rows, query, sortKey, sortDir]);
+
+  const totals = useMemo(() => rows.reduce((a, r) => ({
+    demand:         a.demand         + (r.demand || 0),
+    collected:      a.collected      + (r.collected || 0),
+    posted:         a.posted         + (r.posted_amount || 0),
+    cash:           a.cash           + (r.cash_amount || 0),
+    upi:            a.upi            + (r.upi_amount || 0),
+    cheque:         a.cheque         + (r.cheque_amount || 0),
+    receipts:       a.receipts       + (r.receipts || 0),
+    accounts:       a.accounts       + (r.accounts || 0),
+  }), { demand: 0, collected: 0, posted: 0, cash: 0, upi: 0, cheque: 0, receipts: 0, accounts: 0 }), [rows]);
+  const overallCe = totals.demand > 0 ? (totals.collected / totals.demand) * 100 : null;
+  const overallCash = totals.posted > 0 ? (totals.cash / totals.posted) * 100 : null;
+
+  const sortBtn = (key, label) => (
+    <button
+      onClick={() => {
+        if (sortKey === key) setSortDir(sortDir === "asc" ? "desc" : "asc");
+        else { setSortKey(key); setSortDir("desc"); }
+      }}
+      className={`flex items-center gap-0.5 ${sortKey === key ? "text-teal-700 font-semibold" : "text-gray-500"}`}>
+      {label}{sortKey === key ? (sortDir === "asc" ? " ▲" : " ▼") : ""}
+    </button>
+  );
+
+  return (
+    <div className="space-y-4">
+      <div className="bg-white rounded-xl border p-4 grid grid-cols-2 md:grid-cols-4 gap-3 items-end">
+        <div>
+          <label className="block text-xs text-gray-500 mb-1">Period</label>
+          <select
+            value={period.start && period.end ? `${period.start}__${period.end}` : ""}
+            onChange={e => { const [s, ed] = e.target.value.split("__"); setPeriod({ start: s, end: ed }); }}
+            className="w-full px-2.5 py-2 border rounded-lg text-sm">
+            {periods.length === 0 && <option>No periods uploaded</option>}
+            {periods.map(p => (
+              <option key={`${p.period_start}__${p.period_end}`} value={`${p.period_start}__${p.period_end}`}>
+                {formatDateDMY(p.period_start)} → {formatDateDMY(p.period_end)}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="md:col-span-2">
+          <label className="block text-xs text-gray-500 mb-1">Search officer / branch</label>
+          <input type="text" value={query} onChange={e => setQuery(e.target.value)}
+            placeholder="Name, code, or branch…"
+            className="w-full px-2.5 py-2 border rounded-lg text-sm" />
+        </div>
+        <button onClick={() => downloadCSV(filtered, `officer-scorecard-${period.end}.csv`)}
+          className="w-full py-2 bg-white border text-gray-700 rounded-lg text-sm font-medium hover:bg-gray-50 flex items-center justify-center gap-1">
+          <Download size={14} /> Export CSV
+        </button>
+      </div>
+
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <KpiCard icon={<Target />} label="Period CE%" color="teal"
+          value={formatPct(overallCe)} sub={`${formatLakhs(totals.collected)} of ${formatLakhs(totals.demand)} · click for detail`}
+          onClick={() => openDrill && openDrill({
+            periodStart: period.start, periodEnd: period.end,
+            from: period.start, to: period.end,
+            title: "Officer Period CE%",
+            subtitle: `${formatPct(overallCe)} across ${rows.length} officers`,
+          })} />
+        <KpiCard icon={<Activity />} label="Receipts Posted" color="indigo"
+          value={totals.receipts.toLocaleString()} sub={`${formatLakhs(totals.posted)} total · click for detail`}
+          onClick={() => openDrill && openDrill({
+            periodStart: period.start, periodEnd: period.end,
+            from: period.start, to: period.end,
+            title: "Receipts Posted",
+            subtitle: `${totals.receipts.toLocaleString()} receipts · ${formatLakhs(totals.posted)}`,
+          })} />
+        <KpiCard icon={<Wallet />} label="Cash Share" color="amber"
+          value={formatPct(overallCash)} sub={`${formatLakhs(totals.cash)} in cash · click cash receipts`}
+          onClick={() => openDrill && openDrill({
+            periodStart: period.start, periodEnd: period.end,
+            from: period.start, to: period.end,
+            mode: "CASH",
+            title: "Cash Receipts",
+            subtitle: `${formatPct(overallCash)} of posted · ${formatLakhs(totals.cash)}`,
+          })} />
+        <KpiCard icon={<Users />} label="Active Officers" color="red"
+          value={rows.length.toLocaleString()} sub={`${totals.accounts.toLocaleString()} accts in book · click for detail`}
+          onClick={() => openDrill && openDrill({
+            periodStart: period.start, periodEnd: period.end,
+            from: period.start, to: period.end,
+            title: "Active Officers",
+            subtitle: `${rows.length} officers · ${totals.accounts.toLocaleString()} accounts`,
+          })} />
+      </div>
+
+      <div className="bg-white rounded-xl border">
+        <div className="px-5 py-3 border-b flex items-center justify-between">
+          <h3 className="font-semibold text-gray-800">Officer Scorecard</h3>
+          <span className="text-xs text-gray-500">{loading ? "Loading…" : `${filtered.length} officers`}</span>
+        </div>
+        <div className="overflow-x-auto max-h-[560px] overflow-y-auto">
+          <table className="w-full text-xs">
+            <thead className="sticky top-0 bg-gray-50 text-gray-600 uppercase text-[10px] z-10">
+              <tr>
+                <th className="text-left px-3 py-2">{sortBtn("officer_name", "Officer")}</th>
+                <th className="text-left px-3 py-2">{sortBtn("branch_name", "Branch")}</th>
+                <th className="text-right px-3 py-2">{sortBtn("accounts", "Accts")}</th>
+                <th className="text-right px-3 py-2">{sortBtn("demand", "Demand")}</th>
+                <th className="text-right px-3 py-2">{sortBtn("collected", "Collected")}</th>
+                <th className="text-right px-3 py-2">{sortBtn("cePct", "CE%")}</th>
+                <th className="text-right px-3 py-2">{sortBtn("posted_amount", "Posted")}</th>
+                <th className="text-right px-3 py-2">{sortBtn("receipts", "Receipts")}</th>
+                <th className="text-right px-3 py-2">{sortBtn("cash_amount", "Cash")}</th>
+                <th className="text-right px-3 py-2">{sortBtn("cashPct", "Cash%")}</th>
+                <th className="text-right px-3 py-2">UPI</th>
+                <th className="text-right px-3 py-2">Cheque</th>
+                <th className="text-right px-3 py-2">{sortBtn("overdue_end", "OD End")}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.length === 0 ? (
+                <tr><td colSpan={13} className="text-center text-gray-400 py-6">No officer data.</td></tr>
+              ) : filtered.map((o, i) => (
+                <tr key={`${o.officer_code}-${i}`}
+                    onClick={() => openDrill && openDrill({
+                      branch: o.branch_name || undefined,
+                      periodStart: period.start, periodEnd: period.end,
+                      from: period.start, to: period.end,
+                      title: `Officer: ${o.officer_name || o.officer_code}`,
+                      subtitle: `${o.branch_name || ""} · ${o.officer_code || ""}`,
+                    })}
+                    className="border-t hover:bg-teal-50/50 cursor-pointer">
+                  <td className="px-3 py-1.5">
+                    <div className="font-medium text-gray-800">{o.officer_name || "—"}</div>
+                    <div className="text-[10px] text-gray-400">{o.officer_code}</div>
+                  </td>
+                  <td className="px-3 py-1.5">{o.branch_name || "—"}</td>
+                  <td className="px-3 py-1.5 text-right">{(o.accounts || 0).toLocaleString()}</td>
+                  <td className="px-3 py-1.5 text-right">{formatLakhs(o.demand)}</td>
+                  <td className="px-3 py-1.5 text-right text-teal-700 font-medium">{formatLakhs(o.collected)}</td>
+                  <td className={`px-3 py-1.5 text-right font-semibold ${ceColor(o.cePct)}`}>{o.cePct == null ? "—" : formatPct(o.cePct)}</td>
+                  <td className="px-3 py-1.5 text-right">{formatLakhs(o.posted_amount)}</td>
+                  <td className="px-3 py-1.5 text-right">{(o.receipts || 0).toLocaleString()}</td>
+                  <td className="px-3 py-1.5 text-right">{formatLakhs(o.cash_amount)}</td>
+                  <td className={`px-3 py-1.5 text-right font-semibold ${(o.cashPct ?? 0) > 70 ? "text-red-700" : (o.cashPct ?? 0) > 40 ? "text-amber-700" : "text-emerald-700"}`}>
+                    {o.cashPct == null ? "—" : formatPct(o.cashPct, 0)}
+                  </td>
+                  <td className="px-3 py-1.5 text-right">{formatLakhs(o.upi_amount)}</td>
+                  <td className="px-3 py-1.5 text-right">{formatLakhs(o.cheque_amount)}</td>
+                  <td className="px-3 py-1.5 text-right text-red-600">{formatLakhs(o.overdue_end)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <div className="px-5 py-2 border-t bg-gray-50 text-[11px] text-gray-500">
+          Tip: officers with <b>&gt;70% cash</b> are flagged red — consider UPI-first targets to cut cash handling risk.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── DailyCollectionsView ──────────────────────────────────────────────────
+// Day-by-day rupees collected with stacked mode breakdown + branch leaderboard
+// + overall mode mix pie. Highlights missed days in the selected window.
+function DailyCollectionsView({ branches, openDrill }) {
+  const [from, setFrom] = useState(() => { const d = new Date(); d.setDate(d.getDate() - 30); return d.toISOString().slice(0, 10); });
+  const [to, setTo] = useState(() => new Date().toISOString().slice(0, 10));
+  const [branch, setBranch] = useState("");
+  const [data, setData] = useState({ byDay: [], byBranch: [], modeMix: [] });
+  const [loading, setLoading] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const p = new URLSearchParams();
+      if (from) p.set("from", from);
+      if (to) p.set("to", to);
+      if (branch) p.set("branch", branch);
+      const j = await fetch(`${API_BASE}/od/analytics/daily-collections?${p.toString()}`).then(r => r.json());
+      setData({
+        byDay: Array.isArray(j?.byDay) ? j.byDay : [],
+        byBranch: Array.isArray(j?.byBranch) ? j.byBranch : [],
+        modeMix: Array.isArray(j?.modeMix) ? j.modeMix : [],
+      });
+    } finally { setLoading(false); }
+  }, [from, to, branch]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const totals = useMemo(() => data.byDay.reduce((a, r) => ({
+    total: a.total + (r.total || 0),
+    cash: a.cash + (r.cash || 0),
+    upi: a.upi + (r.upi || 0),
+    cheque: a.cheque + (r.cheque || 0),
+    receipts: a.receipts + (r.receipts || 0),
+    days: a.days + 1,
+  }), { total: 0, cash: 0, upi: 0, cheque: 0, receipts: 0, days: 0 }), [data.byDay]);
+
+  const avgPerDay = totals.days > 0 ? totals.total / totals.days : 0;
+  const peakDay = useMemo(() => data.byDay.reduce((m, r) => (!m || (r.total || 0) > (m.total || 0)) ? r : m, null), [data.byDay]);
+
+  // Build a continuous daily series from (from..to) and mark missed days
+  const dailySeries = useMemo(() => {
+    if (!from || !to) return [];
+    const map = new Map(data.byDay.map(r => [r.day, r]));
+    const out = [];
+    const start = new Date(from), end = new Date(to);
+    for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+      const iso = d.toISOString().slice(0, 10);
+      const r = map.get(iso);
+      out.push({
+        day: iso.slice(5), // MM-DD
+        total: r?.total || 0, cash: r?.cash || 0, upi: r?.upi || 0, cheque: r?.cheque || 0,
+        missed: !r || !r.total,
+      });
+    }
+    return out;
+  }, [data.byDay, from, to]);
+
+  const missedDays = dailySeries.filter(d => d.missed).length;
+
+  return (
+    <div className="space-y-4">
+      <div className="bg-white rounded-xl border p-4 grid grid-cols-2 md:grid-cols-5 gap-3 items-end">
+        <div>
+          <label className="block text-xs text-gray-500 mb-1">From</label>
+          <input type="date" value={from} onChange={e => setFrom(e.target.value)}
+            className="w-full px-2.5 py-2 border rounded-lg text-sm" />
+        </div>
+        <div>
+          <label className="block text-xs text-gray-500 mb-1">To</label>
+          <input type="date" value={to} onChange={e => setTo(e.target.value)}
+            className="w-full px-2.5 py-2 border rounded-lg text-sm" />
+        </div>
+        <div>
+          <label className="block text-xs text-gray-500 mb-1">Branch</label>
+          <select value={branch} onChange={e => setBranch(e.target.value)}
+            className="w-full px-2.5 py-2 border rounded-lg text-sm">
+            <option value="">All Branches</option>
+            {branches?.map(b => <option key={b} value={b}>{b}</option>)}
+          </select>
+        </div>
+        <div className="md:col-span-1 text-xs text-gray-500">
+          {loading ? "Loading…" : (
+            <>{totals.receipts.toLocaleString()} receipts · {formatLakhs(totals.total)} · {missedDays} day(s) with zero</>
+          )}
+        </div>
+        <button onClick={load}
+          className="w-full py-2 bg-teal-600 text-white rounded-lg text-sm font-medium hover:bg-teal-700">
+          Refresh
+        </button>
+      </div>
+
+      {/* Headline */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <KpiCard icon={<DollarSign />} label="Total Collected" color="teal"
+          value={formatLakhs(totals.total)} sub={`${totals.receipts.toLocaleString()} receipts · click for detail`}
+          onClick={() => openDrill && openDrill({
+            branch: branch || undefined,
+            from, to,
+            title: "Total Collected",
+            subtitle: `${formatDateDMY(from)} → ${formatDateDMY(to)}${branch ? " · " + branch : ""}`,
+          })} />
+        <KpiCard icon={<TrendingUp />} label="Daily Avg" color="indigo"
+          value={formatLakhs(avgPerDay)} sub={`${totals.days} day(s) with activity · click for detail`}
+          onClick={() => openDrill && openDrill({
+            branch: branch || undefined,
+            from, to,
+            title: "Daily Average",
+            subtitle: `${formatLakhs(avgPerDay)}/day across ${totals.days} active days`,
+          })} />
+        <KpiCard icon={<Wallet />} label="Cash / UPI Split" color="amber"
+          value={totals.total > 0 ? `${((totals.cash/totals.total)*100).toFixed(0)}% / ${((totals.upi/totals.total)*100).toFixed(0)}%` : "—"}
+          sub={`Cash ${formatLakhs(totals.cash)} · UPI ${formatLakhs(totals.upi)} · click cash`}
+          onClick={() => openDrill && openDrill({
+            branch: branch || undefined,
+            from, to,
+            mode: "CASH",
+            title: "Cash Receipts",
+            subtitle: `${formatLakhs(totals.cash)} · ${((totals.cash/Math.max(totals.total,1))*100).toFixed(0)}% of total`,
+          })} />
+        <KpiCard icon={<Target />} label="Peak Day" color="red"
+          value={peakDay ? formatLakhs(peakDay.total) : "—"}
+          sub={peakDay ? `${formatDateDMY(peakDay.day)} · click for detail` : ""}
+          onClick={peakDay ? () => openDrill && openDrill({
+            branch: branch || undefined,
+            from: peakDay.day, to: peakDay.day,
+            title: `Peak day: ${formatDateDMY(peakDay.day)}`,
+            subtitle: `${formatLakhs(peakDay.total)} collected · ${peakDay.receipts || 0} receipts`,
+          }) : undefined} />
+      </div>
+
+      {/* Daily stacked bars */}
+      <div className="bg-white rounded-xl border p-4">
+        <div className="flex items-center justify-between mb-3">
+          <div>
+            <h3 className="font-semibold text-gray-800">Daily Collections (stacked by mode)</h3>
+            <p className="text-xs text-gray-500">Days with zero receipts are rendered as gaps — useful for spotting off-days or posting lags.</p>
+          </div>
+          <button onClick={() => downloadCSV(data.byDay, `daily-collections-${from}_${to}.csv`)}
+            className="text-xs text-teal-700 flex items-center gap-1"><Download size={12} /> CSV</button>
+        </div>
+        <ResponsiveContainer width="100%" height={320}>
+          <BarChart data={dailySeries}>
+            <CartesianGrid strokeDasharray="3 3" />
+            <XAxis dataKey="day" fontSize={10} />
+            <YAxis fontSize={10} tickFormatter={v => `${Math.round(v / 100000)}L`} />
+            <Tooltip formatter={v => formatLakhs(v)} />
+            <Legend />
+            <Bar dataKey="cash" stackId="a" fill="#f59e0b" name="Cash" />
+            <Bar dataKey="upi" stackId="a" fill="#10b981" name="UPI" />
+            <Bar dataKey="cheque" stackId="a" fill="#6366f1" name="Cheque/DD" />
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+
+      {/* Branch leaderboard + mode mix pie */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+        <div className="bg-white rounded-xl border p-4 lg:col-span-2">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="font-semibold text-gray-800">Top Branches — Period</h3>
+            <button onClick={() => downloadCSV(data.byBranch, `branch-collections-${from}_${to}.csv`)}
+              className="text-xs text-teal-700 flex items-center gap-1"><Download size={12} /> CSV</button>
+          </div>
+          <div className="overflow-y-auto max-h-80">
+            <table className="w-full text-xs">
+              <thead className="sticky top-0 bg-white">
+                <tr className="text-left text-gray-500 border-b">
+                  <th className="py-2 pr-2">Branch</th>
+                  <th className="py-2 pr-2 text-right">Receipts</th>
+                  <th className="py-2 pr-2 text-right">Total</th>
+                  <th className="py-2 pr-2 text-right">Cash</th>
+                  <th className="py-2 pr-2 text-right">UPI</th>
+                  <th className="py-2 pr-2 text-right">Cheque</th>
+                  <th className="py-2 pr-2 text-right">Cash%</th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.byBranch.length === 0 ? (
+                  <tr><td colSpan={7} className="py-4 text-center text-gray-400">None.</td></tr>
+                ) : data.byBranch.slice(0, 100).map((b, i) => {
+                  const cashPct = b.total > 0 ? (b.cash / b.total) * 100 : 0;
+                  return (
+                    <tr key={i} className="border-b hover:bg-teal-50/50 cursor-pointer"
+                        onClick={() => openDrill && openDrill({
+                          branch: b.branch, from, to,
+                          title: `Branch: ${b.branch}`,
+                          subtitle: `Receipts ${formatDateDMY(from)} → ${formatDateDMY(to)}`,
+                        })}>
+                      <td className="py-1.5 pr-2 font-medium">{b.branch}</td>
+                      <td className="py-1.5 pr-2 text-right">{(b.receipts || 0).toLocaleString()}</td>
+                      <td className="py-1.5 pr-2 text-right text-teal-700 font-medium">{formatLakhs(b.total)}</td>
+                      <td className="py-1.5 pr-2 text-right">{formatLakhs(b.cash)}</td>
+                      <td className="py-1.5 pr-2 text-right">{formatLakhs(b.upi)}</td>
+                      <td className="py-1.5 pr-2 text-right">{formatLakhs(b.cheque)}</td>
+                      <td className={`py-1.5 pr-2 text-right font-semibold ${cashPct > 70 ? "text-red-600" : cashPct > 40 ? "text-amber-600" : "text-emerald-700"}`}>
+                        {cashPct.toFixed(0)}%
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div className="bg-white rounded-xl border p-4">
+          <h3 className="font-semibold text-gray-800 mb-3">Mode Mix</h3>
+          {data.modeMix.length === 0 ? (
+            <div className="text-gray-400 text-sm">No data.</div>
+          ) : (
+            <>
+              <ResponsiveContainer width="100%" height={200}>
+                <PieChart>
+                  <Pie data={data.modeMix} cx="50%" cy="50%" innerRadius={50} outerRadius={80}
+                    dataKey="total" nameKey="mode"
+                    paddingAngle={1} minAngle={2}
+                    isAnimationActive={false}>
+                    {data.modeMix.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
+                  </Pie>
+                  <Tooltip formatter={(v, n) => [formatLakhs(v), n]} />
+                </PieChart>
+              </ResponsiveContainer>
+              <div className="mt-3 space-y-1 text-xs">
+                {data.modeMix.map((m, i) => {
+                  const pct = totals.total > 0 ? (m.total / totals.total) * 100 : 0;
+                  return (
+                    <div key={i} className="flex items-center justify-between">
+                      <div className="flex items-center gap-1.5">
+                        <span className="w-2 h-2 rounded-full" style={{ backgroundColor: COLORS[i % COLORS.length] }} />
+                        <span className="text-gray-700">{m.mode}</span>
+                      </div>
+                      <span className="text-gray-500">{formatLakhs(m.total)} <span className="text-gray-400">({pct.toFixed(0)}%)</span></span>
+                    </div>
+                  );
+                })}
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── RiskTriageView ────────────────────────────────────────────────────────
+// NPA ageing + death-case tracker + installments-due distribution
+// — driven by the Overdue Report snapshot.
+function RiskTriageView({ openDrill }) {
+  const [snap, setSnap] = useState("");
+  const [ageing, setAgeing] = useState(null);
+  const [deaths, setDeaths] = useState(null);
+  const [inst, setInst] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const q = snap ? `?snapshotDate=${snap}` : "";
+      const [ag, de, ins] = await Promise.all([
+        fetch(`${API_BASE}/od/analytics/npa-ageing${q}`).then(r => r.json()).catch(() => null),
+        fetch(`${API_BASE}/od/analytics/death-cases${q}`).then(r => r.json()).catch(() => null),
+        fetch(`${API_BASE}/od/analytics/installments-due${q}`).then(r => r.json()).catch(() => null),
+      ]);
+      setAgeing(ag); setDeaths(de); setInst(ins);
+      if (!snap && ag?.snapshotDate) setSnap(ag.snapshotDate);
+    } finally { setLoading(false); }
+  }, [snap]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const ageingChart = useMemo(() => {
+    if (!ageing?.buckets) return [];
+    return ageing.buckets.map(b => ({
+      name: b.bucket,
+      accounts: b.accounts || 0,
+      principalL: Math.round((b.principal || 0) / 100000),
+      totalOd: (b.principal || 0) + (b.interest || 0),
+    }));
+  }, [ageing]);
+
+  const instChart = useMemo(() => {
+    if (!inst?.buckets) return [];
+    return inst.buckets.map(b => ({
+      name: b.bucket,
+      accounts: b.accounts || 0,
+      principalL: Math.round((b.principal || 0) / 100000),
+    }));
+  }, [inst]);
+
+  const ageingTotals = useMemo(() => (ageing?.buckets || []).reduce((a, b) => ({
+    accounts: a.accounts + (b.accounts || 0),
+    principal: a.principal + (b.principal || 0),
+    interest: a.interest + (b.interest || 0),
+  }), { accounts: 0, principal: 0, interest: 0 }), [ageing]);
+
+  const overTwelve = (ageing?.buckets || [])
+    .filter(b => b.bucket === "12-24 months" || b.bucket === "24+ months")
+    .reduce((a, b) => ({ accounts: a.accounts + (b.accounts || 0), principal: a.principal + (b.principal || 0) }), { accounts: 0, principal: 0 });
+
+  return (
+    <div className="space-y-4">
+      <div className="bg-white rounded-xl border p-4 flex items-end gap-3">
+        <div className="flex-1">
+          <label className="block text-xs text-gray-500 mb-1">Snapshot Date (Overdue Report)</label>
+          <input type="date" value={snap} onChange={e => setSnap(e.target.value)}
+            className="w-full md:w-56 px-2.5 py-2 border rounded-lg text-sm" />
+        </div>
+        <div className="flex-1 text-xs text-gray-500">
+          {loading ? "Loading…" : ageing?.snapshotDate ? (
+            <>Snapshot: <b>{formatDateDMY(ageing.snapshotDate)}</b> · {ageing.totalNpaAccounts?.toLocaleString() || 0} NPA accts</>
+          ) : "—"}
+        </div>
+        <button onClick={load}
+          className="py-2 px-4 bg-teal-600 text-white rounded-lg text-sm font-medium hover:bg-teal-700">
+          Refresh
+        </button>
+      </div>
+
+      {/* Headline */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <KpiCard icon={<AlertTriangle />} label="NPA Accounts" color="red"
+          value={(ageing?.totalNpaAccounts || 0).toLocaleString()}
+          sub={`${formatLakhs(ageingTotals.principal + ageingTotals.interest)} total OD · click for customers`}
+          onClick={() => openDrill && openDrill({
+            npaOnly: true,
+            title: "NPA Accounts",
+            subtitle: `${(ageing?.totalNpaAccounts || 0).toLocaleString()} NPA · ${formatLakhs(ageingTotals.principal + ageingTotals.interest)} OD`,
+          })} />
+        <KpiCard icon={<Layers />} label="12-Month+ Stranded" color="amber"
+          value={overTwelve.accounts.toLocaleString()}
+          sub={`${formatLakhs(overTwelve.principal)} principal · click for customers`}
+          onClick={() => openDrill && openDrill({
+            npaOnly: true,
+            minMonthsStranded: 12,
+            title: "12-Month+ Stranded NPA",
+            subtitle: `${overTwelve.accounts.toLocaleString()} accounts · ${formatLakhs(overTwelve.principal)} principal`,
+          })} />
+        <KpiCard icon={<Skull />} label="Death Cases" color="indigo"
+          value={(deaths?.totals?.accounts || 0).toLocaleString()}
+          sub={`${formatLakhs(deaths?.totals?.principal || 0)} principal · click for customers`}
+          onClick={() => openDrill && openDrill({
+            deathOnly: true,
+            title: "Death Cases",
+            subtitle: `${(deaths?.totals?.accounts || 0).toLocaleString()} cases · ${formatLakhs(deaths?.totals?.principal || 0)} principal`,
+          })} />
+        <KpiCard icon={<Clock />} label="Installments Due > 6" color="teal"
+          value={((inst?.buckets || []).filter(b => b.min >= 7).reduce((s, b) => s + b.accounts, 0)).toLocaleString()}
+          sub="Long-dormant / structural defaulters · click for customers"
+          onClick={() => openDrill && openDrill({
+            minInstallmentsDue: 7,
+            title: "Installments Due > 6",
+            subtitle: "Long-dormant / structural defaulters",
+          })} />
+      </div>
+
+      {/* NPA ageing + Installments-due side by side */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div className="bg-white rounded-xl border p-4">
+          <div className="flex items-center justify-between mb-3">
+            <div>
+              <h3 className="font-semibold text-gray-800">NPA Ageing</h3>
+              <p className="text-xs text-gray-500">Bucketed by months since First NPA Date — older buckets are harder to recover.</p>
+            </div>
+            <button onClick={() => downloadCSV(ageing?.buckets || [], `npa-ageing-${snap}.csv`)}
+              className="text-xs text-teal-700 flex items-center gap-1"><Download size={12} /> CSV</button>
+          </div>
+          <ResponsiveContainer width="100%" height={260}>
+            <BarChart data={ageingChart}>
+              <CartesianGrid strokeDasharray="3 3" />
+              <XAxis dataKey="name" fontSize={11} />
+              <YAxis yAxisId="l" fontSize={11} />
+              <YAxis yAxisId="r" orientation="right" fontSize={11} />
+              <Tooltip />
+              <Legend />
+              <Bar yAxisId="l" dataKey="accounts" fill="#ef4444" name="Accounts" />
+              <Bar yAxisId="r" dataKey="principalL" fill="#f59e0b" name="Principal (L)" />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+
+        <div className="bg-white rounded-xl border p-4">
+          <div className="flex items-center justify-between mb-3">
+            <div>
+              <h3 className="font-semibold text-gray-800">Installments Due — distribution</h3>
+              <p className="text-xs text-gray-500">1 installment = skipped once; 7+ = structural defaulter needing escalation.</p>
+            </div>
+            <button onClick={() => downloadCSV(inst?.buckets || [], `installments-due-${snap}.csv`)}
+              className="text-xs text-teal-700 flex items-center gap-1"><Download size={12} /> CSV</button>
+          </div>
+          <ResponsiveContainer width="100%" height={260}>
+            <BarChart data={instChart}>
+              <CartesianGrid strokeDasharray="3 3" />
+              <XAxis dataKey="name" fontSize={11} />
+              <YAxis yAxisId="l" fontSize={11} />
+              <YAxis yAxisId="r" orientation="right" fontSize={11} />
+              <Tooltip />
+              <Legend />
+              <Bar yAxisId="l" dataKey="accounts" fill="#0f766e" name="Accounts" />
+              <Bar yAxisId="r" dataKey="principalL" fill="#8b5cf6" name="Principal (L)" />
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+
+      {/* NPA stranded top + Death cases */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div className="bg-white rounded-xl border p-4">
+          <div className="flex items-center justify-between mb-3">
+            <div>
+              <h3 className="font-semibold text-gray-800">Top Stranded NPA Accounts</h3>
+              <p className="text-xs text-gray-500">Longest time as NPA — write-off / legal-notice candidates.</p>
+            </div>
+            <button onClick={() => downloadCSV(ageing?.top || [], `npa-stranded-${snap}.csv`)}
+              className="text-xs text-teal-700 flex items-center gap-1"><Download size={12} /> CSV</button>
+          </div>
+          <div className="overflow-y-auto max-h-80">
+            <table className="w-full text-xs">
+              <thead className="sticky top-0 bg-white">
+                <tr className="text-left text-gray-500 border-b">
+                  <th className="py-2 pr-2">Customer</th>
+                  <th className="py-2 pr-2">Branch / Officer</th>
+                  <th className="py-2 pr-2 text-right">Months NPA</th>
+                  <th className="py-2 pr-2 text-right">Principal</th>
+                  <th className="py-2 pr-2 text-right">Inst. Due</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(ageing?.top || []).length === 0 ? (
+                  <tr><td colSpan={5} className="py-4 text-center text-gray-400">None.</td></tr>
+                ) : ageing.top.map((r, i) => (
+                  <tr key={i} className="border-b hover:bg-red-50/50 cursor-pointer"
+                      onClick={() => openDrill && openDrill({
+                        branch: r.branch_name,
+                        title: r.customer_name || r.loan_account_no,
+                        subtitle: `NPA · ${r.branch_name} · ${r.officer_name || ""}`,
+                      })}>
+                    <td className="py-1.5 pr-2">
+                      <div className="font-medium">{r.customer_name || "—"}</div>
+                      <div className="text-[10px] text-gray-400">{r.loan_account_no}</div>
+                    </td>
+                    <td className="py-1.5 pr-2">
+                      <div>{r.branch_name}</div>
+                      <div className="text-[10px] text-gray-400">{r.officer_name}</div>
+                    </td>
+                    <td className="py-1.5 pr-2 text-right font-semibold text-red-700">
+                      {r.monthsAsNpa != null ? r.monthsAsNpa.toFixed(1) : "—"}
+                    </td>
+                    <td className="py-1.5 pr-2 text-right">{formatINR(r.principal_outstanding)}</td>
+                    <td className="py-1.5 pr-2 text-right">{r.installments_due}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div className="bg-white rounded-xl border p-4">
+          <div className="flex items-center justify-between mb-3">
+            <div>
+              <h3 className="font-semibold text-gray-800">Death Cases</h3>
+              <p className="text-xs text-gray-500">Flagged as deceased — insurance claim / guarantor pursuit candidates.</p>
+            </div>
+            <button onClick={() => downloadCSV(deaths?.rows || [], `death-cases-${snap}.csv`)}
+              className="text-xs text-teal-700 flex items-center gap-1"><Download size={12} /> CSV</button>
+          </div>
+          <div className="overflow-y-auto max-h-80">
+            <table className="w-full text-xs">
+              <thead className="sticky top-0 bg-white">
+                <tr className="text-left text-gray-500 border-b">
+                  <th className="py-2 pr-2">Customer / Loan</th>
+                  <th className="py-2 pr-2">Branch</th>
+                  <th className="py-2 pr-2">Flagged</th>
+                  <th className="py-2 pr-2 text-right">Principal</th>
+                  <th className="py-2 pr-2 text-right">Interest</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(deaths?.rows || []).length === 0 ? (
+                  <tr><td colSpan={5} className="py-4 text-center text-gray-400">None.</td></tr>
+                ) : deaths.rows.map((r, i) => (
+                  <tr key={i} className="border-b hover:bg-indigo-50/50 cursor-pointer"
+                      onClick={() => openDrill && openDrill({
+                        branch: r.branch_name,
+                        title: r.customer_name || r.loan_account_no,
+                        subtitle: `Death case · ${r.branch_name}${r.guarantor_name ? " · Guar: " + r.guarantor_name : ""}`,
+                      })}>
+                    <td className="py-1.5 pr-2">
+                      <div className="font-medium">{r.customer_name || "—"}</div>
+                      <div className="text-[10px] text-gray-400">{r.loan_account_no}</div>
+                      {r.guarantor_name && <div className="text-[10px] text-gray-500">Guar: {r.guarantor_name}</div>}
+                    </td>
+                    <td className="py-1.5 pr-2">{r.branch_name}</td>
+                    <td className="py-1.5 pr-2 text-gray-600">{r.death_flagged_date ? formatDateDMY(r.death_flagged_date) : "—"}</td>
+                    <td className="py-1.5 pr-2 text-right">{formatINR(r.principal_outstanding)}</td>
+                    <td className="py-1.5 pr-2 text-right">{formatINR(r.interest_outstanding)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── BranchPerformanceView ─────────────────────────────────────────────────
+// Per-branch scorecard with click-through to customer-level detail.
+function BranchPerformanceView({ openDrill }) {
+  const { periods, latest } = useLatestPeriod();
+  const [period, setPeriod] = useState({ start: "", end: "" });
+  const [rows, setRows] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [query, setQuery] = useState("");
+  const [sortKey, setSortKey] = useState("principal_outstanding");
+  const [sortDir, setSortDir] = useState("desc");
+
+  useEffect(() => {
+    if (latest && !period.start) setPeriod({ start: latest.period_start, end: latest.period_end });
+  }, [latest]); // eslint-disable-line
+
+  const load = useCallback(async () => {
+    if (!period.start || !period.end) return;
+    setLoading(true);
+    try {
+      const j = await fetch(`${API_BASE}/od/analytics/branch-scorecard?periodStart=${period.start}&periodEnd=${period.end}`).then(r => r.json());
+      setRows(Array.isArray(j?.rows) ? j.rows : []);
+    } finally { setLoading(false); }
+  }, [period.start, period.end]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    let arr = q ? rows.filter(r => (r.branch || "").toLowerCase().includes(q)) : [...rows];
+    arr.sort((a, b) => {
+      const av = a[sortKey], bv = b[sortKey];
+      const an = Number(av), bn = Number(bv);
+      const numeric = Number.isFinite(an) && Number.isFinite(bn);
+      const cmp = numeric ? an - bn : String(av ?? "").localeCompare(String(bv ?? ""));
+      return sortDir === "asc" ? cmp : -cmp;
+    });
+    return arr;
+  }, [rows, query, sortKey, sortDir]);
+
+  const totals = useMemo(() => rows.reduce((a, r) => ({
+    accounts: a.accounts + (r.accounts || 0),
+    principal_outstanding: a.principal_outstanding + (r.principal_outstanding || 0),
+    demand: a.demand + (r.demand || 0),
+    collected: a.collected + (r.collected || 0),
+    principal_overdue: a.principal_overdue + (r.principal_overdue || 0),
+    interest_overdue: a.interest_overdue + (r.interest_overdue || 0),
+    receipts: a.receipts + (r.receipts || 0),
+    posted_amount: a.posted_amount + (r.posted_amount || 0),
+    cash_amount: a.cash_amount + (r.cash_amount || 0),
+    npa_accounts: a.npa_accounts + (r.npa_accounts || 0),
+  }), { accounts: 0, principal_outstanding: 0, demand: 0, collected: 0, principal_overdue: 0, interest_overdue: 0, receipts: 0, posted_amount: 0, cash_amount: 0, npa_accounts: 0 }), [rows]);
+
+  const overallCe = totals.demand > 0 ? (totals.collected / totals.demand) * 100 : null;
+  const overallCash = totals.posted_amount > 0 ? (totals.cash_amount / totals.posted_amount) * 100 : null;
+  const worst = useMemo(() => rows.filter(r => r.cePct != null).sort((a, b) => a.cePct - b.cePct)[0] || null, [rows]);
+  const best = useMemo(() => rows.filter(r => r.cePct != null && r.demand > 0).sort((a, b) => b.cePct - a.cePct)[0] || null, [rows]);
+
+  const chartData = useMemo(() => filtered.slice(0, 20).map(r => ({
+    branch: r.branch.length > 18 ? r.branch.slice(0, 16) + "…" : r.branch,
+    fullBranch: r.branch,
+    odL: Math.round(((r.principal_overdue || 0) + (r.interest_overdue || 0)) / 100000),
+    cePct: Number(r.cePct || 0),
+  })), [filtered]);
+
+  const drill = (branch, titleSuffix = "") => openDrill({
+    branch,
+    periodStart: period.start,
+    periodEnd: period.end,
+    from: period.start,
+    to: period.end,
+    title: `Branch: ${branch}`,
+    subtitle: titleSuffix || `${formatDateDMY(period.start)} → ${formatDateDMY(period.end)}`,
+  });
+
+  const sortBtn = (key, label) => (
+    <button
+      onClick={() => {
+        if (sortKey === key) setSortDir(sortDir === "asc" ? "desc" : "asc");
+        else { setSortKey(key); setSortDir("desc"); }
+      }}
+      className={`flex items-center gap-0.5 ${sortKey === key ? "text-teal-700 font-semibold" : "text-gray-500"}`}>
+      {label}{sortKey === key ? (sortDir === "asc" ? " ▲" : " ▼") : ""}
+    </button>
+  );
+
+  return (
+    <div className="space-y-4">
+      {/* Period selector */}
+      <div className="bg-white rounded-xl border p-4 grid grid-cols-2 md:grid-cols-4 gap-3 items-end">
+        <div>
+          <label className="block text-xs text-gray-500 mb-1">Period</label>
+          <select
+            value={period.start && period.end ? `${period.start}__${period.end}` : ""}
+            onChange={e => { const [s, ed] = e.target.value.split("__"); setPeriod({ start: s, end: ed }); }}
+            className="w-full px-2.5 py-2 border rounded-lg text-sm">
+            {periods.length === 0 && <option>No periods uploaded</option>}
+            {periods.map(p => (
+              <option key={`${p.period_start}__${p.period_end}`} value={`${p.period_start}__${p.period_end}`}>
+                {formatDateDMY(p.period_start)} → {formatDateDMY(p.period_end)}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <label className="block text-xs text-gray-500 mb-1">Search branch</label>
+          <input type="text" value={query} onChange={e => setQuery(e.target.value)}
+            placeholder="Branch name…"
+            className="w-full px-2.5 py-2 border rounded-lg text-sm" />
+        </div>
+        <div className="text-xs text-gray-500 self-center">
+          {loading ? "Loading…" : `${rows.length} branches tracked`}
+        </div>
+        <button onClick={() => downloadCSV(filtered, `branch-scorecard-${period.end}.csv`)}
+          className="w-full py-2 bg-white border text-gray-700 rounded-lg text-sm font-medium hover:bg-gray-50 flex items-center justify-center gap-1">
+          <Download size={14} /> Export CSV
+        </button>
+      </div>
+
+      {/* Headline KPIs (clickable) */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <KpiCard icon={<Building2 />} label="Branches Tracked" color="teal"
+          value={rows.length.toLocaleString()}
+          sub={`${totals.accounts.toLocaleString()} accounts · ${formatLakhs(totals.principal_outstanding)} book`}
+          onClick={() => openDrill({
+            periodStart: period.start, periodEnd: period.end,
+            from: period.start, to: period.end,
+            title: "All Branches",
+            subtitle: `${rows.length} branches · ${totals.accounts.toLocaleString()} accounts`,
+          })} />
+        <KpiCard icon={<Target />} label="Portfolio CE%" color="indigo"
+          value={formatPct(overallCe)}
+          sub={`${formatLakhs(totals.collected)} of ${formatLakhs(totals.demand)} · click for detail`}
+          onClick={() => openDrill({
+            periodStart: period.start, periodEnd: period.end,
+            from: period.start, to: period.end,
+            title: "Portfolio Collection Efficiency",
+            subtitle: `${formatPct(overallCe)} — all branches combined`,
+          })} />
+        <KpiCard icon={<AlertTriangle />} label="Weakest Branch" color="red"
+          value={worst ? `${worst.branch} — ${formatPct(worst.cePct, 0)}` : "—"}
+          sub={worst ? `OD ${formatLakhs((worst.principal_overdue || 0) + (worst.interest_overdue || 0))}` : ""}
+          onClick={worst ? () => drill(worst.branch, "Weakest branch by CE%") : undefined} />
+        <KpiCard icon={<CheckCircle />} label="Strongest Branch" color="amber"
+          value={best ? `${best.branch} — ${formatPct(best.cePct, 0)}` : "—"}
+          sub={best ? `${(best.accounts || 0).toLocaleString()} accounts · ${formatLakhs(best.collected)} collected` : ""}
+          onClick={best ? () => drill(best.branch, "Strongest branch by CE%") : undefined} />
+      </div>
+
+      {/* Ranked chart */}
+      <div className="bg-white rounded-xl border p-4">
+        <div className="flex items-center justify-between mb-3">
+          <div>
+            <h3 className="font-semibold text-gray-800">Branch OD Exposure & CE%</h3>
+            <p className="text-xs text-gray-500">Top 20 by overdue. Click any bar to drilldown.</p>
+          </div>
+          <span className="text-xs text-gray-500">{filtered.length} shown</span>
+        </div>
+        <ResponsiveContainer width="100%" height={Math.max(280, chartData.length * 24)}>
+          <BarChart data={chartData} layout="vertical" margin={{ left: 90 }}>
+            <CartesianGrid strokeDasharray="3 3" />
+            <XAxis type="number" fontSize={10} />
+            <YAxis dataKey="branch" type="category" fontSize={10} width={120} />
+            <Tooltip
+              formatter={(v, n) => n === "CE%" ? [`${Number(v).toFixed(1)}%`, "CE%"] : [`Rs. ${v}L`, "OD"]}
+              labelFormatter={(l, p) => p?.[0]?.payload?.fullBranch || l} />
+            <Legend />
+            <Bar dataKey="odL" fill="#ef4444" name="OD (L)" radius={[0, 4, 4, 0]}
+              onClick={(d) => d?.fullBranch && drill(d.fullBranch)}
+              style={{ cursor: "pointer" }} />
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+
+      {/* Scorecard table */}
+      <div className="bg-white rounded-xl border">
+        <div className="px-5 py-3 border-b flex items-center justify-between">
+          <h3 className="font-semibold text-gray-800">Branch Scorecard</h3>
+          <span className="text-xs text-gray-500">Cash% &gt; 70% flagged red. Click any row for detail.</span>
+        </div>
+        <div className="overflow-x-auto max-h-[560px] overflow-y-auto">
+          <table className="w-full text-xs">
+            <thead className="sticky top-0 bg-gray-50 text-gray-600 uppercase text-[10px] z-10">
+              <tr>
+                <th className="text-left px-3 py-2">{sortBtn("branch", "Branch")}</th>
+                <th className="text-right px-3 py-2">{sortBtn("accounts", "Accts")}</th>
+                <th className="text-right px-3 py-2">{sortBtn("officers", "Officers")}</th>
+                <th className="text-right px-3 py-2">{sortBtn("principal_outstanding", "Book (P.O/S)")}</th>
+                <th className="text-right px-3 py-2">{sortBtn("demand", "Demand")}</th>
+                <th className="text-right px-3 py-2">{sortBtn("collected", "Collected")}</th>
+                <th className="text-right px-3 py-2">{sortBtn("cePct", "CE%")}</th>
+                <th className="text-right px-3 py-2">{sortBtn("principal_overdue", "OD (P+I)")}</th>
+                <th className="text-right px-3 py-2">{sortBtn("receipts", "Receipts")}</th>
+                <th className="text-right px-3 py-2">{sortBtn("cashPct", "Cash%")}</th>
+                <th className="text-right px-3 py-2">{sortBtn("npa_accounts", "NPA")}</th>
+                <th className="text-right px-3 py-2"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.length === 0 ? (
+                <tr><td colSpan={12} className="text-center text-gray-400 py-6">No branch data. Upload a Client-Wise Collection Report to populate.</td></tr>
+              ) : filtered.map((r, i) => {
+                const od = (r.principal_overdue || 0) + (r.interest_overdue || 0);
+                return (
+                  <tr key={r.branch + "-" + i}
+                      onClick={() => drill(r.branch)}
+                      className="border-t hover:bg-teal-50/50 cursor-pointer group">
+                    <td className="px-3 py-1.5 font-medium text-gray-800 group-hover:text-teal-800">{r.branch}</td>
+                    <td className="px-3 py-1.5 text-right">{(r.accounts || 0).toLocaleString()}</td>
+                    <td className="px-3 py-1.5 text-right">{r.officers || 0}</td>
+                    <td className="px-3 py-1.5 text-right">{formatLakhs(r.principal_outstanding)}</td>
+                    <td className="px-3 py-1.5 text-right">{formatLakhs(r.demand)}</td>
+                    <td className="px-3 py-1.5 text-right text-teal-700 font-medium">{formatLakhs(r.collected)}</td>
+                    <td className={`px-3 py-1.5 text-right font-semibold ${ceColor(r.cePct)}`}>{r.cePct == null ? "—" : formatPct(r.cePct, 1)}</td>
+                    <td className="px-3 py-1.5 text-right text-red-600">{formatLakhs(od)}</td>
+                    <td className="px-3 py-1.5 text-right">{(r.receipts || 0).toLocaleString()}</td>
+                    <td className={`px-3 py-1.5 text-right font-semibold ${(r.cashPct ?? 0) > 70 ? "text-red-700" : (r.cashPct ?? 0) > 40 ? "text-amber-700" : "text-emerald-700"}`}>
+                      {r.cashPct == null ? "—" : formatPct(r.cashPct, 0)}
+                    </td>
+                    <td className="px-3 py-1.5 text-right">{r.npa_accounts || 0}</td>
+                    <td className="px-3 py-1.5 text-right"><ChevronRight size={14} className="opacity-30 group-hover:opacity-100 text-teal-700" /></td>
+                  </tr>
+                );
+              })}
+            </tbody>
+            {filtered.length > 0 && (
+              <tfoot className="sticky bottom-0 bg-gray-50 font-semibold text-gray-800 text-[11px]">
+                <tr>
+                  <td className="px-3 py-2">Totals</td>
+                  <td className="px-3 py-2 text-right">{totals.accounts.toLocaleString()}</td>
+                  <td className="px-3 py-2 text-right">—</td>
+                  <td className="px-3 py-2 text-right">{formatLakhs(totals.principal_outstanding)}</td>
+                  <td className="px-3 py-2 text-right">{formatLakhs(totals.demand)}</td>
+                  <td className="px-3 py-2 text-right text-teal-700">{formatLakhs(totals.collected)}</td>
+                  <td className={`px-3 py-2 text-right ${ceColor(overallCe)}`}>{overallCe == null ? "—" : formatPct(overallCe, 1)}</td>
+                  <td className="px-3 py-2 text-right text-red-600">{formatLakhs(totals.principal_overdue + totals.interest_overdue)}</td>
+                  <td className="px-3 py-2 text-right">{totals.receipts.toLocaleString()}</td>
+                  <td className={`px-3 py-2 text-right ${(overallCash ?? 0) > 70 ? "text-red-700" : (overallCash ?? 0) > 40 ? "text-amber-700" : "text-emerald-700"}`}>
+                    {overallCash == null ? "—" : formatPct(overallCash, 0)}
+                  </td>
+                  <td className="px-3 py-2 text-right">{totals.npa_accounts}</td>
+                  <td></td>
+                </tr>
+              </tfoot>
+            )}
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── ProductPerformanceView ────────────────────────────────────────────────
+// Per-product scorecard + collections-by-product mode mix + branch × product
+// CE% heatmap. Cells and rows are clickable to open the shared drilldown.
+function ProductPerformanceView({ openDrill }) {
+  const { periods, latest } = useLatestPeriod();
+  const [period, setPeriod] = useState({ start: "", end: "" });
+  const [rows, setRows] = useState([]);
+  const [collByProduct, setCollByProduct] = useState([]);
+  const [matrix, setMatrix] = useState({ branches: [], products: [], matrix: [] });
+  const [loading, setLoading] = useState(false);
+  const [sortKey, setSortKey] = useState("principal_outstanding");
+  const [sortDir, setSortDir] = useState("desc");
+
+  useEffect(() => {
+    if (latest && !period.start) setPeriod({ start: latest.period_start, end: latest.period_end });
+  }, [latest]); // eslint-disable-line
+
+  const load = useCallback(async () => {
+    if (!period.start || !period.end) return;
+    setLoading(true);
+    try {
+      const qs = `periodStart=${period.start}&periodEnd=${period.end}`;
+      const [ps, cp, mx] = await Promise.all([
+        fetch(`${API_BASE}/od/analytics/product-scorecard?${qs}`).then(r => r.json()),
+        fetch(`${API_BASE}/od/analytics/collections-by-product?from=${period.start}&to=${period.end}`).then(r => r.json()),
+        fetch(`${API_BASE}/od/analytics/branch-product-matrix?${qs}`).then(r => r.json()),
+      ]);
+      setRows(Array.isArray(ps?.rows) ? ps.rows : []);
+      setCollByProduct(Array.isArray(cp?.rows) ? cp.rows : []);
+      setMatrix({
+        branches: Array.isArray(mx?.branches) ? mx.branches : [],
+        products: Array.isArray(mx?.products) ? mx.products : [],
+        matrix:   Array.isArray(mx?.matrix)   ? mx.matrix   : [],
+      });
+    } finally { setLoading(false); }
+  }, [period.start, period.end]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const sorted = useMemo(() => {
+    const arr = [...rows];
+    arr.sort((a, b) => {
+      const av = a[sortKey], bv = b[sortKey];
+      const an = Number(av), bn = Number(bv);
+      const numeric = Number.isFinite(an) && Number.isFinite(bn);
+      const cmp = numeric ? an - bn : String(av ?? "").localeCompare(String(bv ?? ""));
+      return sortDir === "asc" ? cmp : -cmp;
+    });
+    return arr;
+  }, [rows, sortKey, sortDir]);
+
+  const totals = useMemo(() => rows.reduce((a, r) => ({
+    accounts: a.accounts + (r.accounts || 0),
+    principal_outstanding: a.principal_outstanding + (r.principal_outstanding || 0),
+    demand: a.demand + (r.demand || 0),
+    collected: a.collected + (r.collected || 0),
+    principal_overdue: a.principal_overdue + (r.principal_overdue || 0),
+    interest_overdue: a.interest_overdue + (r.interest_overdue || 0),
+    receipts: a.receipts + (r.receipts || 0),
+    posted_amount: a.posted_amount + (r.posted_amount || 0),
+    cash_amount: a.cash_amount + (r.cash_amount || 0),
+  }), { accounts: 0, principal_outstanding: 0, demand: 0, collected: 0, principal_overdue: 0, interest_overdue: 0, receipts: 0, posted_amount: 0, cash_amount: 0 }), [rows]);
+
+  const overallCe = totals.demand > 0 ? (totals.collected / totals.demand) * 100 : null;
+  const worst = useMemo(() => rows.filter(r => r.cePct != null && r.demand > 0).sort((a, b) => a.cePct - b.cePct)[0] || null, [rows]);
+  const best = useMemo(() => rows.filter(r => r.cePct != null && r.demand > 0).sort((a, b) => b.cePct - a.cePct)[0] || null, [rows]);
+
+  // Build matrix lookup
+  const matrixLookup = useMemo(() => {
+    const m = new Map();
+    for (const c of matrix.matrix) {
+      m.set(`${c.branch}||${c.product}`, c);
+    }
+    return m;
+  }, [matrix.matrix]);
+
+  const drill = (product, branch) => openDrill({
+    product: product || undefined,
+    branch: branch || undefined,
+    periodStart: period.start,
+    periodEnd: period.end,
+    from: period.start,
+    to: period.end,
+    title: branch && product ? `${branch} × ${product}` : product ? `Product: ${product}` : `Branch: ${branch}`,
+    subtitle: `${formatDateDMY(period.start)} → ${formatDateDMY(period.end)}`,
+  });
+
+  const cellColor = (ce) => {
+    if (ce == null) return "bg-gray-50 text-gray-300";
+    if (ce >= 95) return "bg-emerald-600 text-white";
+    if (ce >= 85) return "bg-emerald-400 text-white";
+    if (ce >= 70) return "bg-amber-400 text-gray-900";
+    if (ce >= 50) return "bg-orange-500 text-white";
+    return "bg-red-600 text-white";
+  };
+
+  const sortBtn = (key, label) => (
+    <button
+      onClick={() => {
+        if (sortKey === key) setSortDir(sortDir === "asc" ? "desc" : "asc");
+        else { setSortKey(key); setSortDir("desc"); }
+      }}
+      className={`flex items-center gap-0.5 ${sortKey === key ? "text-teal-700 font-semibold" : "text-gray-500"}`}>
+      {label}{sortKey === key ? (sortDir === "asc" ? " ▲" : " ▼") : ""}
+    </button>
+  );
+
+  return (
+    <div className="space-y-4">
+      <div className="bg-white rounded-xl border p-4 grid grid-cols-2 md:grid-cols-4 gap-3 items-end">
+        <div>
+          <label className="block text-xs text-gray-500 mb-1">Period</label>
+          <select
+            value={period.start && period.end ? `${period.start}__${period.end}` : ""}
+            onChange={e => { const [s, ed] = e.target.value.split("__"); setPeriod({ start: s, end: ed }); }}
+            className="w-full px-2.5 py-2 border rounded-lg text-sm">
+            {periods.length === 0 && <option>No periods uploaded</option>}
+            {periods.map(p => (
+              <option key={`${p.period_start}__${p.period_end}`} value={`${p.period_start}__${p.period_end}`}>
+                {formatDateDMY(p.period_start)} → {formatDateDMY(p.period_end)}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="md:col-span-2 text-xs text-gray-500 self-center">
+          {loading ? "Loading…" : `${rows.length} products · ${matrix.branches.length} branches · ${matrix.matrix.length} branch×product intersections`}
+        </div>
+        <button onClick={() => downloadCSV(sorted, `product-scorecard-${period.end}.csv`)}
+          className="w-full py-2 bg-white border text-gray-700 rounded-lg text-sm font-medium hover:bg-gray-50 flex items-center justify-center gap-1">
+          <Download size={14} /> Export CSV
+        </button>
+      </div>
+
+      {/* Headline */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <KpiCard icon={<Package />} label="Products Tracked" color="teal"
+          value={rows.length.toLocaleString()}
+          sub={`${totals.accounts.toLocaleString()} accounts · ${formatLakhs(totals.principal_outstanding)} book`}
+          onClick={() => openDrill({
+            periodStart: period.start, periodEnd: period.end,
+            from: period.start, to: period.end,
+            title: "All Products",
+            subtitle: `${rows.length} products · ${totals.accounts.toLocaleString()} accounts`,
+          })} />
+        <KpiCard icon={<Target />} label="Portfolio CE%" color="indigo"
+          value={formatPct(overallCe)}
+          sub={`${formatLakhs(totals.collected)} of ${formatLakhs(totals.demand)} · click for detail`}
+          onClick={() => openDrill({
+            periodStart: period.start, periodEnd: period.end,
+            from: period.start, to: period.end,
+            title: "Portfolio CE% — Products",
+            subtitle: formatPct(overallCe),
+          })} />
+        <KpiCard icon={<CheckCircle />} label="Best Product" color="teal"
+          value={best ? `${best.product} — ${formatPct(best.cePct, 0)}` : "—"}
+          sub={best ? `${(best.accounts || 0).toLocaleString()} accounts` : ""}
+          onClick={best ? () => drill(best.product) : undefined} />
+        <KpiCard icon={<AlertTriangle />} label="Weakest Product" color="red"
+          value={worst ? `${worst.product} — ${formatPct(worst.cePct, 0)}` : "—"}
+          sub={worst ? `OD ${formatLakhs((worst.principal_overdue || 0) + (worst.interest_overdue || 0))}` : ""}
+          onClick={worst ? () => drill(worst.product) : undefined} />
+      </div>
+
+      {/* Product scorecard table */}
+      <div className="bg-white rounded-xl border">
+        <div className="px-5 py-3 border-b flex items-center justify-between">
+          <h3 className="font-semibold text-gray-800">Product Scorecard</h3>
+          <span className="text-xs text-gray-500">Click any row for detail.</span>
+        </div>
+        <div className="overflow-x-auto max-h-[480px] overflow-y-auto">
+          <table className="w-full text-xs">
+            <thead className="sticky top-0 bg-gray-50 text-gray-600 uppercase text-[10px] z-10">
+              <tr>
+                <th className="text-left px-3 py-2">{sortBtn("product", "Product")}</th>
+                <th className="text-right px-3 py-2">{sortBtn("accounts", "Accts")}</th>
+                <th className="text-right px-3 py-2">{sortBtn("branches", "Branches")}</th>
+                <th className="text-right px-3 py-2">{sortBtn("principal_outstanding", "Book")}</th>
+                <th className="text-right px-3 py-2">{sortBtn("demand", "Demand")}</th>
+                <th className="text-right px-3 py-2">{sortBtn("collected", "Collected")}</th>
+                <th className="text-right px-3 py-2">{sortBtn("cePct", "CE%")}</th>
+                <th className="text-right px-3 py-2">{sortBtn("principal_overdue", "OD (P)")}</th>
+                <th className="text-right px-3 py-2">{sortBtn("receipts", "Receipts")}</th>
+                <th className="text-right px-3 py-2">{sortBtn("cashPct", "Cash%")}</th>
+                <th className="text-right px-3 py-2">{sortBtn("npa_accounts", "NPA")}</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {sorted.length === 0 ? (
+                <tr><td colSpan={12} className="text-center text-gray-400 py-6">No product data. Upload a Client-Wise Collection Report to populate.</td></tr>
+              ) : sorted.map((r, i) => (
+                <tr key={r.product + "-" + i}
+                    onClick={() => drill(r.product)}
+                    className="border-t hover:bg-indigo-50/50 cursor-pointer group">
+                  <td className="px-3 py-1.5 font-medium text-gray-800 group-hover:text-indigo-800">{r.product}</td>
+                  <td className="px-3 py-1.5 text-right">{(r.accounts || 0).toLocaleString()}</td>
+                  <td className="px-3 py-1.5 text-right">{r.branches || 0}</td>
+                  <td className="px-3 py-1.5 text-right">{formatLakhs(r.principal_outstanding)}</td>
+                  <td className="px-3 py-1.5 text-right">{formatLakhs(r.demand)}</td>
+                  <td className="px-3 py-1.5 text-right text-teal-700 font-medium">{formatLakhs(r.collected)}</td>
+                  <td className={`px-3 py-1.5 text-right font-semibold ${ceColor(r.cePct)}`}>{r.cePct == null ? "—" : formatPct(r.cePct, 1)}</td>
+                  <td className="px-3 py-1.5 text-right text-red-600">{formatLakhs(r.principal_overdue)}</td>
+                  <td className="px-3 py-1.5 text-right">{(r.receipts || 0).toLocaleString()}</td>
+                  <td className={`px-3 py-1.5 text-right font-semibold ${(r.cashPct ?? 0) > 70 ? "text-red-700" : (r.cashPct ?? 0) > 40 ? "text-amber-700" : "text-emerald-700"}`}>
+                    {r.cashPct == null ? "—" : formatPct(r.cashPct, 0)}
+                  </td>
+                  <td className="px-3 py-1.5 text-right">{r.npa_accounts || 0}</td>
+                  <td className="px-3 py-1.5 text-right"><ChevronRight size={14} className="opacity-30 group-hover:opacity-100 text-indigo-700" /></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Collections by product */}
+      <div className="bg-white rounded-xl border">
+        <div className="px-5 py-3 border-b flex items-center justify-between">
+          <h3 className="font-semibold text-gray-800">Collections by Product — {formatDateDMY(period.start)} → {formatDateDMY(period.end)}</h3>
+          <button onClick={() => downloadCSV(collByProduct, `collections-by-product-${period.end}.csv`)}
+            className="text-xs text-teal-700 flex items-center gap-1"><Download size={12} /> CSV</button>
+        </div>
+        <div className="overflow-x-auto max-h-80 overflow-y-auto">
+          <table className="w-full text-xs">
+            <thead className="sticky top-0 bg-gray-50 text-gray-600 uppercase text-[10px] z-10">
+              <tr>
+                <th className="text-left px-3 py-2">Product</th>
+                <th className="text-right px-3 py-2">Receipts</th>
+                <th className="text-right px-3 py-2">Accounts</th>
+                <th className="text-right px-3 py-2">Branches</th>
+                <th className="text-right px-3 py-2">Total</th>
+                <th className="text-right px-3 py-2">Cash</th>
+                <th className="text-right px-3 py-2">UPI/Digital</th>
+                <th className="text-right px-3 py-2">Cheque/DD</th>
+                <th className="text-right px-3 py-2">Cash %</th>
+                <th className="text-right px-3 py-2">Avg Receipt</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {collByProduct.length === 0 ? (
+                <tr><td colSpan={11} className="text-center text-gray-400 py-6">No receipts in this window.</td></tr>
+              ) : collByProduct.map((r, i) => (
+                <tr key={r.product + "-" + i}
+                    onClick={() => drill(r.product)}
+                    className="border-t hover:bg-amber-50/50 cursor-pointer group">
+                  <td className="px-3 py-1.5 font-medium group-hover:text-amber-800">{r.product}</td>
+                  <td className="px-3 py-1.5 text-right">{(r.receipts || 0).toLocaleString()}</td>
+                  <td className="px-3 py-1.5 text-right">{(r.accounts || 0).toLocaleString()}</td>
+                  <td className="px-3 py-1.5 text-right">{r.branches || 0}</td>
+                  <td className="px-3 py-1.5 text-right text-teal-700 font-medium">{formatLakhs(r.total)}</td>
+                  <td className="px-3 py-1.5 text-right">{formatLakhs(r.cash)}</td>
+                  <td className="px-3 py-1.5 text-right">{formatLakhs(r.upi)}</td>
+                  <td className="px-3 py-1.5 text-right">{formatLakhs(r.cheque)}</td>
+                  <td className={`px-3 py-1.5 text-right font-semibold ${(r.cashPct ?? 0) > 70 ? "text-red-700" : (r.cashPct ?? 0) > 40 ? "text-amber-700" : "text-emerald-700"}`}>
+                    {r.cashPct == null ? "—" : formatPct(r.cashPct, 0)}
+                  </td>
+                  <td className="px-3 py-1.5 text-right">{formatINR(r.avg_receipt || 0)}</td>
+                  <td className="px-3 py-1.5 text-right"><ChevronRight size={14} className="opacity-30 group-hover:opacity-100 text-amber-700" /></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Branch × Product heatmap */}
+      <div className="bg-white rounded-xl border">
+        <div className="px-5 py-3 border-b flex items-center justify-between">
+          <div>
+            <h3 className="font-semibold text-gray-800 flex items-center gap-1.5"><Grid3x3 size={16} /> Branch × Product CE% Matrix</h3>
+            <p className="text-xs text-gray-500">Colour shows CE%. Click any cell to drill into that branch-product slice.</p>
+          </div>
+          <div className="flex items-center gap-1.5 text-[10px]">
+            <span className="px-1.5 py-0.5 rounded bg-red-600 text-white">&lt;50%</span>
+            <span className="px-1.5 py-0.5 rounded bg-orange-500 text-white">50-70</span>
+            <span className="px-1.5 py-0.5 rounded bg-amber-400 text-gray-900">70-85</span>
+            <span className="px-1.5 py-0.5 rounded bg-emerald-400 text-white">85-95</span>
+            <span className="px-1.5 py-0.5 rounded bg-emerald-600 text-white">95%+</span>
+          </div>
+        </div>
+        <div className="overflow-x-auto max-h-[600px] overflow-y-auto">
+          {matrix.branches.length === 0 ? (
+            <div className="text-center text-gray-400 py-10">No matrix data.</div>
+          ) : (
+            <table className="text-[10px] border-separate border-spacing-0.5 p-2">
+              <thead className="sticky top-0 bg-white z-10">
+                <tr>
+                  <th className="sticky left-0 bg-white text-left px-2 py-2 text-gray-500 uppercase tracking-wide min-w-[140px] z-20">Branch ↓ / Product →</th>
+                  {matrix.products.map(p => (
+                    <th key={p.product} className="px-2 py-2 text-gray-600 font-semibold min-w-[90px] text-center">
+                      <div className="truncate max-w-[100px]" title={p.product}>{p.product}</div>
+                      <div className={`text-[9px] ${ceColor(p.cePct)}`}>{p.cePct == null ? "—" : formatPct(p.cePct, 0)}</div>
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {matrix.branches.map(b => (
+                  <tr key={b.branch}>
+                    <td className="sticky left-0 bg-white text-left px-2 py-1 font-medium text-gray-800 z-10 cursor-pointer hover:text-teal-700"
+                        onClick={() => drill(null, b.branch)}>
+                      <div className="truncate max-w-[130px]" title={b.branch}>{b.branch}</div>
+                      <div className={`text-[9px] ${ceColor(b.cePct)}`}>{b.cePct == null ? "—" : formatPct(b.cePct, 0)}</div>
+                    </td>
+                    {matrix.products.map(p => {
+                      const cell = matrixLookup.get(`${b.branch}||${p.product}`);
+                      const ce = cell ? cell.cePct : null;
+                      const empty = !cell;
+                      return (
+                        <td key={p.product}
+                            className={`text-center font-semibold cursor-pointer transition-opacity ${cellColor(ce)} ${empty ? "opacity-40" : "hover:opacity-80"}`}
+                            title={cell ? `${b.branch} × ${p.product}\n${cell.accounts} accts · CE% ${ce == null ? "—" : formatPct(ce, 1)}\nDemand ${formatLakhs(cell.demand)} · Collected ${formatLakhs(cell.collected)}` : "No data"}
+                            onClick={() => !empty && drill(p.product, b.branch)}>
+                          <div className="px-1.5 py-1">
+                            {empty ? "—" : (ce == null ? "—" : `${Math.round(ce)}%`)}
+                            {cell && <div className="text-[8px] opacity-80">{cell.accounts}a</div>}
+                          </div>
+                        </td>
+                      );
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

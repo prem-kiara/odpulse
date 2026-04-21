@@ -10,6 +10,22 @@ const path = require("path");
 const { parse } = require("csv-parse/sync");
 const db = require("./db");
 
+// ── Required column sets ───────────────────────────────────────────────────
+// We validate these BEFORE opening the DB transaction so a wrong file fails
+// fast with a clear error instead of silently inserting zero rows.
+const POOL_REQUIRED_COLS = [
+  "Loan number",
+  "Office Name",
+  "Member Name",
+  "Principal Outstanding",
+  "Current OD",
+];
+const ACCRUED_REQUIRED_COLS = [
+  "Account Number",
+  "Branch",
+  "Principal Outstanding",
+];
+
 // ── helpers ────────────────────────────────────────────────────────────────
 const num = (v) => {
   if (v == null || v === "") return 0;
@@ -24,41 +40,75 @@ const str = (v) => {
   return String(v).replace(/^"|"$/g, "").trim();
 };
 
-// Auto-add branches we've never seen. Updates branches.json in-place.
-function addBranchIfMissing(branchesFile, branch, registry) {
-  if (!branch) return false;
-  const key = branch.toLowerCase();
-  if (registry.has(key)) return false;
-  let branches = [];
-  try { branches = JSON.parse(fs.readFileSync(branchesFile, "utf8")); } catch { branches = []; }
-  if (!branches.some(b => b.toLowerCase() === key)) {
-    branches.push(branch);
-    fs.writeFileSync(branchesFile, JSON.stringify(branches, null, 2), "utf8");
-  }
-  registry.add(key);
-  return true;
+// Read branches.json safely.
+function readBranches(branchesFile) {
+  try { return JSON.parse(fs.readFileSync(branchesFile, "utf8")); }
+  catch { return []; }
+}
+
+// Atomically overwrite branches.json (write to temp then rename).
+function writeBranchesAtomic(branchesFile, branches) {
+  const tmp = branchesFile + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify(branches, null, 2), "utf8");
+  fs.renameSync(tmp, branchesFile);
+}
+
+// Validate required headers exist (case-insensitive, trim-insensitive).
+// Returns the list of missing columns (empty = OK).
+function missingColumns(firstRow, required) {
+  if (!firstRow) return required.slice();
+  const have = new Set(Object.keys(firstRow).map(k => String(k).trim().toLowerCase()));
+  return required.filter(c => !have.has(c.toLowerCase()));
+}
+
+// Checkpoint WAL at the end of a large ingest to keep the -wal file from growing unbounded.
+function checkpoint() {
+  try { db.pragma("wal_checkpoint(TRUNCATE)"); }
+  catch (err) { console.warn("[ingest] wal_checkpoint failed:", err.message); }
 }
 
 // ── Pool report ingestion ──────────────────────────────────────────────────
 function ingestPool(fileContent, opts) {
   const { snapshotDate, branchesFile, uploadedBy, filename } = opts;
 
-  const rows = parse(fileContent, {
-    delimiter: "|",
-    quote: '"',
-    columns: true,
-    relax_quotes: true,
-    relax_column_count: true,
-    skip_empty_lines: true,
-    trim: true,
-    bom: true,
-  });
+  let rows;
+  try {
+    rows = parse(fileContent, {
+      delimiter: "|",
+      quote: '"',
+      columns: true,
+      relax_quotes: true,
+      relax_column_count: true,
+      skip_empty_lines: true,
+      trim: true,
+      bom: true,
+    });
+  } catch (err) {
+    const e = new Error(`Could not parse pool report CSV: ${err.message}`);
+    e.statusCode = 400;
+    throw e;
+  }
 
-  const branches = (() => {
-    try { return JSON.parse(fs.readFileSync(branchesFile, "utf8")); } catch { return []; }
-  })();
-  const branchRegistry = new Set(branches.map(b => b.toLowerCase()));
-  let newBranches = 0;
+  if (rows.length === 0) {
+    const e = new Error("Pool report contains no data rows.");
+    e.statusCode = 400;
+    throw e;
+  }
+
+  const missing = missingColumns(rows[0], POOL_REQUIRED_COLS);
+  if (missing.length) {
+    const e = new Error(
+      `Pool report is missing required columns: ${missing.join(", ")}. ` +
+      `Got: ${Object.keys(rows[0]).join(", ")}`
+    );
+    e.statusCode = 400;
+    throw e;
+  }
+
+  // Buffer new branches; flush ONCE after the DB txn commits.
+  const existingBranches = readBranches(branchesFile);
+  const branchRegistry = new Set(existingBranches.map(b => String(b).toLowerCase()));
+  const pendingBranches = [];
 
   const upsertCustomer = db.prepare(`
     INSERT INTO customers (loan_account_no, customer_number, customer_name, spouse_name, branch,
@@ -83,8 +133,10 @@ function ingestPool(fileContent, opts) {
       updated_at=excluded.updated_at
   `);
 
+  // ON CONFLICT DO UPDATE keeps the same PK but avoids REPLACE's delete+insert
+  // behaviour (which churns rowids and fires delete-triggers).
   const upsertSnap = db.prepare(`
-    INSERT OR REPLACE INTO pool_snapshots
+    INSERT INTO pool_snapshots
       (snapshot_date, loan_account_no, branch, principal_outstanding, interest_outstanding, principal_overdue,
        interest_overdue, current_od, overdue_days, installments_paid, loan_status, account_dpd_classification,
        customer_dpd, customer_dpd_classification, last_payment_amount, total_interest_collected)
@@ -92,6 +144,13 @@ function ingestPool(fileContent, opts) {
       (@snapshot_date, @loan_account_no, @branch, @principal_outstanding, @interest_outstanding, @principal_overdue,
        @interest_overdue, @current_od, @overdue_days, @installments_paid, @loan_status, @account_dpd_classification,
        @customer_dpd, @customer_dpd_classification, @last_payment_amount, @total_interest_collected)
+    ON CONFLICT(snapshot_date, loan_account_no) DO UPDATE SET
+      branch=excluded.branch, principal_outstanding=excluded.principal_outstanding, interest_outstanding=excluded.interest_outstanding,
+      principal_overdue=excluded.principal_overdue, interest_overdue=excluded.interest_overdue, current_od=excluded.current_od,
+      overdue_days=excluded.overdue_days, installments_paid=excluded.installments_paid, loan_status=excluded.loan_status,
+      account_dpd_classification=excluded.account_dpd_classification, customer_dpd=excluded.customer_dpd,
+      customer_dpd_classification=excluded.customer_dpd_classification, last_payment_amount=excluded.last_payment_amount,
+      total_interest_collected=excluded.total_interest_collected
   `);
 
   const now = new Date().toISOString();
@@ -110,9 +169,12 @@ function ingestPool(fileContent, opts) {
       const loan = str(r["Loan number"]);
       if (!loan) continue;
       const branch = str(r["Office Name"]);
-      if (branch && !branchRegistry.has(branch.toLowerCase())) {
-        addBranchIfMissing(branchesFile, branch, branchRegistry);
-        newBranches++;
+      if (branch) {
+        const key = branch.toLowerCase();
+        if (!branchRegistry.has(key)) {
+          branchRegistry.add(key);
+          pendingBranches.push(branch);
+        }
       }
 
       upsertCustomer.run({
@@ -172,11 +234,26 @@ function ingestPool(fileContent, opts) {
 
   const rowCount = txn(rows);
 
+  // Flush branches AFTER the DB commit so the file and DB stay consistent
+  // even if the transaction rolls back mid-way.
+  let newBranches = 0;
+  if (pendingBranches.length) {
+    try {
+      const updated = existingBranches.concat(pendingBranches);
+      writeBranchesAtomic(branchesFile, updated);
+      newBranches = pendingBranches.length;
+    } catch (err) {
+      // DB is already committed; log but don't fail the request.
+      console.error("[ingest] failed to update branches.json:", err.message);
+    }
+  }
+
   db.prepare(
     `INSERT INTO upload_log (kind, filename, snapshot_date, row_count, new_branches, uploaded_by, uploaded_at)
      VALUES (?,?,?,?,?,?,?)`
   ).run("pool", filename, snapshotDate, rowCount, newBranches, uploadedBy, now);
 
+  checkpoint();
   return { rowCount, newBranches };
 }
 
@@ -195,23 +272,48 @@ function detectDelimiter(fileContent) {
 function ingestAccrued(fileContent, opts) {
   const { snapshotDate, branchesFile, uploadedBy, filename } = opts;
   const delimiter = detectDelimiter(fileContent);
-  const rows = parse(fileContent, {
-    delimiter,
-    columns: (header) => header.map((h) => String(h).trim()),
-    relax_quotes: true,
-    relax_column_count: true,
-    skip_empty_lines: true,
-    trim: true,
-    bom: true,
-  });
+
+  let rows;
+  try {
+    rows = parse(fileContent, {
+      delimiter,
+      columns: (header) => header.map((h) => String(h).trim()),
+      relax_quotes: true,
+      relax_column_count: true,
+      skip_empty_lines: true,
+      trim: true,
+      bom: true,
+    });
+  } catch (err) {
+    const e = new Error(`Could not parse accrued interest CSV: ${err.message}`);
+    e.statusCode = 400;
+    throw e;
+  }
 
   if (rows.length === 0) {
     return { rowCount: 0, newBranches: 0, currentAccruedColumn: null };
   }
 
+  const missing = missingColumns(rows[0], ACCRUED_REQUIRED_COLS);
+  if (missing.length) {
+    const e = new Error(
+      `Accrued interest report is missing required columns: ${missing.join(", ")}. ` +
+      `Got: ${Object.keys(rows[0]).join(", ")}`
+    );
+    e.statusCode = 400;
+    throw e;
+  }
+
   // The file has two "Accrued Interest (DD/MM/YYYY BOD)" columns — use the later one as "current".
   const keys = Object.keys(rows[0]);
   const accruedKeys = keys.filter(k => /Accrued\s*Interest/i.test(k));
+  if (accruedKeys.length === 0) {
+    const e = new Error(
+      `Accrued interest report has no "Accrued Interest (DD/MM/YYYY BOD)" column.`
+    );
+    e.statusCode = 400;
+    throw e;
+  }
   const parseDate = (k) => {
     const m = k.match(/(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
     if (!m) return 0;
@@ -221,19 +323,21 @@ function ingestAccrued(fileContent, opts) {
   const currentKey = accruedKeys[0];
   const prevKey = accruedKeys[1] || null;
 
-  const branches = (() => {
-    try { return JSON.parse(fs.readFileSync(branchesFile, "utf8")); } catch { return []; }
-  })();
-  const branchRegistry = new Set(branches.map(b => b.toLowerCase()));
-  let newBranches = 0;
+  const existingBranches = readBranches(branchesFile);
+  const branchRegistry = new Set(existingBranches.map(b => String(b).toLowerCase()));
+  const pendingBranches = [];
 
   const upsertAccrued = db.prepare(`
-    INSERT OR REPLACE INTO accrued_snapshots
+    INSERT INTO accrued_snapshots
       (snapshot_date, loan_account_no, branch, principal_outstanding, accrued_interest, accrued_interest_prev,
        last_installment_date, last_paid_date)
     VALUES
       (@snapshot_date, @loan_account_no, @branch, @principal_outstanding, @accrued_interest, @accrued_interest_prev,
        @last_installment_date, @last_paid_date)
+    ON CONFLICT(snapshot_date, loan_account_no) DO UPDATE SET
+      branch=excluded.branch, principal_outstanding=excluded.principal_outstanding,
+      accrued_interest=excluded.accrued_interest, accrued_interest_prev=excluded.accrued_interest_prev,
+      last_installment_date=excluded.last_installment_date, last_paid_date=excluded.last_paid_date
   `);
 
   const now = new Date().toISOString();
@@ -244,9 +348,12 @@ function ingestAccrued(fileContent, opts) {
       const loan = str(r["Account Number"]);
       if (!loan) continue;
       const branch = str(r["Branch"]);
-      if (branch && !branchRegistry.has(branch.toLowerCase())) {
-        addBranchIfMissing(branchesFile, branch, branchRegistry);
-        newBranches++;
+      if (branch) {
+        const key = branch.toLowerCase();
+        if (!branchRegistry.has(key)) {
+          branchRegistry.add(key);
+          pendingBranches.push(branch);
+        }
       }
 
       upsertAccrued.run({
@@ -266,12 +373,396 @@ function ingestAccrued(fileContent, opts) {
 
   const rowCount = txn(rows);
 
+  let newBranches = 0;
+  if (pendingBranches.length) {
+    try {
+      const updated = existingBranches.concat(pendingBranches);
+      writeBranchesAtomic(branchesFile, updated);
+      newBranches = pendingBranches.length;
+    } catch (err) {
+      console.error("[ingest] failed to update branches.json:", err.message);
+    }
+  }
+
   db.prepare(
     `INSERT INTO upload_log (kind, filename, snapshot_date, row_count, new_branches, uploaded_by, uploaded_at)
      VALUES (?,?,?,?,?,?,?)`
   ).run("accrued", filename, snapshotDate, rowCount, newBranches, uploadedBy, now);
 
+  checkpoint();
   return { rowCount, newBranches, currentAccruedColumn: currentKey };
+}
+
+// ── Date helpers ───────────────────────────────────────────────────────────
+// Normalises the many date formats seen in the reports (1-Nov-1977, 30/01/2023,
+// 01-04-2026, 2022-05-02, etc.) to ISO yyyy-mm-dd for consistent querying.
+const MONTHS = { jan:"01",feb:"02",mar:"03",apr:"04",may:"05",jun:"06",jul:"07",aug:"08",sep:"09",oct:"10",nov:"11",dec:"12" };
+function toIsoDate(raw) {
+  if (!raw) return "";
+  const s = String(raw).trim().replace(/^"|"$/g, "");
+  if (!s) return "";
+  // yyyy-mm-dd or yyyy/mm/dd
+  let m = s.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
+  if (m) return `${m[1]}-${String(m[2]).padStart(2,"0")}-${String(m[3]).padStart(2,"0")}`;
+  // dd-Mon-yyyy
+  m = s.match(/^(\d{1,2})[\-\/\s]([A-Za-z]{3,})[\-\/\s](\d{4})/);
+  if (m) {
+    const mon = MONTHS[m[2].slice(0,3).toLowerCase()];
+    if (mon) return `${m[3]}-${mon}-${String(m[1]).padStart(2,"0")}`;
+  }
+  // dd/mm/yyyy or dd-mm-yyyy
+  m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
+  if (m) return `${m[3]}-${String(m[2]).padStart(2,"0")}-${String(m[1]).padStart(2,"0")}`;
+  return "";
+}
+
+// ── Overdue report ingestion ───────────────────────────────────────────────
+// Pipe-delimited. One row per delinquent account on the snapshot date.
+function ingestOverdue(fileContent, opts) {
+  const { snapshotDate, branchesFile, uploadedBy, filename } = opts;
+  const delimiter = detectDelimiter(fileContent);
+  const rows = parse(fileContent, {
+    delimiter,
+    columns: (header) => header.map((h) => String(h).trim().replace(/^"|"$/g, "")),
+    relax_quotes: true,
+    relax_column_count: true,
+    skip_empty_lines: true,
+    trim: true,
+    bom: true,
+  });
+  if (rows.length === 0) return { rowCount: 0, newBranches: 0 };
+
+  const branches = (() => {
+    try { return JSON.parse(fs.readFileSync(branchesFile, "utf8")); } catch { return []; }
+  })();
+  const branchRegistry = new Set(branches.map(b => b.toLowerCase()));
+  let newBranches = 0;
+
+  const upsert = db.prepare(`
+    INSERT OR REPLACE INTO od_overdue (
+      snapshot_date, loan_account_no, customer_number, customer_name, telephone, guarantor_name,
+      branch_name, branch_code, officer_name, officer_code, center_name, center_code, group_name,
+      date_of_birth, religious_group, caste, locale, state, product, loan_amount, loan_cycle,
+      last_payment_approp_date, last_payment_approp_amount, repayment_frequency, maturity_date,
+      interest_rate, emi, purpose_category, purpose, fund_source,
+      principal_outstanding, interest_outstanding, fee_insurance_outstanding, disbursement_date,
+      installments_due, earliest_unpaid_demand_date, latest_unpaid_demand_date,
+      principal_default, interest_default, min_principal_overdue_days, max_principal_overdue_days,
+      account_status, death_case_remark, death_flagged_date, moratorium_availed, is_restructured,
+      dpd_classification, npa_date, first_npa_date, current_npa_date
+    ) VALUES (
+      @snapshot_date, @loan_account_no, @customer_number, @customer_name, @telephone, @guarantor_name,
+      @branch_name, @branch_code, @officer_name, @officer_code, @center_name, @center_code, @group_name,
+      @date_of_birth, @religious_group, @caste, @locale, @state, @product, @loan_amount, @loan_cycle,
+      @last_payment_approp_date, @last_payment_approp_amount, @repayment_frequency, @maturity_date,
+      @interest_rate, @emi, @purpose_category, @purpose, @fund_source,
+      @principal_outstanding, @interest_outstanding, @fee_insurance_outstanding, @disbursement_date,
+      @installments_due, @earliest_unpaid_demand_date, @latest_unpaid_demand_date,
+      @principal_default, @interest_default, @min_principal_overdue_days, @max_principal_overdue_days,
+      @account_status, @death_case_remark, @death_flagged_date, @moratorium_availed, @is_restructured,
+      @dpd_classification, @npa_date, @first_npa_date, @current_npa_date
+    )
+  `);
+
+  const now = new Date().toISOString();
+  const txn = db.transaction((rs) => {
+    let count = 0;
+    for (const r of rs) {
+      const loan = str(r["Account Number"]);
+      if (!loan) continue;
+      const branch = str(r["Branch Name"]);
+      if (branch && !branchRegistry.has(branch.toLowerCase())) {
+        addBranchIfMissing(branchesFile, branch, branchRegistry);
+        newBranches++;
+      }
+      upsert.run({
+        snapshot_date: snapshotDate,
+        loan_account_no: loan,
+        customer_number: str(r["Customer Number"]),
+        customer_name: str(r["Customer"]),
+        telephone: str(r["Telephone"]),
+        guarantor_name: str(r["Guarantor's Name"]),
+        branch_name: branch,
+        branch_code: str(r["Branch Code"]),
+        officer_name: str(r["Officer"]),
+        officer_code: str(r["Officer Employee Number"]),
+        center_name: str(r["Center"]),
+        center_code: str(r["Center Code"]),
+        group_name: str(r["Group"]),
+        date_of_birth: toIsoDate(r["Date of Birth"]),
+        religious_group: str(r["Religious Group"]),
+        caste: str(r["Caste"]),
+        locale: str(r["Locale"]),
+        state: str(r["State"]),
+        product: str(r["Product"]),
+        loan_amount: num(r["Loan Amount"]),
+        loan_cycle: Math.round(num(r["Loan Cycle"])),
+        last_payment_approp_date: toIsoDate(r["Last Payment Appropriation Date"]),
+        last_payment_approp_amount: num(r["Last Payment Appropriation Amount"]),
+        repayment_frequency: str(r["Repayment Frequency"]),
+        maturity_date: toIsoDate(r["Maturity Date"]),
+        interest_rate: num(r["Interest Rate (%)"]),
+        emi: num(r["EMI"]),
+        purpose_category: str(r["Purpose Category"]),
+        purpose: str(r["Purpose"]),
+        fund_source: str(r["Fund Source"]),
+        principal_outstanding: num(r["Principal Outstanding"]),
+        interest_outstanding: num(r["Interest Outstanding"]),
+        fee_insurance_outstanding: num(r["Fee & Insurance Outstanding"]),
+        disbursement_date: toIsoDate(r["Disbursement Date"]),
+        installments_due: Math.round(num(r["# Installments Due"])),
+        earliest_unpaid_demand_date: toIsoDate(r["Earliest Unpaid Demand Date"]),
+        latest_unpaid_demand_date: toIsoDate(r["Latest Unpaid Demand Date"]),
+        principal_default: num(r["Principal Default"]),
+        interest_default: num(r["Interest Default"]),
+        min_principal_overdue_days: Math.round(num(r["Minimum Principal Overdue Days"])),
+        max_principal_overdue_days: Math.round(num(r["Maximum Principal Overdue Days"])),
+        account_status: str(r["Account Status"]),
+        death_case_remark: str(r["Death Case Remark"]),
+        death_flagged_date: toIsoDate(r["Death Flagged Date"]),
+        moratorium_availed: str(r["Moratorium Availed"]),
+        is_restructured: str(r["Is Restructured"]),
+        dpd_classification: str(r["DPD Classification"]),
+        npa_date: toIsoDate(r["NPA Date"]),
+        first_npa_date: toIsoDate(r["First NPA Date"]),
+        current_npa_date: toIsoDate(r["Current NPA Date"]),
+      });
+      count++;
+    }
+    return count;
+  });
+
+  const rowCount = txn(rows);
+  db.prepare(
+    `INSERT INTO upload_log (kind, filename, snapshot_date, row_count, new_branches, uploaded_by, uploaded_at)
+     VALUES (?,?,?,?,?,?,?)`
+  ).run("overdue", filename, snapshotDate, rowCount, newBranches, uploadedBy, now);
+  return { rowCount, newBranches };
+}
+
+// ── Collection report (transactional ledger) ───────────────────────────────
+// Pipe-delimited. One row per receipt. Idempotent on receipt_no so re-uploading
+// the same extract is safe; duplicates are skipped and reported back.
+function ingestCollections(fileContent, opts) {
+  const { branchesFile, uploadedBy, filename } = opts;
+  const delimiter = detectDelimiter(fileContent);
+  const rows = parse(fileContent, {
+    delimiter,
+    columns: (header) => header.map((h) => String(h).trim().replace(/^"|"$/g, "")),
+    relax_quotes: true,
+    relax_column_count: true,
+    skip_empty_lines: true,
+    trim: true,
+    bom: true,
+  });
+  if (rows.length === 0) {
+    return { rowCount: 0, rowsInserted: 0, rowsSkipped: 0, newBranches: 0 };
+  }
+
+  const branches = (() => {
+    try { return JSON.parse(fs.readFileSync(branchesFile, "utf8")); } catch { return []; }
+  })();
+  const branchRegistry = new Set(branches.map(b => b.toLowerCase()));
+  let newBranches = 0;
+
+  const insert = db.prepare(`
+    INSERT OR IGNORE INTO od_collections (
+      receipt_no, loan_account_no, customer_number, customer_name,
+      branch_name, branch_code, center_name, center_code, meeting_time,
+      officer_name, officer_code, payment_officer_name, payment_officer_code, username,
+      amount, paid_by, payment_date, payment_status, disbursement_date, mode,
+      app_local_posting_time, posting_time, product, payment_app, narration,
+      upi_txn_number, upi_rrn, uploaded_at
+    ) VALUES (
+      @receipt_no, @loan_account_no, @customer_number, @customer_name,
+      @branch_name, @branch_code, @center_name, @center_code, @meeting_time,
+      @officer_name, @officer_code, @payment_officer_name, @payment_officer_code, @username,
+      @amount, @paid_by, @payment_date, @payment_status, @disbursement_date, @mode,
+      @app_local_posting_time, @posting_time, @product, @payment_app, @narration,
+      @upi_txn_number, @upi_rrn, @uploaded_at
+    )
+  `);
+
+  const now = new Date().toISOString();
+  const txn = db.transaction((rs) => {
+    let inserted = 0, skipped = 0, total = 0;
+    for (const r of rs) {
+      total++;
+      const receipt = str(r["Receipt No"]);
+      if (!receipt) { skipped++; continue; }
+      const branch = str(r["Branch Name"]);
+      if (branch && !branchRegistry.has(branch.toLowerCase())) {
+        addBranchIfMissing(branchesFile, branch, branchRegistry);
+        newBranches++;
+      }
+      const info = insert.run({
+        receipt_no: receipt,
+        loan_account_no: str(r["Account No"]),
+        customer_number: str(r["Customer Number"]),
+        customer_name: str(r["Customer Name"]),
+        branch_name: branch,
+        branch_code: str(r["Branch Code"]),
+        center_name: str(r["Center"]),
+        center_code: str(r["Center Code"]),
+        meeting_time: str(r["Meeting Time"]),
+        officer_name: str(r["Officer Name"]),
+        officer_code: str(r["Officer Code"]),
+        payment_officer_name: str(r["Payment Officer Name"]),
+        payment_officer_code: str(r["Payment Officer Code"]),
+        username: str(r["Username"]),
+        amount: num(r["Amount"]),
+        paid_by: str(r["Paid By"]),
+        payment_date: toIsoDate(r["Payment Date"]),
+        payment_status: str(r["Payment Status"]),
+        disbursement_date: toIsoDate(r["Disbursement Date"]),
+        mode: str(r["Mode"]),
+        app_local_posting_time: str(r["APP Local Posting Time"]),
+        posting_time: str(r["Posting Time"]),
+        product: str(r["Product"]),
+        payment_app: str(r["Payment App"]),
+        narration: str(r["Narration"]),
+        upi_txn_number: str(r["UPI Transaction Number"]),
+        upi_rrn: str(r["UPI RRN"]),
+        uploaded_at: now,
+      });
+      if (info.changes > 0) inserted++; else skipped++;
+    }
+    return { inserted, skipped, total };
+  });
+
+  const { inserted, skipped, total } = txn(rows);
+  db.prepare(
+    `INSERT INTO upload_log (kind, filename, snapshot_date, row_count, new_branches, uploaded_by, uploaded_at)
+     VALUES (?,?,?,?,?,?,?)`
+  ).run("collections", filename, null, inserted, newBranches, uploadedBy, now);
+  return { rowCount: total, rowsInserted: inserted, rowsSkipped: skipped, newBranches };
+}
+
+// ── Client-wise Collection Report (per-account demand vs collected) ────────
+// Pipe-delimited. One row per account for a period. Period boundaries come
+// from the caller (detected from the file name or supplied by the user). Three
+// Principal Outstanding snapshot columns are captured as start/mid/end.
+function ingestClientPeriod(fileContent, opts) {
+  const { periodStart, periodEnd, branchesFile, uploadedBy, filename } = opts;
+  const delimiter = detectDelimiter(fileContent);
+  const rows = parse(fileContent, {
+    delimiter,
+    columns: (header) => header.map((h) => String(h).trim().replace(/^"|"$/g, "")),
+    relax_quotes: true,
+    relax_column_count: true,
+    skip_empty_lines: true,
+    trim: true,
+    bom: true,
+  });
+  if (rows.length === 0) return { rowCount: 0, newBranches: 0 };
+
+  // Discover the 3 "Principal Outstanding (dd-mm-yyyy)" snapshot columns, then
+  // sort by embedded date so we can assign start/mid/end consistently.
+  const keys = Object.keys(rows[0]);
+  const principalCols = keys.filter(k => /^PRINCIPAL\s+OUTSTANDING\s*\(/i.test(k));
+  const parseHeaderDate = (k) => {
+    const m = k.match(/(\d{1,2})[\-\/](\d{1,2})[\-\/](\d{4})/);
+    if (!m) return 0;
+    return new Date(`${m[3]}-${String(m[2]).padStart(2,"0")}-${String(m[1]).padStart(2,"0")}`).getTime();
+  };
+  principalCols.sort((a, b) => parseHeaderDate(a) - parseHeaderDate(b));
+  const poStartKey = principalCols[0] || null;
+  const poEndKey = principalCols[principalCols.length - 1] || null;
+  const poMidKey = principalCols.length > 2 ? principalCols[1] : (principalCols.length === 2 ? principalCols[0] : null);
+
+  const branches = (() => {
+    try { return JSON.parse(fs.readFileSync(branchesFile, "utf8")); } catch { return []; }
+  })();
+  const branchRegistry = new Set(branches.map(b => b.toLowerCase()));
+  let newBranches = 0;
+
+  const upsert = db.prepare(`
+    INSERT OR REPLACE INTO od_client_period (
+      period_start, period_end, loan_account_no, customer_number, customer_name,
+      branch_name, branch_code, center_name, center_code, officer_name, officer_code,
+      product_name, account_status, disbursement_date, closing_date, installments_remaining,
+      principal_outstanding_start, principal_outstanding_mid, principal_outstanding_end,
+      interest_outstanding, principal_demand, principal_prepayment, interest_prepayment,
+      last_principal_demand_date, principal_collected, last_principal_collected_date,
+      interest_demand, last_interest_demand_date, interest_collected, differential_interest,
+      last_interest_collected_date, other_charges, moratorium_interest_collection, total_collection,
+      advance_amount, principal_overdue, interest_overdue, funder_name, fund_source_name
+    ) VALUES (
+      @period_start, @period_end, @loan_account_no, @customer_number, @customer_name,
+      @branch_name, @branch_code, @center_name, @center_code, @officer_name, @officer_code,
+      @product_name, @account_status, @disbursement_date, @closing_date, @installments_remaining,
+      @principal_outstanding_start, @principal_outstanding_mid, @principal_outstanding_end,
+      @interest_outstanding, @principal_demand, @principal_prepayment, @interest_prepayment,
+      @last_principal_demand_date, @principal_collected, @last_principal_collected_date,
+      @interest_demand, @last_interest_demand_date, @interest_collected, @differential_interest,
+      @last_interest_collected_date, @other_charges, @moratorium_interest_collection, @total_collection,
+      @advance_amount, @principal_overdue, @interest_overdue, @funder_name, @fund_source_name
+    )
+  `);
+
+  const now = new Date().toISOString();
+  const txn = db.transaction((rs) => {
+    let count = 0;
+    for (const r of rs) {
+      const loan = str(r["ACCOUNT NUMBER"]);
+      if (!loan) continue;
+      const branch = str(r["BRANCH NAME"]);
+      if (branch && !branchRegistry.has(branch.toLowerCase())) {
+        addBranchIfMissing(branchesFile, branch, branchRegistry);
+        newBranches++;
+      }
+      upsert.run({
+        period_start: periodStart,
+        period_end: periodEnd,
+        loan_account_no: loan,
+        customer_number: str(r["CUSTOMER NUMBER"]),
+        customer_name: str(r["NAME"]),
+        branch_name: branch,
+        branch_code: str(r["BRANCH CODE"]),
+        center_name: str(r["CENTER"]),
+        center_code: str(r["CENTER CODE"]),
+        officer_name: str(r["RELATIONSHIP OFFICER"]),
+        officer_code: str(r["EMPLOYEE NUMBER"]),
+        product_name: str(r["PRODUCT NAME"]),
+        account_status: str(r["ACCOUNT STATUS"]),
+        disbursement_date: toIsoDate(r["DISB DATE"]),
+        closing_date: toIsoDate(r["CLOSING DATE"]),
+        installments_remaining: Math.round(num(r["INSTALLMENTS REMAINING"])),
+        principal_outstanding_start: poStartKey ? num(r[poStartKey]) : 0,
+        principal_outstanding_mid: poMidKey ? num(r[poMidKey]) : 0,
+        principal_outstanding_end: poEndKey ? num(r[poEndKey]) : 0,
+        interest_outstanding: num(r["INTEREST OUTSTANDING"]),
+        principal_demand: num(r["PRINCIPAL DEMAND"]),
+        principal_prepayment: num(r["PRINCIPAL PREPAYMENT"]),
+        interest_prepayment: num(r["INTEREST PREPAYMENT"]),
+        last_principal_demand_date: toIsoDate(r["LAST PRINCIPAL DEMAND DATE"]),
+        principal_collected: num(r["PRINCIPAL COLLECTED"]),
+        last_principal_collected_date: toIsoDate(r["LAST PRINCIPAL COLLECTED DATE"]),
+        interest_demand: num(r["INTEREST DEMAND"]),
+        last_interest_demand_date: toIsoDate(r["LAST INTEREST DEMAND DATE"]),
+        interest_collected: num(r["INTEREST COLLECTED"]),
+        differential_interest: num(r["DIFFERENTIAL INTEREST"]),
+        last_interest_collected_date: toIsoDate(r["LAST INTEREST COLLECTED DATE"]),
+        other_charges: num(r["OTHER CHARGES"]),
+        moratorium_interest_collection: num(r["MORATORIUM INTEREST COLLECTION"]),
+        total_collection: num(r["TOTAL COLLECTION"]),
+        advance_amount: num(r["ADVANCE AMOUNT (As of to-date)"]),
+        principal_overdue: num(r["PRINCIPAL OVERDUE"]),
+        interest_overdue: num(r["INTEREST OVERDUE"]),
+        funder_name: str(r["FUNDER NAME"]),
+        fund_source_name: str(r["FUND SOURCE NAME"]),
+      });
+      count++;
+    }
+    return count;
+  });
+
+  const rowCount = txn(rows);
+  db.prepare(
+    `INSERT INTO upload_log (kind, filename, snapshot_date, row_count, new_branches, uploaded_by, uploaded_at)
+     VALUES (?,?,?,?,?,?,?)`
+  ).run("client_period", filename, periodEnd, rowCount, newBranches, uploadedBy, now);
+  return { rowCount, newBranches, principalCols: principalCols.length };
 }
 
 // ── Retention ──────────────────────────────────────────────────────────────
@@ -282,7 +773,14 @@ function purgeOldSnapshots(retentionDays = 90) {
   const r1 = db.prepare("DELETE FROM pool_snapshots WHERE snapshot_date < ?").run(iso);
   const r2 = db.prepare("DELETE FROM accrued_snapshots WHERE snapshot_date < ?").run(iso);
   const r3 = db.prepare("DELETE FROM upload_log WHERE uploaded_at < ?").run(cutoff.toISOString());
-  return { poolDeleted: r1.changes, accruedDeleted: r2.changes, logDeleted: r3.changes, cutoff: iso };
+  const r4 = db.prepare("DELETE FROM od_overdue WHERE snapshot_date < ?").run(iso);
+  // od_collections is an immutable ledger — keep indefinitely unless admin purges.
+  // od_client_period kept — typically small, one row per account per period.
+  // Reclaim space after a purge. VACUUM cannot run inside a transaction and
+  // briefly exclusive-locks the DB, so schedule it on a retention run only.
+  try { db.exec("VACUUM"); }
+  catch (err) { console.warn("[purge] VACUUM failed:", err.message); }
+  return { poolDeleted: r1.changes, accruedDeleted: r2.changes, logDeleted: r3.changes, overdueDeleted: r4.changes, cutoff: iso };
 }
 
-module.exports = { ingestPool, ingestAccrued, purgeOldSnapshots };
+module.exports = { ingestPool, ingestAccrued, ingestOverdue, ingestCollections, ingestClientPeriod, purgeOldSnapshots, toIsoDate, detectDelimiter };
