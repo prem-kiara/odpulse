@@ -10,6 +10,22 @@ const path = require("path");
 const { parse } = require("csv-parse/sync");
 const db = require("./db");
 
+// ── Required column sets ───────────────────────────────────────────────────
+// We validate these BEFORE opening the DB transaction so a wrong file fails
+// fast with a clear error instead of silently inserting zero rows.
+const POOL_REQUIRED_COLS = [
+  "Loan number",
+  "Office Name",
+  "Member Name",
+  "Principal Outstanding",
+  "Current OD",
+];
+const ACCRUED_REQUIRED_COLS = [
+  "Account Number",
+  "Branch",
+  "Principal Outstanding",
+];
+
 // ── helpers ────────────────────────────────────────────────────────────────
 const num = (v) => {
   if (v == null || v === "") return 0;
@@ -24,41 +40,75 @@ const str = (v) => {
   return String(v).replace(/^"|"$/g, "").trim();
 };
 
-// Auto-add branches we've never seen. Updates branches.json in-place.
-function addBranchIfMissing(branchesFile, branch, registry) {
-  if (!branch) return false;
-  const key = branch.toLowerCase();
-  if (registry.has(key)) return false;
-  let branches = [];
-  try { branches = JSON.parse(fs.readFileSync(branchesFile, "utf8")); } catch { branches = []; }
-  if (!branches.some(b => b.toLowerCase() === key)) {
-    branches.push(branch);
-    fs.writeFileSync(branchesFile, JSON.stringify(branches, null, 2), "utf8");
-  }
-  registry.add(key);
-  return true;
+// Read branches.json safely.
+function readBranches(branchesFile) {
+  try { return JSON.parse(fs.readFileSync(branchesFile, "utf8")); }
+  catch { return []; }
+}
+
+// Atomically overwrite branches.json (write to temp then rename).
+function writeBranchesAtomic(branchesFile, branches) {
+  const tmp = branchesFile + ".tmp";
+  fs.writeFileSync(tmp, JSON.stringify(branches, null, 2), "utf8");
+  fs.renameSync(tmp, branchesFile);
+}
+
+// Validate required headers exist (case-insensitive, trim-insensitive).
+// Returns the list of missing columns (empty = OK).
+function missingColumns(firstRow, required) {
+  if (!firstRow) return required.slice();
+  const have = new Set(Object.keys(firstRow).map(k => String(k).trim().toLowerCase()));
+  return required.filter(c => !have.has(c.toLowerCase()));
+}
+
+// Checkpoint WAL at the end of a large ingest to keep the -wal file from growing unbounded.
+function checkpoint() {
+  try { db.pragma("wal_checkpoint(TRUNCATE)"); }
+  catch (err) { console.warn("[ingest] wal_checkpoint failed:", err.message); }
 }
 
 // ── Pool report ingestion ──────────────────────────────────────────────────
 function ingestPool(fileContent, opts) {
   const { snapshotDate, branchesFile, uploadedBy, filename } = opts;
 
-  const rows = parse(fileContent, {
-    delimiter: "|",
-    quote: '"',
-    columns: true,
-    relax_quotes: true,
-    relax_column_count: true,
-    skip_empty_lines: true,
-    trim: true,
-    bom: true,
-  });
+  let rows;
+  try {
+    rows = parse(fileContent, {
+      delimiter: "|",
+      quote: '"',
+      columns: true,
+      relax_quotes: true,
+      relax_column_count: true,
+      skip_empty_lines: true,
+      trim: true,
+      bom: true,
+    });
+  } catch (err) {
+    const e = new Error(`Could not parse pool report CSV: ${err.message}`);
+    e.statusCode = 400;
+    throw e;
+  }
 
-  const branches = (() => {
-    try { return JSON.parse(fs.readFileSync(branchesFile, "utf8")); } catch { return []; }
-  })();
-  const branchRegistry = new Set(branches.map(b => b.toLowerCase()));
-  let newBranches = 0;
+  if (rows.length === 0) {
+    const e = new Error("Pool report contains no data rows.");
+    e.statusCode = 400;
+    throw e;
+  }
+
+  const missing = missingColumns(rows[0], POOL_REQUIRED_COLS);
+  if (missing.length) {
+    const e = new Error(
+      `Pool report is missing required columns: ${missing.join(", ")}. ` +
+      `Got: ${Object.keys(rows[0]).join(", ")}`
+    );
+    e.statusCode = 400;
+    throw e;
+  }
+
+  // Buffer new branches; flush ONCE after the DB txn commits.
+  const existingBranches = readBranches(branchesFile);
+  const branchRegistry = new Set(existingBranches.map(b => String(b).toLowerCase()));
+  const pendingBranches = [];
 
   const upsertCustomer = db.prepare(`
     INSERT INTO customers (loan_account_no, customer_number, customer_name, spouse_name, branch,
@@ -83,8 +133,10 @@ function ingestPool(fileContent, opts) {
       updated_at=excluded.updated_at
   `);
 
+  // ON CONFLICT DO UPDATE keeps the same PK but avoids REPLACE's delete+insert
+  // behaviour (which churns rowids and fires delete-triggers).
   const upsertSnap = db.prepare(`
-    INSERT OR REPLACE INTO pool_snapshots
+    INSERT INTO pool_snapshots
       (snapshot_date, loan_account_no, branch, principal_outstanding, interest_outstanding, principal_overdue,
        interest_overdue, current_od, overdue_days, installments_paid, loan_status, account_dpd_classification,
        customer_dpd, customer_dpd_classification, last_payment_amount, total_interest_collected)
@@ -92,6 +144,13 @@ function ingestPool(fileContent, opts) {
       (@snapshot_date, @loan_account_no, @branch, @principal_outstanding, @interest_outstanding, @principal_overdue,
        @interest_overdue, @current_od, @overdue_days, @installments_paid, @loan_status, @account_dpd_classification,
        @customer_dpd, @customer_dpd_classification, @last_payment_amount, @total_interest_collected)
+    ON CONFLICT(snapshot_date, loan_account_no) DO UPDATE SET
+      branch=excluded.branch, principal_outstanding=excluded.principal_outstanding, interest_outstanding=excluded.interest_outstanding,
+      principal_overdue=excluded.principal_overdue, interest_overdue=excluded.interest_overdue, current_od=excluded.current_od,
+      overdue_days=excluded.overdue_days, installments_paid=excluded.installments_paid, loan_status=excluded.loan_status,
+      account_dpd_classification=excluded.account_dpd_classification, customer_dpd=excluded.customer_dpd,
+      customer_dpd_classification=excluded.customer_dpd_classification, last_payment_amount=excluded.last_payment_amount,
+      total_interest_collected=excluded.total_interest_collected
   `);
 
   const now = new Date().toISOString();
@@ -110,9 +169,12 @@ function ingestPool(fileContent, opts) {
       const loan = str(r["Loan number"]);
       if (!loan) continue;
       const branch = str(r["Office Name"]);
-      if (branch && !branchRegistry.has(branch.toLowerCase())) {
-        addBranchIfMissing(branchesFile, branch, branchRegistry);
-        newBranches++;
+      if (branch) {
+        const key = branch.toLowerCase();
+        if (!branchRegistry.has(key)) {
+          branchRegistry.add(key);
+          pendingBranches.push(branch);
+        }
       }
 
       upsertCustomer.run({
@@ -172,11 +234,26 @@ function ingestPool(fileContent, opts) {
 
   const rowCount = txn(rows);
 
+  // Flush branches AFTER the DB commit so the file and DB stay consistent
+  // even if the transaction rolls back mid-way.
+  let newBranches = 0;
+  if (pendingBranches.length) {
+    try {
+      const updated = existingBranches.concat(pendingBranches);
+      writeBranchesAtomic(branchesFile, updated);
+      newBranches = pendingBranches.length;
+    } catch (err) {
+      // DB is already committed; log but don't fail the request.
+      console.error("[ingest] failed to update branches.json:", err.message);
+    }
+  }
+
   db.prepare(
     `INSERT INTO upload_log (kind, filename, snapshot_date, row_count, new_branches, uploaded_by, uploaded_at)
      VALUES (?,?,?,?,?,?,?)`
   ).run("pool", filename, snapshotDate, rowCount, newBranches, uploadedBy, now);
 
+  checkpoint();
   return { rowCount, newBranches };
 }
 
@@ -195,23 +272,48 @@ function detectDelimiter(fileContent) {
 function ingestAccrued(fileContent, opts) {
   const { snapshotDate, branchesFile, uploadedBy, filename } = opts;
   const delimiter = detectDelimiter(fileContent);
-  const rows = parse(fileContent, {
-    delimiter,
-    columns: (header) => header.map((h) => String(h).trim()),
-    relax_quotes: true,
-    relax_column_count: true,
-    skip_empty_lines: true,
-    trim: true,
-    bom: true,
-  });
+
+  let rows;
+  try {
+    rows = parse(fileContent, {
+      delimiter,
+      columns: (header) => header.map((h) => String(h).trim()),
+      relax_quotes: true,
+      relax_column_count: true,
+      skip_empty_lines: true,
+      trim: true,
+      bom: true,
+    });
+  } catch (err) {
+    const e = new Error(`Could not parse accrued interest CSV: ${err.message}`);
+    e.statusCode = 400;
+    throw e;
+  }
 
   if (rows.length === 0) {
     return { rowCount: 0, newBranches: 0, currentAccruedColumn: null };
   }
 
+  const missing = missingColumns(rows[0], ACCRUED_REQUIRED_COLS);
+  if (missing.length) {
+    const e = new Error(
+      `Accrued interest report is missing required columns: ${missing.join(", ")}. ` +
+      `Got: ${Object.keys(rows[0]).join(", ")}`
+    );
+    e.statusCode = 400;
+    throw e;
+  }
+
   // The file has two "Accrued Interest (DD/MM/YYYY BOD)" columns — use the later one as "current".
   const keys = Object.keys(rows[0]);
   const accruedKeys = keys.filter(k => /Accrued\s*Interest/i.test(k));
+  if (accruedKeys.length === 0) {
+    const e = new Error(
+      `Accrued interest report has no "Accrued Interest (DD/MM/YYYY BOD)" column.`
+    );
+    e.statusCode = 400;
+    throw e;
+  }
   const parseDate = (k) => {
     const m = k.match(/(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
     if (!m) return 0;
@@ -221,19 +323,21 @@ function ingestAccrued(fileContent, opts) {
   const currentKey = accruedKeys[0];
   const prevKey = accruedKeys[1] || null;
 
-  const branches = (() => {
-    try { return JSON.parse(fs.readFileSync(branchesFile, "utf8")); } catch { return []; }
-  })();
-  const branchRegistry = new Set(branches.map(b => b.toLowerCase()));
-  let newBranches = 0;
+  const existingBranches = readBranches(branchesFile);
+  const branchRegistry = new Set(existingBranches.map(b => String(b).toLowerCase()));
+  const pendingBranches = [];
 
   const upsertAccrued = db.prepare(`
-    INSERT OR REPLACE INTO accrued_snapshots
+    INSERT INTO accrued_snapshots
       (snapshot_date, loan_account_no, branch, principal_outstanding, accrued_interest, accrued_interest_prev,
        last_installment_date, last_paid_date)
     VALUES
       (@snapshot_date, @loan_account_no, @branch, @principal_outstanding, @accrued_interest, @accrued_interest_prev,
        @last_installment_date, @last_paid_date)
+    ON CONFLICT(snapshot_date, loan_account_no) DO UPDATE SET
+      branch=excluded.branch, principal_outstanding=excluded.principal_outstanding,
+      accrued_interest=excluded.accrued_interest, accrued_interest_prev=excluded.accrued_interest_prev,
+      last_installment_date=excluded.last_installment_date, last_paid_date=excluded.last_paid_date
   `);
 
   const now = new Date().toISOString();
@@ -244,9 +348,12 @@ function ingestAccrued(fileContent, opts) {
       const loan = str(r["Account Number"]);
       if (!loan) continue;
       const branch = str(r["Branch"]);
-      if (branch && !branchRegistry.has(branch.toLowerCase())) {
-        addBranchIfMissing(branchesFile, branch, branchRegistry);
-        newBranches++;
+      if (branch) {
+        const key = branch.toLowerCase();
+        if (!branchRegistry.has(key)) {
+          branchRegistry.add(key);
+          pendingBranches.push(branch);
+        }
       }
 
       upsertAccrued.run({
@@ -266,11 +373,23 @@ function ingestAccrued(fileContent, opts) {
 
   const rowCount = txn(rows);
 
+  let newBranches = 0;
+  if (pendingBranches.length) {
+    try {
+      const updated = existingBranches.concat(pendingBranches);
+      writeBranchesAtomic(branchesFile, updated);
+      newBranches = pendingBranches.length;
+    } catch (err) {
+      console.error("[ingest] failed to update branches.json:", err.message);
+    }
+  }
+
   db.prepare(
     `INSERT INTO upload_log (kind, filename, snapshot_date, row_count, new_branches, uploaded_by, uploaded_at)
      VALUES (?,?,?,?,?,?,?)`
   ).run("accrued", filename, snapshotDate, rowCount, newBranches, uploadedBy, now);
 
+  checkpoint();
   return { rowCount, newBranches, currentAccruedColumn: currentKey };
 }
 
@@ -282,6 +401,10 @@ function purgeOldSnapshots(retentionDays = 90) {
   const r1 = db.prepare("DELETE FROM pool_snapshots WHERE snapshot_date < ?").run(iso);
   const r2 = db.prepare("DELETE FROM accrued_snapshots WHERE snapshot_date < ?").run(iso);
   const r3 = db.prepare("DELETE FROM upload_log WHERE uploaded_at < ?").run(cutoff.toISOString());
+  // Reclaim space after a purge. VACUUM cannot run inside a transaction and
+  // briefly exclusive-locks the DB, so schedule it on a retention run only.
+  try { db.exec("VACUUM"); }
+  catch (err) { console.warn("[purge] VACUUM failed:", err.message); }
   return { poolDeleted: r1.changes, accruedDeleted: r2.changes, logDeleted: r3.changes, cutoff: iso };
 }
 

@@ -508,7 +508,8 @@ export function CollectionDashboard({ user, entries, branches }) {
       return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
     };
     const csv = [keys.join(","), ...rows.map(r => keys.map(k => esc(r[k])).join(","))].join("\n");
-    const blob = new Blob([csv], { type: "text/csv" });
+    // Prepend UTF-8 BOM so Excel renders Tamil / non-ASCII characters correctly.
+    const blob = new Blob(["\uFEFF", csv], { type: "text/csv;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url; a.download = filename; a.click();

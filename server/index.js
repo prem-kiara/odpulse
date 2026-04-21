@@ -5,6 +5,7 @@ const path = require("path");
 const cron = require("node-cron");
 const nodemailer = require("nodemailer");
 const multer = require("multer");
+const iconv = require("iconv-lite");
 
 const db = require("./db");
 const { ingestPool, ingestAccrued, purgeOldSnapshots } = require("./ingest");
@@ -12,11 +13,14 @@ const { ingestPool, ingestAccrued, purgeOldSnapshots } = require("./ingest");
 const app = express();
 const PORT = 3001;
 const DATA_DIR = path.join(__dirname, "data");
+const UPLOAD_TMP_DIR = path.join(__dirname, "uploads");
 const BRANCHES_FILE = path.join(DATA_DIR, "branches.json");
 const RETENTION_DAYS = 90;
+const MAX_UPLOAD_BYTES = 150 * 1024 * 1024; // 150 MB
 
-// ─── Ensure data directory exists ───────────────────────────────────────────
+// ─── Ensure data + upload directories exist ─────────────────────────────────
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+if (!fs.existsSync(UPLOAD_TMP_DIR)) fs.mkdirSync(UPLOAD_TMP_DIR, { recursive: true });
 
 // ─── Default data ───────────────────────────────────────────────────────────
 const DEFAULT_BRANCHES = [
@@ -251,16 +255,86 @@ app.get("/api/customers/lookup", (req, res) => {
 // suspenders check. Read endpoints are unrestricted (same pattern as existing
 // /api/:collection routes).
 
-const uploader = multer({ limits: { fileSize: 150 * 1024 * 1024 } });
+// Disk-backed storage so 100+ MB uploads don't sit in Node's heap.
+// Files land in server/uploads/ and are unlinked after processing.
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, UPLOAD_TMP_DIR),
+  filename: (req, file, cb) => {
+    const safe = String(file.originalname || "upload").replace(/[^A-Za-z0-9_.-]+/g, "_");
+    cb(null, `${Date.now()}-${Math.random().toString(36).slice(2,8)}-${safe}`);
+  },
+});
 
-// Wraps multer.single() so Multer errors (file-size, disk, etc.) always come back
-// as JSON with a meaningful message instead of crashing Express into a blank body.
+// Reject anything that isn't a CSV/TXT at the multer level so garbage
+// (exe, pdf, xlsx, etc.) never touches disk.
+function csvFileFilter(req, file, cb) {
+  const name = String(file.originalname || "").toLowerCase();
+  const ok =
+    name.endsWith(".csv") ||
+    name.endsWith(".txt") ||
+    /^text\//.test(file.mimetype) ||
+    file.mimetype === "application/vnd.ms-excel" || // some browsers tag CSV as this
+    file.mimetype === "application/octet-stream";   // conservative fallback
+  if (!ok) {
+    const err = new Error(`Only .csv / .txt files are accepted (got ${file.originalname || file.mimetype}).`);
+    err.code = "UNSUPPORTED_TYPE";
+    return cb(err);
+  }
+  cb(null, true);
+}
+
+const uploader = multer({
+  storage,
+  limits: { fileSize: MAX_UPLOAD_BYTES },
+  fileFilter: csvFileFilter,
+});
+
+// Safely unlink a tmp file; never throws.
+function cleanupTmp(filePath) {
+  if (!filePath) return;
+  fs.unlink(filePath, (err) => {
+    if (err && err.code !== "ENOENT") {
+      console.warn(`[UPLOAD] failed to remove tmp file ${filePath}:`, err.message);
+    }
+  });
+}
+
+// Read an uploaded file and decode it as UTF-8 even when the bank sends
+// CP1252/latin1 (common for Tamil/Windows exports). Detects BOM first.
+function readUploadAsUtf8(filePath) {
+  const buf = fs.readFileSync(filePath);
+  if (buf.length >= 3 && buf[0] === 0xef && buf[1] === 0xbb && buf[2] === 0xbf) {
+    return buf.slice(3).toString("utf8");
+  }
+  if (buf.length >= 2 && buf[0] === 0xff && buf[1] === 0xfe) {
+    return iconv.decode(buf.slice(2), "utf-16le");
+  }
+  if (buf.length >= 2 && buf[0] === 0xfe && buf[1] === 0xff) {
+    return iconv.decode(buf.slice(2), "utf-16be");
+  }
+  // Heuristic: if the buffer decoded as UTF-8 contains U+FFFD (replacement
+  // character), it probably isn't UTF-8. Fall back to CP1252 which is a
+  // superset of latin1 and the usual Windows-India default.
+  const asUtf8 = buf.toString("utf8");
+  if (asUtf8.includes("\uFFFD")) {
+    return iconv.decode(buf, "win1252");
+  }
+  return asUtf8;
+}
+
+// Wraps multer.single() so Multer errors (file-size, wrong type, disk, etc.)
+// always come back as JSON with a meaningful message instead of crashing
+// Express into a blank body.
 function uploadField(fieldName) {
   return (req, res, next) => {
     uploader.single(fieldName)(req, res, (err) => {
       if (err) {
         console.error(`[UPLOAD:${fieldName}] multer error:`, err);
-        return res.status(400).json({ error: `Upload error: ${err.message || err.code || "unknown"}` });
+        let msg = err.message || err.code || "unknown upload error";
+        if (err.code === "LIMIT_FILE_SIZE") {
+          msg = `File exceeds the ${Math.round(MAX_UPLOAD_BYTES / 1024 / 1024)} MB upload limit.`;
+        }
+        return res.status(400).json({ error: msg });
       }
       next();
     });
@@ -277,41 +351,72 @@ function requireUploader(req, res, next) {
 
 function todayIso() { return new Date().toISOString().slice(0, 10); }
 
+// Accept strict YYYY-MM-DD; reject "yesterday", "2026-13-40", etc.
+// Empty/missing value is treated as "today" (existing behaviour).
+function validateSnapshotDate(raw) {
+  if (raw == null || raw === "") return { ok: true, value: todayIso() };
+  const s = String(raw).slice(0, 10);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return { ok: false, error: `Invalid snapshotDate "${raw}" — expected YYYY-MM-DD.` };
+  const d = new Date(s + "T00:00:00Z");
+  if (isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== s) {
+    return { ok: false, error: `Invalid calendar date "${raw}".` };
+  }
+  return { ok: true, value: s };
+}
+
 // POST /api/od/pool/upload — ingest Compressed Pool Report (pipe-delimited)
 app.post("/api/od/pool/upload", requireUploader, uploadField("file"), (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+  const tmpPath = req.file.path;
   const t0 = Date.now();
   try {
-    const snapshotDate = (req.body.snapshotDate || todayIso()).slice(0, 10);
+    const dateCheck = validateSnapshotDate(req.body.snapshotDate);
+    if (!dateCheck.ok) return res.status(400).json({ error: dateCheck.error });
+    const snapshotDate = dateCheck.value;
     const uploadedBy = req.header("x-od-user") || "unknown";
     console.log(`[POOL UPLOAD] ${req.file.originalname} (${(req.file.size/1024/1024).toFixed(2)}MB) for ${snapshotDate}`);
-    const result = ingestPool(req.file.buffer.toString("utf8"), {
+    const text = readUploadAsUtf8(tmpPath);
+    const result = ingestPool(text, {
       snapshotDate, branchesFile: BRANCHES_FILE, uploadedBy, filename: req.file.originalname,
     });
     console.log(`[POOL UPLOAD] done in ${Date.now()-t0}ms — ${result.rowCount} rows, ${result.newBranches} new branches`);
     res.json({ ok: true, snapshotDate, ...result });
   } catch (err) {
     console.error("[POOL UPLOAD] error:", err);
-    if (!res.headersSent) res.status(500).json({ error: err.message || String(err) });
+    if (!res.headersSent) {
+      const code = err.statusCode || 500;
+      res.status(code).json({ error: err.message || String(err) });
+    }
+  } finally {
+    cleanupTmp(tmpPath);
   }
 });
 
 // POST /api/od/accrued/upload — ingest Interest Accrued Not Due Report (comma)
 app.post("/api/od/accrued/upload", requireUploader, uploadField("file"), (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+  const tmpPath = req.file.path;
   const t0 = Date.now();
   try {
-    const snapshotDate = (req.body.snapshotDate || todayIso()).slice(0, 10);
+    const dateCheck = validateSnapshotDate(req.body.snapshotDate);
+    if (!dateCheck.ok) return res.status(400).json({ error: dateCheck.error });
+    const snapshotDate = dateCheck.value;
     const uploadedBy = req.header("x-od-user") || "unknown";
     console.log(`[ACCRUED UPLOAD] ${req.file.originalname} (${(req.file.size/1024/1024).toFixed(2)}MB) for ${snapshotDate}`);
-    const result = ingestAccrued(req.file.buffer.toString("utf8"), {
+    const text = readUploadAsUtf8(tmpPath);
+    const result = ingestAccrued(text, {
       snapshotDate, branchesFile: BRANCHES_FILE, uploadedBy, filename: req.file.originalname,
     });
     console.log(`[ACCRUED UPLOAD] done in ${Date.now()-t0}ms — ${result.rowCount} rows, col=${result.currentAccruedColumn}`);
     res.json({ ok: true, snapshotDate, ...result });
   } catch (err) {
     console.error("[ACCRUED UPLOAD] error:", err);
-    if (!res.headersSent) res.status(500).json({ error: err.message || String(err) });
+    if (!res.headersSent) {
+      const code = err.statusCode || 500;
+      res.status(code).json({ error: err.message || String(err) });
+    }
+  } finally {
+    cleanupTmp(tmpPath);
   }
 });
 

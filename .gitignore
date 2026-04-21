@@ -2,3 +2,31 @@ node_modules
 dist
 .DS_Store
 *.local
+
+# Vite temp config cache
+vite.config.js.timestamp-*.mjs
+vite.config.ts.timestamp-*.mjs
+
+# Server runtime data — must never be committed.
+# These files contain live customer data and credentials and are managed
+# on the production host. Committing them causes `git pull` to overwrite
+# the server's DB and can leak PII into git history.
+server/data/*.sqlite
+server/data/*.sqlite-wal
+server/data/*.sqlite-shm
+server/data/*.sqlite-journal
+server/data/users.json
+server/data/entries.json
+server/data/notifications.json
+server/data/config.json
+server/data/audit-log.json
+server/uploads/
+
+# One-off local artifacts
+failed-entries-to-fix.xlsx
+*.log
+
+# Env / secrets
+.env
+.env.*
+!.env.example
