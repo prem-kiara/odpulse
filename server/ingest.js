@@ -71,9 +71,29 @@ function checkpoint() {
 function ingestPool(fileContent, opts) {
   const { snapshotDate, branchesFile, uploadedBy, filename } = opts;
 
+  // Some Finflux Pool Report exports include a "group label" row as line 1:
+  //   ||||||||||...Installment 1||||Installment 2||||Installment 3...
+  // This row marks where the repeating per-installment demand columns begin.
+  // The REAL header row ("Loan number|Customer number|Member Name|...") is then
+  // on line 2. If we feed this straight into csv-parse with columns:true, every
+  // real column name becomes a DATA value and ingestion fails with
+  // "missing required columns: Loan number, Member Name, ...".
+  // Detect and strip that leading group-label row if present.
+  let content = fileContent;
+  const firstNewline = content.indexOf("\n");
+  if (firstNewline > 0) {
+    const firstLine = content.slice(0, firstNewline);
+    const looksLikeGroupLabels =
+      !/Loan\s*number/i.test(firstLine) && /Installment\s+\d+/i.test(firstLine);
+    if (looksLikeGroupLabels) {
+      console.log(`[ingestPool] detected group-label first line, stripping it before parse`);
+      content = content.slice(firstNewline + 1);
+    }
+  }
+
   let rows;
   try {
-    rows = parse(fileContent, {
+    rows = parse(content, {
       delimiter: "|",
       quote: '"',
       columns: true,

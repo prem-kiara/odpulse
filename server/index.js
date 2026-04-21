@@ -430,11 +430,18 @@ app.post("/api/od/accrued/upload", requireUploader, uploadField("file"), (req, r
 app.post("/api/od/overdue/upload", requireUploader, uploadField("file"), (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No file uploaded" });
   const t0 = Date.now();
+  const tmpPath = req.file.path;
   try {
     const snapshotDate = (req.body.snapshotDate || todayIso()).slice(0, 10);
     const uploadedBy = req.header("x-od-user") || "unknown";
     console.log(`[OVERDUE UPLOAD] ${req.file.originalname} (${(req.file.size/1024/1024).toFixed(2)}MB) for ${snapshotDate}`);
-    const result = ingestOverdue(req.file.buffer.toString("utf8"), {
+    // Multer uses disk storage (see storage config) so req.file.buffer is
+    // undefined — calling .toString() on it throws
+    // "Cannot read properties of undefined (reading 'toString')".
+    // Read the tmp file from disk instead. readUploadAsUtf8 also handles
+    // CP1252/UTF-16 encodings common in Finflux exports.
+    const text = readUploadAsUtf8(tmpPath);
+    const result = ingestOverdue(text, {
       snapshotDate, branchesFile: BRANCHES_FILE, uploadedBy, filename: req.file.originalname,
     });
     console.log(`[OVERDUE UPLOAD] done in ${Date.now()-t0}ms — ${result.rowCount} rows, ${result.newBranches} new branches`);
@@ -442,6 +449,8 @@ app.post("/api/od/overdue/upload", requireUploader, uploadField("file"), (req, r
   } catch (err) {
     console.error("[OVERDUE UPLOAD] error:", err);
     if (!res.headersSent) res.status(500).json({ error: err.message || String(err) });
+  } finally {
+    cleanupTmp(tmpPath);
   }
 });
 
@@ -480,10 +489,15 @@ function extractPeriodFromClientWiseHeader(text) {
 app.post("/api/od/collections/upload", requireUploader, uploadField("file"), (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No file uploaded" });
   const t0 = Date.now();
+  const tmpPath = req.file.path;
   try {
     const uploadedBy = req.header("x-od-user") || "unknown";
     console.log(`[COLLECTIONS UPLOAD] ${req.file.originalname} (${(req.file.size/1024/1024).toFixed(2)}MB)`);
-    const result = ingestCollections(req.file.buffer.toString("utf8"), {
+    // Multer disk-storage fix: read the uploaded tmp file from req.file.path
+    // rather than the (undefined) req.file.buffer. Same pattern as pool/accrued
+    // upload routes above.
+    const text = readUploadAsUtf8(tmpPath);
+    const result = ingestCollections(text, {
       branchesFile: BRANCHES_FILE, uploadedBy, filename: req.file.originalname,
     });
     console.log(`[COLLECTIONS UPLOAD] done in ${Date.now()-t0}ms — ${result.rowsInserted} inserted, ${result.rowsSkipped} duplicates skipped`);
@@ -491,6 +505,8 @@ app.post("/api/od/collections/upload", requireUploader, uploadField("file"), (re
   } catch (err) {
     console.error("[COLLECTIONS UPLOAD] error:", err);
     if (!res.headersSent) res.status(500).json({ error: err.message || String(err) });
+  } finally {
+    cleanupTmp(tmpPath);
   }
 });
 
