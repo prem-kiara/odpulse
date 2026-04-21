@@ -295,10 +295,32 @@ const REPORT_KINDS = [
   {
     key: "client-period", slug: "client-period",
     title: "Client-Wise Collection Report",
-    hint: "Pipe-delimited. Per-account demand vs collected for a period. Period is parsed from the filename or entered below.",
+    hint: "Pipe-delimited. Per-account demand vs collected. Period dates are auto-detected from the file's PRINCIPAL OUTSTANDING (DD-MM-YYYY) columns on file selection.",
     accent: "amber", needsSnapshot: false, needsPeriod: true,
   },
 ];
+
+// Parse the Client-Wise CSV header client-side to auto-fill the period window.
+// Header carries PRINCIPAL OUTSTANDING (DD-MM-YYYY) columns — we extract min/max.
+// Reads only the first 16 KB so 100+ MB files don't get decoded in the browser.
+async function extractPeriodFromCsvHeader(file) {
+  try {
+    const slice = file.slice(0, 16 * 1024);
+    const text = await slice.text();
+    const firstLine = text.split(/\r?\n/, 1)[0] || "";
+    const re = /PRINCIPAL\s+OUTSTANDING\s*\(\s*(\d{1,2})-(\d{1,2})-(\d{4})\s*\)/gi;
+    const dates = [];
+    let m;
+    while ((m = re.exec(firstLine)) !== null) {
+      dates.push(`${m[3]}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`);
+    }
+    if (dates.length === 0) return null;
+    dates.sort();
+    return { start: dates[0], end: dates[dates.length - 1] };
+  } catch {
+    return null;
+  }
+}
 
 export function DataUploadPage({ user, canUpload }) {
   const [files, setFiles] = useState({});
@@ -307,6 +329,12 @@ export function DataUploadPage({ user, canUpload }) {
     return { pool: today, accrued: today, overdue: today };
   });
   const [period, setPeriod] = useState({ start: "", end: "" });
+  // Tracks auto-detect state for the Client-Wise period dates:
+  // "idle"      — no file picked yet (or file is non-client-period)
+  // "detecting" — reading header (brief, only for big files)
+  // "detected"  — successfully parsed; period inputs now show header-derived dates
+  // "failed"    — header didn't contain PRINCIPAL OUTSTANDING (…) columns; user must enter manually
+  const [periodAutoStatus, setPeriodAutoStatus] = useState("idle");
   const [busyKind, setBusyKind] = useState("");
   const [msg, setMsg] = useState(null);
   const [history, setHistory] = useState({
@@ -601,21 +629,50 @@ export function DataUploadPage({ user, canUpload }) {
                   <div>
                     <label className="block text-xs font-medium text-gray-600 mb-1">Period Start</label>
                     <input type="date" value={period.start}
-                      onChange={e => setPeriod(prev => ({ ...prev, start: e.target.value }))}
+                      onChange={e => { setPeriod(prev => ({ ...prev, start: e.target.value })); setPeriodAutoStatus("idle"); }}
                       className={`w-full px-2 py-2 border rounded-lg focus:ring-2 text-sm ${cls.ring}`} />
                   </div>
                   <div>
                     <label className="block text-xs font-medium text-gray-600 mb-1">Period End</label>
                     <input type="date" value={period.end}
-                      onChange={e => setPeriod(prev => ({ ...prev, end: e.target.value }))}
+                      onChange={e => { setPeriod(prev => ({ ...prev, end: e.target.value })); setPeriodAutoStatus("idle"); }}
                       className={`w-full px-2 py-2 border rounded-lg focus:ring-2 text-sm ${cls.ring}`} />
                   </div>
-                  <div className="col-span-2 text-[10px] text-gray-500 -mt-1">Leave blank to auto-detect from filename.</div>
+                  <div className="col-span-2 text-[10px] -mt-1">
+                    {periodAutoStatus === "detected" && (
+                      <span className="text-emerald-600">✓ Auto-detected from file header — edit if needed.</span>
+                    )}
+                    {periodAutoStatus === "detecting" && (
+                      <span className="text-gray-500">Reading file header…</span>
+                    )}
+                    {periodAutoStatus === "failed" && (
+                      <span className="text-amber-600">Could not auto-detect dates — enter manually (file needs "PRINCIPAL OUTSTANDING (DD-MM-YYYY)" columns).</span>
+                    )}
+                    {periodAutoStatus === "idle" && (
+                      <span className="text-gray-500">Dates will be auto-detected from the file header on selection.</span>
+                    )}
+                  </div>
                 </div>
               )}
               <label className="block text-xs font-medium text-gray-600 mb-1">CSV File</label>
               <input type="file" accept=".csv,.txt"
-                onChange={e => setFiles(prev => ({ ...prev, [k.key]: e.target.files?.[0] || null }))}
+                onChange={async e => {
+                  const f = e.target.files?.[0] || null;
+                  setFiles(prev => ({ ...prev, [k.key]: f }));
+                  // Client-Wise: peek the header and auto-fill Period Start/End from the
+                  // PRINCIPAL OUTSTANDING (DD-MM-YYYY) columns. User can still override
+                  // by typing into the date inputs (which resets the status to "idle").
+                  if (f && k.key === "client-period") {
+                    setPeriodAutoStatus("detecting");
+                    const p = await extractPeriodFromCsvHeader(f);
+                    if (p) {
+                      setPeriod({ start: p.start, end: p.end });
+                      setPeriodAutoStatus("detected");
+                    } else {
+                      setPeriodAutoStatus("failed");
+                    }
+                  }
+                }}
                 className={`w-full text-sm mb-3 file:mr-3 file:py-2 file:px-3 file:rounded-lg file:border-0 ${cls.fileBg} file:font-medium file:cursor-pointer`} />
               {f && <div className="text-xs text-gray-500 mb-3 truncate">Selected: {f.name} ({(f.size / 1024 / 1024).toFixed(2)} MB)</div>}
               <button onClick={() => upload(k.key)} disabled={busy || !f}

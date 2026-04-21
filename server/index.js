@@ -457,6 +457,24 @@ function extractPeriodFromFilename(name) {
   };
 }
 
+// Helper: pull the period window from a Client-Wise CSV header by scanning
+// "PRINCIPAL OUTSTANDING (DD-MM-YYYY)" columns and using min/max dates.
+// This is the authoritative source — it matches what ingest.js already uses
+// to build the PO snapshot columns — and lets us ingest files whose name
+// doesn't carry a date (e.g. "ClientWiseCollectionReport.csv").
+function extractPeriodFromClientWiseHeader(text) {
+  const firstLine = (String(text || "").split(/\r?\n/, 1)[0] || "");
+  const re = /PRINCIPAL\s+OUTSTANDING\s*\(\s*(\d{1,2})-(\d{1,2})-(\d{4})\s*\)/gi;
+  const dates = [];
+  let m;
+  while ((m = re.exec(firstLine)) !== null) {
+    dates.push(`${m[3]}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`);
+  }
+  if (dates.length === 0) return null;
+  dates.sort();
+  return { periodStart: dates[0], periodEnd: dates[dates.length - 1] };
+}
+
 // POST /api/od/collections/upload — ingest Collection Report (pipe-delimited)
 // Idempotent per receipt_no so re-uploading the same extract is safe.
 app.post("/api/od/collections/upload", requireUploader, uploadField("file"), (req, res) => {
@@ -481,26 +499,52 @@ app.post("/api/od/collections/upload", requireUploader, uploadField("file"), (re
 app.post("/api/od/client-period/upload", requireUploader, uploadField("file"), (req, res) => {
   if (!req.file) return res.status(400).json({ error: "No file uploaded" });
   const t0 = Date.now();
+  const tmpPath = req.file.path;
   try {
     const uploadedBy = req.header("x-od-user") || "unknown";
     let periodStart = (req.body.periodStart || "").slice(0, 10);
     let periodEnd = (req.body.periodEnd || "").slice(0, 10);
+
+    // 1) Try filename (legacy path, e.g. "...YYYYMMDD_YYYYMMDD.csv")
     if (!periodStart || !periodEnd) {
       const p = extractPeriodFromFilename(req.file.originalname);
       if (p) { periodStart = periodStart || p.periodStart; periodEnd = periodEnd || p.periodEnd; }
     }
+
+    // Read the file. Multer uses disk storage (see the storage config above),
+    // so req.file.buffer is undefined — we have to read req.file.path.
+    // readUploadAsUtf8 also handles CP1252/UTF-16 bank exports.
+    const text = readUploadAsUtf8(tmpPath);
+
+    // 2) Fall back to parsing the CSV header's PRINCIPAL OUTSTANDING (DD-MM-YYYY)
+    // columns. This is the preferred path — filename-less uploads like
+    // "ClientWiseCollectionReport.csv" still work.
+    let periodSource = (periodStart && periodEnd) ? "user-or-filename" : null;
     if (!periodStart || !periodEnd) {
-      return res.status(400).json({ error: "periodStart and periodEnd are required (YYYY-MM-DD) or must be derivable from the filename." });
+      const p2 = extractPeriodFromClientWiseHeader(text);
+      if (p2) {
+        periodStart = periodStart || p2.periodStart;
+        periodEnd = periodEnd || p2.periodEnd;
+        periodSource = "header";
+      }
     }
-    console.log(`[CLIENT-PERIOD UPLOAD] ${req.file.originalname} (${(req.file.size/1024/1024).toFixed(2)}MB) for ${periodStart}..${periodEnd}`);
-    const result = ingestClientPeriod(req.file.buffer.toString("utf8"), {
+
+    if (!periodStart || !periodEnd) {
+      return res.status(400).json({
+        error: "periodStart and periodEnd are required (YYYY-MM-DD) — could not auto-detect from filename or CSV header. Ensure the file has PRINCIPAL OUTSTANDING (DD-MM-YYYY) columns.",
+      });
+    }
+    console.log(`[CLIENT-PERIOD UPLOAD] ${req.file.originalname} (${(req.file.size/1024/1024).toFixed(2)}MB) for ${periodStart}..${periodEnd} [source: ${periodSource || "user-or-filename"}]`);
+    const result = ingestClientPeriod(text, {
       periodStart, periodEnd, branchesFile: BRANCHES_FILE, uploadedBy, filename: req.file.originalname,
     });
     console.log(`[CLIENT-PERIOD UPLOAD] done in ${Date.now()-t0}ms — ${result.rowCount} rows, ${result.principalCols} PO snapshot cols`);
-    res.json({ ok: true, periodStart, periodEnd, ...result });
+    res.json({ ok: true, periodStart, periodEnd, periodSource: periodSource || "user-or-filename", ...result });
   } catch (err) {
     console.error("[CLIENT-PERIOD UPLOAD] error:", err);
     if (!res.headersSent) res.status(500).json({ error: err.message || String(err) });
+  } finally {
+    cleanupTmp(tmpPath);
   }
 });
 
