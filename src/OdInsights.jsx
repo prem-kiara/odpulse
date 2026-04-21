@@ -14,8 +14,11 @@ import {
   Upload, CheckCircle, AlertTriangle, Clock, FileText, Database, RefreshCw,
   Search, Download, Users, TrendingUp, Phone, PhoneOff, Target, DollarSign,
   Activity, Calendar, Skull, Wallet, Layers, Gauge, X, ChevronRight, Package,
-  Building2, Grid3x3,
+  Building2, Grid3x3, CloudOff, Trash2,
 } from "lucide-react";
+import {
+  enqueueUpload, listQueue, deleteFromQueue, drainQueue, isBackendUp,
+} from "./uploadQueue";
 
 const API_BASE = "/api";
 const COLORS = ["#0f766e", "#06b6d4", "#8b5cf6", "#f59e0b", "#ef4444", "#10b981", "#ec4899", "#6366f1", "#14b8a6", "#f97316"];
@@ -310,6 +313,8 @@ export function DataUploadPage({ user, canUpload }) {
     uploads: [], latestPool: null, latestAccrued: null, latestOverdue: null, latestClientPeriod: null,
     totalCustomers: 0, totalCollections: { n: 0, total: 0 }, retentionDays: 90,
   });
+  const [queue, setQueue] = useState([]);         // pending uploads waiting for backend
+  const [backendUp, setBackendUp] = useState(true);
 
   const loadHistory = useCallback(() => {
     fetch(`${API_BASE}/od/upload-history`)
@@ -318,46 +323,95 @@ export function DataUploadPage({ user, canUpload }) {
       .catch(() => {});
   }, []);
 
-  useEffect(() => { loadHistory(); }, [loadHistory]);
+  const refreshQueue = useCallback(async () => {
+    try { setQueue(await listQueue()); }
+    catch { /* IndexedDB unavailable — fine, just show nothing */ }
+  }, []);
+
+  useEffect(() => { loadHistory(); refreshQueue(); }, [loadHistory, refreshQueue]);
+
+  // Core send helper — used both for direct uploads and when draining the queue.
+  // Returns the server response JSON on success.
+  // Throws { networkError: true, message } when the backend is unreachable.
+  const sendUpload = useCallback(async (item) => {
+    const fd = new FormData();
+    fd.append("file", item.file, item.filename || "upload.csv");
+    if (["pool", "accrued", "overdue"].includes(item.kind)) fd.append("snapshotDate", item.snapshotDate || "");
+    if (item.kind === "client-period") {
+      if (item.periodStart) fd.append("periodStart", item.periodStart);
+      if (item.periodEnd)   fd.append("periodEnd", item.periodEnd);
+    }
+    let res;
+    try {
+      res = await fetch(`${API_BASE}/od/${item.kind}/upload`, {
+        method: "POST",
+        headers: { "x-od-role": item.userRole || "", "x-od-user": item.userName || "" },
+        body: fd,
+      });
+    } catch (networkErr) {
+      const e = new Error("Backend unreachable");
+      e.networkError = true;
+      throw e;
+    }
+    const raw = await res.text();
+    let json = null;
+    if (raw) { try { json = JSON.parse(raw); } catch {} }
+    if (!res.ok) {
+      const looksLikeProxyError = !json && (res.status === 500 || res.status === 502 || res.status === 503 || res.status === 504) && (!raw || /<html|ECONNREFUSED|proxy error/i.test(raw));
+      if (looksLikeProxyError) {
+        const e = new Error("Backend unreachable (proxy error)");
+        e.networkError = true;
+        throw e;
+      }
+      const errMsg = (json && json.error) || raw || `HTTP ${res.status}`;
+      throw new Error(errMsg.slice(0, 500));
+    }
+    if (!json) throw new Error("Server returned an empty response — the upload may have timed out.");
+    return json;
+  }, []);
+
+  // Periodically probe the backend and drain the queue when it's back up.
+  useEffect(() => {
+    let cancelled = false;
+    const tick = async () => {
+      const up = await isBackendUp(`${API_BASE}/health`);
+      if (cancelled) return;
+      setBackendUp(up);
+      if (up) {
+        const q = await listQueue();
+        if (q.length > 0) {
+          const r = await drainQueue(sendUpload);
+          if (cancelled) return;
+          await refreshQueue();
+          if (r.succeeded > 0) {
+            setMsg({ kind: "success", text: `Backend is back — flushed ${r.succeeded} queued upload(s).` });
+            loadHistory();
+          }
+        }
+      }
+    };
+    tick();  // run immediately
+    const id = setInterval(tick, 30000);  // and every 30s
+    return () => { cancelled = true; clearInterval(id); };
+  }, [sendUpload, loadHistory, refreshQueue]);
 
   const upload = async (kind) => {
     const f = files[kind];
     if (!f) { setMsg({ kind: "error", text: `Choose a ${kind} file first.` }); return; }
     setBusyKind(kind);
     setMsg(null);
+    const item = {
+      kind,
+      file: f,
+      filename: f.name,
+      snapshotDate: ["pool", "accrued", "overdue"].includes(kind) ? (dates[kind] || "") : "",
+      periodStart: kind === "client-period" ? (period.start || "") : "",
+      periodEnd:   kind === "client-period" ? (period.end || "")   : "",
+      userRole: user.role,
+      userName: user.username || user.id,
+    };
     try {
-      const fd = new FormData();
-      fd.append("file", f);
-      if (["pool", "accrued", "overdue"].includes(kind)) fd.append("snapshotDate", dates[kind] || "");
-      if (kind === "client-period") {
-        if (period.start) fd.append("periodStart", period.start);
-        if (period.end) fd.append("periodEnd", period.end);
-      }
-      let res;
-      try {
-        res = await fetch(`${API_BASE}/od/${kind}/upload`, {
-          method: "POST",
-          headers: { "x-od-role": user.role, "x-od-user": user.username || user.id },
-          body: fd,
-        });
-      } catch (networkErr) {
-        // fetch() itself rejected — usually means the dev proxy / backend is unreachable.
-        throw new Error("Backend API unreachable — is the server running on port 3001? (Run `npm run dev:server` or `npm run dev:all` from the project root.)");
-      }
-      const raw = await res.text();
-      let json = null;
-      if (raw) { try { json = JSON.parse(raw); } catch {} }
-      if (!res.ok) {
-        // Vite proxy surfaces ECONNREFUSED as a 500 with an HTML body and no JSON error.
-        const looksLikeProxyError = !json && (res.status === 500 || res.status === 502 || res.status === 503 || res.status === 504) && (!raw || /<html|ECONNREFUSED|proxy error/i.test(raw));
-        if (looksLikeProxyError) {
-          throw new Error("Backend API unreachable — is the server running on port 3001? (Run `npm run dev:server` or `npm run dev:all` from the project root.)");
-        }
-        const errMsg = (json && json.error) || raw || `HTTP ${res.status}`;
-        throw new Error(errMsg.slice(0, 500));
-      }
-      if (!json) throw new Error("Server returned an empty response — the upload may have timed out. Check the server console.");
-
+      const json = await sendUpload(item);
       let summary = `${kind} uploaded: `;
       if (kind === "collections") {
         summary += `${json.rowsInserted} new receipts, ${json.rowsSkipped} duplicates skipped`;
@@ -367,13 +421,51 @@ export function DataUploadPage({ user, canUpload }) {
       if (json.newBranches) summary += `, ${json.newBranches} new branch(es)`;
       setMsg({ kind: "success", text: summary });
       setFiles(prev => ({ ...prev, [kind]: null }));
+      setBackendUp(true);
       loadHistory();
     } catch (err) {
-      setMsg({ kind: "error", text: err.message });
+      if (err.networkError) {
+        // Backend down — queue the file instead of failing hard.
+        try {
+          await enqueueUpload(item);
+          await refreshQueue();
+          setBackendUp(false);
+          setMsg({
+            kind: "success",  // visually positive — the staff action succeeded
+            text: `Backend unreachable — file queued locally and will upload automatically when the API is back up. Safe to close or refresh this page.`,
+          });
+          setFiles(prev => ({ ...prev, [kind]: null }));
+        } catch (queueErr) {
+          setMsg({ kind: "error", text: `Backend unreachable and failed to queue locally: ${queueErr.message}` });
+        }
+      } else {
+        setMsg({ kind: "error", text: err.message });
+      }
     } finally {
       setBusyKind("");
     }
   };
+
+  const retryQueueNow = useCallback(async () => {
+    setMsg(null);
+    const r = await drainQueue(sendUpload);
+    await refreshQueue();
+    if (r.succeeded > 0) {
+      setMsg({ kind: "success", text: `Flushed ${r.succeeded} queued upload(s).` });
+      loadHistory();
+    } else if (r.stillDown) {
+      setMsg({ kind: "error", text: `Backend still unreachable. Will keep retrying in the background.` });
+    } else if (r.failed > 0) {
+      setMsg({ kind: "error", text: `${r.failed} queued upload(s) failed server-side. See details below.` });
+    } else {
+      setMsg({ kind: "success", text: `Queue is empty.` });
+    }
+  }, [sendUpload, loadHistory, refreshQueue]);
+
+  const discardQueued = useCallback(async (id) => {
+    await deleteFromQueue(id);
+    await refreshQueue();
+  }, [refreshQueue]);
 
   // Permission: controlled by App.jsx (canUpload prop). Fall back to the
   // legacy role check if the prop is not supplied, so direct mounts still work.
@@ -446,6 +538,41 @@ export function DataUploadPage({ user, canUpload }) {
         <div className={`mb-4 p-3 rounded-lg border flex items-center gap-2 text-sm ${msg.kind === "success" ? "bg-green-50 border-green-200 text-green-700" : "bg-red-50 border-red-200 text-red-700"}`}>
           {msg.kind === "success" ? <CheckCircle size={16} /> : <AlertTriangle size={16} />}
           {msg.text}
+        </div>
+      )}
+
+      {/* Queue banner — shown when there are pending uploads waiting for the backend */}
+      {queue.length > 0 && (
+        <div className="mb-4 p-3 rounded-lg border bg-amber-50 border-amber-200 text-amber-800">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2 text-sm font-medium">
+              <CloudOff size={16} />
+              {backendUp
+                ? `${queue.length} upload(s) pending — retrying now…`
+                : `${queue.length} upload(s) queued locally. Backend is unreachable; auto-retrying every 30s.`}
+            </div>
+            <button onClick={retryQueueNow}
+              className="text-xs px-3 py-1.5 rounded-md bg-amber-600 text-white hover:bg-amber-700 flex items-center gap-1">
+              <RefreshCw size={12} /> Retry now
+            </button>
+          </div>
+          <ul className="mt-2 text-xs space-y-1">
+            {queue.map(q => (
+              <li key={q.id} className="flex items-center justify-between gap-2 bg-white/50 rounded px-2 py-1">
+                <span className="truncate">
+                  <span className="font-mono font-semibold">{q.kind}</span> · {q.filename}
+                  {q.snapshotDate ? ` · ${q.snapshotDate}` : ""}
+                  {q.attempts > 0 ? ` · ${q.attempts} attempt(s)` : ""}
+                  {q.lastError ? ` · last error: ${q.lastError}` : ""}
+                </span>
+                <button onClick={() => discardQueued(q.id)}
+                  className="text-amber-700 hover:text-red-600"
+                  title="Remove from queue">
+                  <Trash2 size={12} />
+                </button>
+              </li>
+            ))}
+          </ul>
         </div>
       )}
 

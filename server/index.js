@@ -8,7 +8,7 @@ const multer = require("multer");
 const iconv = require("iconv-lite");
 
 const db = require("./db");
-const { ingestPool, ingestAccrued, ingestOverdue, ingestCollections, ingestClientPeriod, purgeOldSnapshots } = require("./ingest");
+const { ingestPool, ingestAccrued, ingestOverdue, ingestCollections, ingestClientPeriod, purgeOldSnapshots, rollupMonthlySnapshots } = require("./ingest");
 
 const app = express();
 const PORT = 3001;
@@ -16,7 +16,7 @@ const DATA_DIR = path.join(__dirname, "data");
 const UPLOAD_TMP_DIR = path.join(__dirname, "uploads");
 const BRANCHES_FILE = path.join(DATA_DIR, "branches.json");
 const RETENTION_DAYS = 90;
-const MAX_UPLOAD_BYTES = 150 * 1024 * 1024; // 150 MB
+const MAX_UPLOAD_BYTES = 500 * 1024 * 1024; // 500 MB
 
 // ─── Ensure data + upload directories exist ─────────────────────────────────
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -1629,6 +1629,124 @@ app.post("/api/od/retention/run", requireUploader, (req, res) => {
   res.json(purgeOldSnapshots(RETENTION_DAYS));
 });
 
+// POST /api/od/rollup/run — manual rollup trigger (admin).
+// Useful for backfilling after restoring from a backup or to force a fresh
+// rollup without waiting for the 2:55 AM cron.
+app.post("/api/od/rollup/run", requireUploader, (req, res) => {
+  try {
+    const result = rollupMonthlySnapshots({ trigger: "manual" });
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    console.error("[ROLLUP] manual run failed:", err);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// GET /api/od/rollup/status — last N rollup runs + current rollup table sizes.
+// Lets the UI show "historical data goes back to YYYY-MM".
+app.get("/api/od/rollup/status", (req, res) => {
+  const recent = db.prepare(
+    `SELECT * FROM rollup_log ORDER BY run_at DESC LIMIT 20`
+  ).all();
+  const rowCount = (t) => db.prepare(`SELECT COUNT(*) AS n FROM ${t}`).get().n;
+  const minMax = (t) => db.prepare(
+    `SELECT MIN(year_month) AS min_ym, MAX(year_month) AS max_ym FROM ${t}`
+  ).get();
+  res.json({
+    recent,
+    tables: {
+      pool_monthly_account:    { rows: rowCount("pool_monthly_account"),    ...minMax("pool_monthly_account") },
+      pool_monthly_agg:        { rows: rowCount("pool_monthly_agg"),        ...minMax("pool_monthly_agg") },
+      overdue_monthly_account: { rows: rowCount("overdue_monthly_account"), ...minMax("overdue_monthly_account") },
+      overdue_monthly_agg:     { rows: rowCount("overdue_monthly_agg"),     ...minMax("overdue_monthly_agg") },
+      accrued_monthly_account: { rows: rowCount("accrued_monthly_account"), ...minMax("accrued_monthly_account") },
+    },
+  });
+});
+
+// GET /api/od/analytics/monthly-history?from=YYYY-MM&to=YYYY-MM&branch=
+// Long-horizon trend: per-month principal outstanding, overdue, and DPD-bucket
+// split — served entirely from pool_monthly_agg so it works for any month,
+// including months older than 90 days where daily snapshots are already gone.
+app.get("/api/od/analytics/monthly-history", (req, res) => {
+  const from = String(req.query.from || "");
+  const to = String(req.query.to || "");
+  const branch = String(req.query.branch || "");
+
+  let where = "1=1";
+  const params = [];
+  if (from)   { where += " AND year_month >= ?"; params.push(from); }
+  if (to)     { where += " AND year_month <= ?"; params.push(to); }
+  if (branch) { where += " AND branch = ?";      params.push(branch); }
+
+  // Totals per month (sum across branches and buckets).
+  const totals = db.prepare(`
+    SELECT year_month,
+           SUM(account_count)         AS accounts,
+           SUM(principal_outstanding) AS principal_outstanding,
+           SUM(interest_outstanding)  AS interest_outstanding,
+           SUM(principal_overdue)     AS principal_overdue,
+           SUM(interest_overdue)      AS interest_overdue,
+           SUM(current_od)            AS current_od
+      FROM pool_monthly_agg WHERE ${where}
+     GROUP BY year_month
+     ORDER BY year_month
+  `).all(...params);
+
+  // DPD bucket split per month.
+  const buckets = db.prepare(`
+    SELECT year_month, dpd_bucket,
+           SUM(account_count)         AS accounts,
+           SUM(principal_outstanding) AS principal_outstanding,
+           SUM(principal_overdue)     AS principal_overdue
+      FROM pool_monthly_agg WHERE ${where}
+     GROUP BY year_month, dpd_bucket
+     ORDER BY year_month,
+              CASE dpd_bucket
+                WHEN '0-Current' THEN 0 WHEN '1-30' THEN 1 WHEN '31-60' THEN 2
+                WHEN '61-90' THEN 3 WHEN '91-180' THEN 4 ELSE 5 END
+  `).all(...params);
+
+  // Branch split per month (only if no specific branch was filtered).
+  const byBranch = branch ? [] : db.prepare(`
+    SELECT year_month, branch,
+           SUM(account_count)         AS accounts,
+           SUM(principal_outstanding) AS principal_outstanding,
+           SUM(principal_overdue)     AS principal_overdue
+      FROM pool_monthly_agg WHERE ${where}
+     GROUP BY year_month, branch
+     ORDER BY year_month, branch
+  `).all(...params);
+
+  res.json({ filters: { from, to, branch: branch || null }, totals, buckets, byBranch });
+});
+
+// GET /api/od/analytics/monthly-account?year_month=YYYY-MM&branch=&dpd=
+// Account-level drill-down for a given past month. Answers "show me every
+// account that was in the 91-180 bucket in 2025-08" even if that daily snapshot
+// was purged 6 months ago.
+app.get("/api/od/analytics/monthly-account", (req, res) => {
+  const ym = String(req.query.year_month || "");
+  if (!ym) return res.status(400).json({ error: "year_month is required (YYYY-MM)" });
+  const branch = String(req.query.branch || "");
+  const dpd = String(req.query.dpd || "");
+  const limit = Math.min(Number(req.query.limit) || 500, 5000);
+
+  let where = "year_month = ?";
+  const params = [ym];
+  if (branch) { where += " AND branch = ?"; params.push(branch); }
+  if (dpd)    { where += " AND account_dpd_classification = ?"; params.push(dpd); }
+
+  const rows = db.prepare(`
+    SELECT * FROM pool_monthly_account
+     WHERE ${where}
+     ORDER BY principal_overdue DESC
+     LIMIT ?
+  `).all(...params, limit);
+
+  res.json({ year_month: ym, branch: branch || null, dpd: dpd || null, count: rows.length, rows });
+});
+
 // ── Pool Data (SQLite) helpers & routes ──────────────────────────────────────
 
 const POOL_JOIN = `
@@ -1959,14 +2077,45 @@ async function checkPTPReminders() {
 cron.schedule("0 8 * * *", () => { checkPTPReminders(); });
 cron.schedule("0 19 * * *", () => { checkPTPReminders(); });
 
+// ─── Schedule: Monthly rollup at 2:55 AM, right before the 3 AM purge ─────
+// This preserves month-end insights FOREVER before daily snapshots roll off.
+cron.schedule("55 2 * * *", () => {
+  try {
+    const r = rollupMonthlySnapshots({ trigger: "cron" });
+    console.log(`[ROLLUP] Monthly rollup complete:`, r);
+  } catch (err) {
+    console.error(`[ROLLUP] Monthly rollup FAILED:`, err);
+  }
+});
+
 // ─── Schedule: Retention purge of OD snapshots > 90 days at 3:00 AM daily ──
+// Belt-and-braces: run the rollup synchronously right before the purge too, so
+// if the 2:55 AM job was missed (clock skew, reboot, etc.) we never purge data
+// that hasn't been rolled up.
 cron.schedule("0 3 * * *", () => {
+  try {
+    const rr = rollupMonthlySnapshots({ trigger: "pre-purge" });
+    console.log(`[ROLLUP] Pre-purge rollup:`, rr);
+  } catch (err) {
+    console.error(`[ROLLUP] Pre-purge rollup FAILED — skipping purge to stay safe:`, err);
+    return;  // Abort the purge if rollup fails — data safety over disk usage.
+  }
   const r = purgeOldSnapshots(RETENTION_DAYS);
   console.log(`[RETENTION] Purged snapshots older than ${RETENTION_DAYS} days:`, r);
 });
 
 // Also run on server start (catches up after restarts)
 setTimeout(() => { checkPTPReminders(); }, 5000);
+
+// Run rollup on startup too — if the box was down at 2:55 AM, catch up now.
+setTimeout(() => {
+  try {
+    const r = rollupMonthlySnapshots({ trigger: "startup" });
+    console.log(`[ROLLUP] Startup rollup:`, r);
+  } catch (err) {
+    console.error(`[ROLLUP] Startup rollup FAILED:`, err);
+  }
+}, 10000);
 
 // ─── Start server ───────────────────────────────────────────────────────────
 app.listen(PORT, () => {

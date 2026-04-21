@@ -1,0 +1,41 @@
+; Systemd unit for the OD Pulse API — alternative to PM2 (do not run both).
+; Install:
+;   sudo cp /home/ubuntu/odpulse/odpulse-api.service /etc/systemd/system/odpulse-api.service
+;   sudo systemctl daemon-reload
+;   sudo systemctl enable odpulse-api        ; starts on boot, forever
+;   sudo systemctl start odpulse-api
+;   sudo systemctl status odpulse-api        ; verify
+;
+; If you are already running the API under PM2, DO NOT also enable this unit —
+; the second one will fail to bind :3001. Pick one supervisor.
+
+[Unit]
+Description=OD Pulse API (Express + SQLite)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/odpulse/server
+ExecStart=/usr/bin/node index.js
+Environment=NODE_ENV=production
+Environment=PORT=3001
+
+; Restart on any exit, with a short backoff so a broken build doesn't thrash the CPU.
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+; Journald captures stdout/stderr — view with `journalctl -u odpulse-api -f`.
+StandardOutput=journal
+StandardError=journal
+
+; Light hardening.
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

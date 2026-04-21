@@ -258,6 +258,136 @@ CREATE INDEX IF NOT EXISTS idx_cp_funder ON od_client_period(funder_name);
 CREATE INDEX IF NOT EXISTS idx_cp_product ON od_client_period(product_name);
 CREATE INDEX IF NOT EXISTS idx_cp_period_end ON od_client_period(period_end);
 CREATE INDEX IF NOT EXISTS idx_cp_loan ON od_client_period(loan_account_no);
+
+-- ─── Monthly rollups (NEVER purged) ───────────────────────────────────────
+-- The daily snapshot tables (pool_snapshots / accrued_snapshots / od_overdue)
+-- are purged after 90 days. To preserve long-horizon insights, a nightly job
+-- rolls the LATEST snapshot of each calendar month into these tables before
+-- the purge runs. These tables are the source of truth for any analytic that
+-- looks back more than 90 days.
+--
+-- year_month is TEXT in "YYYY-MM" form (simple to sort, easy to join).
+
+-- Account-level pool: one row per (year_month, loan_account_no) = the last
+-- pool_snapshot seen in that month for that loan.
+CREATE TABLE IF NOT EXISTS pool_monthly_account (
+  year_month TEXT NOT NULL,
+  loan_account_no TEXT NOT NULL,
+  snapshot_date TEXT NOT NULL,
+  branch TEXT,
+  principal_outstanding REAL,
+  interest_outstanding REAL,
+  principal_overdue REAL,
+  interest_overdue REAL,
+  current_od REAL,
+  overdue_days INTEGER,
+  installments_paid INTEGER,
+  loan_status TEXT,
+  account_dpd_classification TEXT,
+  customer_dpd INTEGER,
+  customer_dpd_classification TEXT,
+  last_payment_amount REAL,
+  total_interest_collected REAL,
+  PRIMARY KEY (year_month, loan_account_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pma_branch ON pool_monthly_account(branch);
+CREATE INDEX IF NOT EXISTS idx_pma_ym ON pool_monthly_account(year_month);
+CREATE INDEX IF NOT EXISTS idx_pma_dpd ON pool_monthly_account(account_dpd_classification);
+
+-- Aggregated pool: one row per (year_month, branch, dpd_bucket) for fast
+-- dashboards and long-horizon trend charts.
+CREATE TABLE IF NOT EXISTS pool_monthly_agg (
+  year_month TEXT NOT NULL,
+  branch TEXT NOT NULL,
+  dpd_bucket TEXT NOT NULL,           -- '0', '1-30', '31-60', '61-90', '91-180', '180+'
+  account_count INTEGER,
+  principal_outstanding REAL,
+  interest_outstanding REAL,
+  principal_overdue REAL,
+  interest_overdue REAL,
+  current_od REAL,
+  PRIMARY KEY (year_month, branch, dpd_bucket)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pmagg_ym ON pool_monthly_agg(year_month);
+CREATE INDEX IF NOT EXISTS idx_pmagg_branch ON pool_monthly_agg(branch);
+
+-- Account-level overdue (delinquent book history).
+CREATE TABLE IF NOT EXISTS overdue_monthly_account (
+  year_month TEXT NOT NULL,
+  loan_account_no TEXT NOT NULL,
+  snapshot_date TEXT NOT NULL,
+  customer_number TEXT,
+  customer_name TEXT,
+  branch_name TEXT,
+  branch_code TEXT,
+  officer_code TEXT,
+  principal_outstanding REAL,
+  interest_outstanding REAL,
+  installments_due INTEGER,
+  principal_default REAL,
+  interest_default REAL,
+  min_principal_overdue_days INTEGER,
+  max_principal_overdue_days INTEGER,
+  dpd_classification TEXT,
+  first_npa_date TEXT,
+  current_npa_date TEXT,
+  account_status TEXT,
+  death_case_remark TEXT,
+  PRIMARY KEY (year_month, loan_account_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_oma_branch ON overdue_monthly_account(branch_name);
+CREATE INDEX IF NOT EXISTS idx_oma_ym ON overdue_monthly_account(year_month);
+CREATE INDEX IF NOT EXISTS idx_oma_officer ON overdue_monthly_account(officer_code);
+CREATE INDEX IF NOT EXISTS idx_oma_dpd ON overdue_monthly_account(dpd_classification);
+
+-- Aggregated overdue: (year_month, branch, dpd_bucket).
+CREATE TABLE IF NOT EXISTS overdue_monthly_agg (
+  year_month TEXT NOT NULL,
+  branch_name TEXT NOT NULL,
+  dpd_bucket TEXT NOT NULL,
+  account_count INTEGER,
+  principal_default REAL,
+  interest_default REAL,
+  principal_outstanding REAL,
+  interest_outstanding REAL,
+  PRIMARY KEY (year_month, branch_name, dpd_bucket)
+);
+
+CREATE INDEX IF NOT EXISTS idx_omagg_ym ON overdue_monthly_agg(year_month);
+
+-- Account-level accrued snapshot (month-end accrued interest).
+CREATE TABLE IF NOT EXISTS accrued_monthly_account (
+  year_month TEXT NOT NULL,
+  loan_account_no TEXT NOT NULL,
+  snapshot_date TEXT NOT NULL,
+  branch TEXT,
+  principal_outstanding REAL,
+  accrued_interest REAL,
+  accrued_interest_prev REAL,
+  last_installment_date TEXT,
+  last_paid_date TEXT,
+  PRIMARY KEY (year_month, loan_account_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_ama_ym ON accrued_monthly_account(year_month);
+CREATE INDEX IF NOT EXISTS idx_ama_branch ON accrued_monthly_account(branch);
+
+-- Rollup run log — trail of when each rollup executed and what it touched.
+CREATE TABLE IF NOT EXISTS rollup_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_at TEXT NOT NULL,
+  pool_account_rows INTEGER,
+  pool_agg_rows INTEGER,
+  overdue_account_rows INTEGER,
+  overdue_agg_rows INTEGER,
+  accrued_account_rows INTEGER,
+  months_covered TEXT,              -- comma-joined list of YYYY-MM values
+  duration_ms INTEGER,
+  trigger TEXT                      -- 'cron' | 'manual' | 'startup'
+);
 `);
 
 module.exports = db;

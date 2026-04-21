@@ -765,6 +765,238 @@ function ingestClientPeriod(fileContent, opts) {
   return { rowCount, newBranches, principalCols: principalCols.length };
 }
 
+// ── Monthly rollup (NEVER purged) ──────────────────────────────────────────
+// Before the 90-day purge, take the latest snapshot of each calendar month and
+// upsert it into the long-horizon *_monthly_* tables. This preserves month-end
+// insights forever while keeping the daily hot tables lean.
+//
+// Idempotent — rerunning for the same month just overwrites the same PK.
+// Uses the same DPD bucket definition as /api/od/metrics/dpd.
+function rollupMonthlySnapshots(opts = {}) {
+  const trigger = opts.trigger || "manual";
+  const startedAt = Date.now();
+
+  // For each (year_month) in the source table, find the MAX(snapshot_date).
+  // We roll up EVERY month currently present — cheap, and self-heals gaps.
+  const poolMonthMax = db.prepare(
+    `SELECT substr(snapshot_date,1,7) AS ym, MAX(snapshot_date) AS max_date
+       FROM pool_snapshots GROUP BY substr(snapshot_date,1,7)`
+  ).all();
+  const overdueMonthMax = db.prepare(
+    `SELECT substr(snapshot_date,1,7) AS ym, MAX(snapshot_date) AS max_date
+       FROM od_overdue GROUP BY substr(snapshot_date,1,7)`
+  ).all();
+  const accruedMonthMax = db.prepare(
+    `SELECT substr(snapshot_date,1,7) AS ym, MAX(snapshot_date) AS max_date
+       FROM accrued_snapshots GROUP BY substr(snapshot_date,1,7)`
+  ).all();
+
+  const dpdBucketSql = `
+    CASE
+      WHEN COALESCE(overdue_days,0) <= 0 THEN '0-Current'
+      WHEN overdue_days BETWEEN 1 AND 30 THEN '1-30'
+      WHEN overdue_days BETWEEN 31 AND 60 THEN '31-60'
+      WHEN overdue_days BETWEEN 61 AND 90 THEN '61-90'
+      WHEN overdue_days BETWEEN 91 AND 180 THEN '91-180'
+      ELSE '180+'
+    END`;
+  const overdueDpdBucketSql = `
+    CASE
+      WHEN COALESCE(max_principal_overdue_days,0) <= 0 THEN '0-Current'
+      WHEN max_principal_overdue_days BETWEEN 1 AND 30 THEN '1-30'
+      WHEN max_principal_overdue_days BETWEEN 31 AND 60 THEN '31-60'
+      WHEN max_principal_overdue_days BETWEEN 61 AND 90 THEN '61-90'
+      WHEN max_principal_overdue_days BETWEEN 91 AND 180 THEN '91-180'
+      ELSE '180+'
+    END`;
+
+  const upsertPoolAccount = db.prepare(`
+    INSERT INTO pool_monthly_account (
+      year_month, loan_account_no, snapshot_date, branch,
+      principal_outstanding, interest_outstanding, principal_overdue, interest_overdue,
+      current_od, overdue_days, installments_paid, loan_status,
+      account_dpd_classification, customer_dpd, customer_dpd_classification,
+      last_payment_amount, total_interest_collected
+    )
+    SELECT ?, loan_account_no, snapshot_date, branch,
+      principal_outstanding, interest_outstanding, principal_overdue, interest_overdue,
+      current_od, overdue_days, installments_paid, loan_status,
+      account_dpd_classification, customer_dpd, customer_dpd_classification,
+      last_payment_amount, total_interest_collected
+    FROM pool_snapshots WHERE snapshot_date = ?
+    ON CONFLICT(year_month, loan_account_no) DO UPDATE SET
+      snapshot_date = excluded.snapshot_date,
+      branch = excluded.branch,
+      principal_outstanding = excluded.principal_outstanding,
+      interest_outstanding = excluded.interest_outstanding,
+      principal_overdue = excluded.principal_overdue,
+      interest_overdue = excluded.interest_overdue,
+      current_od = excluded.current_od,
+      overdue_days = excluded.overdue_days,
+      installments_paid = excluded.installments_paid,
+      loan_status = excluded.loan_status,
+      account_dpd_classification = excluded.account_dpd_classification,
+      customer_dpd = excluded.customer_dpd,
+      customer_dpd_classification = excluded.customer_dpd_classification,
+      last_payment_amount = excluded.last_payment_amount,
+      total_interest_collected = excluded.total_interest_collected
+  `);
+
+  const upsertPoolAgg = db.prepare(`
+    INSERT INTO pool_monthly_agg (
+      year_month, branch, dpd_bucket, account_count,
+      principal_outstanding, interest_outstanding,
+      principal_overdue, interest_overdue, current_od
+    )
+    SELECT ?, COALESCE(branch,''), ${dpdBucketSql} AS dpd_bucket,
+      COUNT(*),
+      SUM(COALESCE(principal_outstanding,0)),
+      SUM(COALESCE(interest_outstanding,0)),
+      SUM(COALESCE(principal_overdue,0)),
+      SUM(COALESCE(interest_overdue,0)),
+      SUM(COALESCE(current_od,0))
+    FROM pool_snapshots
+    WHERE snapshot_date = ?
+    GROUP BY COALESCE(branch,''), dpd_bucket
+    ON CONFLICT(year_month, branch, dpd_bucket) DO UPDATE SET
+      account_count = excluded.account_count,
+      principal_outstanding = excluded.principal_outstanding,
+      interest_outstanding = excluded.interest_outstanding,
+      principal_overdue = excluded.principal_overdue,
+      interest_overdue = excluded.interest_overdue,
+      current_od = excluded.current_od
+  `);
+
+  const upsertOverdueAccount = db.prepare(`
+    INSERT INTO overdue_monthly_account (
+      year_month, loan_account_no, snapshot_date, customer_number, customer_name,
+      branch_name, branch_code, officer_code,
+      principal_outstanding, interest_outstanding, installments_due,
+      principal_default, interest_default,
+      min_principal_overdue_days, max_principal_overdue_days,
+      dpd_classification, first_npa_date, current_npa_date,
+      account_status, death_case_remark
+    )
+    SELECT ?, loan_account_no, snapshot_date, customer_number, customer_name,
+      branch_name, branch_code, officer_code,
+      principal_outstanding, interest_outstanding, installments_due,
+      principal_default, interest_default,
+      min_principal_overdue_days, max_principal_overdue_days,
+      dpd_classification, first_npa_date, current_npa_date,
+      account_status, death_case_remark
+    FROM od_overdue WHERE snapshot_date = ?
+    ON CONFLICT(year_month, loan_account_no) DO UPDATE SET
+      snapshot_date = excluded.snapshot_date,
+      customer_number = excluded.customer_number,
+      customer_name = excluded.customer_name,
+      branch_name = excluded.branch_name,
+      branch_code = excluded.branch_code,
+      officer_code = excluded.officer_code,
+      principal_outstanding = excluded.principal_outstanding,
+      interest_outstanding = excluded.interest_outstanding,
+      installments_due = excluded.installments_due,
+      principal_default = excluded.principal_default,
+      interest_default = excluded.interest_default,
+      min_principal_overdue_days = excluded.min_principal_overdue_days,
+      max_principal_overdue_days = excluded.max_principal_overdue_days,
+      dpd_classification = excluded.dpd_classification,
+      first_npa_date = excluded.first_npa_date,
+      current_npa_date = excluded.current_npa_date,
+      account_status = excluded.account_status,
+      death_case_remark = excluded.death_case_remark
+  `);
+
+  const upsertOverdueAgg = db.prepare(`
+    INSERT INTO overdue_monthly_agg (
+      year_month, branch_name, dpd_bucket, account_count,
+      principal_default, interest_default,
+      principal_outstanding, interest_outstanding
+    )
+    SELECT ?, COALESCE(branch_name,''), ${overdueDpdBucketSql} AS dpd_bucket,
+      COUNT(*),
+      SUM(COALESCE(principal_default,0)),
+      SUM(COALESCE(interest_default,0)),
+      SUM(COALESCE(principal_outstanding,0)),
+      SUM(COALESCE(interest_outstanding,0))
+    FROM od_overdue
+    WHERE snapshot_date = ?
+    GROUP BY COALESCE(branch_name,''), dpd_bucket
+    ON CONFLICT(year_month, branch_name, dpd_bucket) DO UPDATE SET
+      account_count = excluded.account_count,
+      principal_default = excluded.principal_default,
+      interest_default = excluded.interest_default,
+      principal_outstanding = excluded.principal_outstanding,
+      interest_outstanding = excluded.interest_outstanding
+  `);
+
+  const upsertAccruedAccount = db.prepare(`
+    INSERT INTO accrued_monthly_account (
+      year_month, loan_account_no, snapshot_date, branch,
+      principal_outstanding, accrued_interest, accrued_interest_prev,
+      last_installment_date, last_paid_date
+    )
+    SELECT ?, loan_account_no, snapshot_date, branch,
+      principal_outstanding, accrued_interest, accrued_interest_prev,
+      last_installment_date, last_paid_date
+    FROM accrued_snapshots WHERE snapshot_date = ?
+    ON CONFLICT(year_month, loan_account_no) DO UPDATE SET
+      snapshot_date = excluded.snapshot_date,
+      branch = excluded.branch,
+      principal_outstanding = excluded.principal_outstanding,
+      accrued_interest = excluded.accrued_interest,
+      accrued_interest_prev = excluded.accrued_interest_prev,
+      last_installment_date = excluded.last_installment_date,
+      last_paid_date = excluded.last_paid_date
+  `);
+
+  let poolAcctRows = 0, poolAggRows = 0;
+  let overdueAcctRows = 0, overdueAggRows = 0;
+  let accruedAcctRows = 0;
+  const monthsTouched = new Set();
+
+  const txn = db.transaction(() => {
+    for (const { ym, max_date } of poolMonthMax) {
+      if (!ym || !max_date) continue;
+      poolAcctRows += upsertPoolAccount.run(ym, max_date).changes;
+      poolAggRows  += upsertPoolAgg.run(ym, max_date).changes;
+      monthsTouched.add(ym);
+    }
+    for (const { ym, max_date } of overdueMonthMax) {
+      if (!ym || !max_date) continue;
+      overdueAcctRows += upsertOverdueAccount.run(ym, max_date).changes;
+      overdueAggRows  += upsertOverdueAgg.run(ym, max_date).changes;
+      monthsTouched.add(ym);
+    }
+    for (const { ym, max_date } of accruedMonthMax) {
+      if (!ym || !max_date) continue;
+      accruedAcctRows += upsertAccruedAccount.run(ym, max_date).changes;
+      monthsTouched.add(ym);
+    }
+  });
+  txn();
+
+  const durationMs = Date.now() - startedAt;
+  const months = Array.from(monthsTouched).sort();
+  db.prepare(
+    `INSERT INTO rollup_log (
+       run_at, pool_account_rows, pool_agg_rows,
+       overdue_account_rows, overdue_agg_rows, accrued_account_rows,
+       months_covered, duration_ms, trigger
+     ) VALUES (?,?,?,?,?,?,?,?,?)`
+  ).run(
+    new Date().toISOString(),
+    poolAcctRows, poolAggRows,
+    overdueAcctRows, overdueAggRows, accruedAcctRows,
+    months.join(","), durationMs, trigger
+  );
+
+  return {
+    poolAcctRows, poolAggRows,
+    overdueAcctRows, overdueAggRows, accruedAcctRows,
+    months, durationMs, trigger,
+  };
+}
+
 // ── Retention ──────────────────────────────────────────────────────────────
 function purgeOldSnapshots(retentionDays = 90) {
   const cutoff = new Date();
@@ -776,6 +1008,7 @@ function purgeOldSnapshots(retentionDays = 90) {
   const r4 = db.prepare("DELETE FROM od_overdue WHERE snapshot_date < ?").run(iso);
   // od_collections is an immutable ledger — keep indefinitely unless admin purges.
   // od_client_period kept — typically small, one row per account per period.
+  // *_monthly_* rollup tables are NEVER purged — they hold the long-horizon view.
   // Reclaim space after a purge. VACUUM cannot run inside a transaction and
   // briefly exclusive-locks the DB, so schedule it on a retention run only.
   try { db.exec("VACUUM"); }
@@ -783,4 +1016,8 @@ function purgeOldSnapshots(retentionDays = 90) {
   return { poolDeleted: r1.changes, accruedDeleted: r2.changes, logDeleted: r3.changes, overdueDeleted: r4.changes, cutoff: iso };
 }
 
-module.exports = { ingestPool, ingestAccrued, ingestOverdue, ingestCollections, ingestClientPeriod, purgeOldSnapshots, toIsoDate, detectDelimiter };
+module.exports = {
+  ingestPool, ingestAccrued, ingestOverdue, ingestCollections, ingestClientPeriod,
+  purgeOldSnapshots, rollupMonthlySnapshots,
+  toIsoDate, detectDelimiter,
+};

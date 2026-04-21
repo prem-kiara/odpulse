@@ -100,6 +100,76 @@ You should see the login screen. Default credentials:
 
 ---
 
+## ALWAYS-ON BACKEND (do this ONCE on EC2)
+
+The frontend is static and served by Nginx — it's always up. The backend Express
+API on `:3001` must ALSO be always up, otherwise `/api/od/*/upload` returns
+"Backend API unreachable" and staff cannot upload. This section sets that up so
+the API auto-restarts on crash AND on reboot.
+
+Pick ONE supervisor. The recommended path is PM2 because pm2 commands are
+already referenced below. The alternative is a standalone systemd unit.
+
+### Option A: PM2 (recommended)
+
+```bash
+# First-time setup on the EC2 box:
+cd /home/ubuntu/odpulse
+npm install -g pm2                                   # one-time, global
+pm2 start ecosystem.config.js                        # starts odpulse-api on :3001
+pm2 save                                             # persist process list
+pm2 startup systemd                                   # prints a sudo command — RUN IT
+# Copy-paste the `sudo env PATH=$PATH:... pm2 startup systemd -u ubuntu --hp /home/ubuntu`
+# command that pm2 emits. That installs a systemd hook so PM2 itself is resurrected
+# on reboot, which then resurrects odpulse-api.
+
+# Verify the API is up now AND survives a reboot:
+pm2 status
+curl -s http://127.0.0.1:3001/api/health | head -c 200
+sudo reboot                                           # optional — come back in 30s
+pm2 status                                            # should show odpulse-api online
+```
+
+Day-to-day commands:
+
+```bash
+pm2 logs odpulse-api          # tail live logs
+pm2 restart odpulse-api       # after git pull + npm install
+pm2 stop odpulse-api          # planned downtime
+pm2 monit                     # interactive dashboard
+```
+
+### Option B: systemd directly
+
+If you prefer not to use PM2:
+
+```bash
+sudo cp /home/ubuntu/odpulse/odpulse-api.service /etc/systemd/system/odpulse-api.service
+sudo systemctl daemon-reload
+sudo systemctl enable odpulse-api        # starts on every boot, forever
+sudo systemctl start odpulse-api
+sudo systemctl status odpulse-api        # should say "active (running)"
+
+# Tail logs:
+journalctl -u odpulse-api -f
+```
+
+DO NOT enable both PM2 and the systemd unit — they will race for port 3001.
+
+### Health check
+
+`/api/health` returns 200 + JSON when the backend is live. Point your uptime
+monitor (UptimeRobot / Pingdom / CloudWatch) at:
+
+```
+https://odpulse.dhanamfinance.com/api/health
+```
+
+If that stops responding, one of PM2 / systemd should restart it within seconds.
+If not, SSH in and check `pm2 logs` or `journalctl -u odpulse-api -n 200`.
+
+---
+
 ## UPDATING THE APP (Future Deployments)
 
 When you make changes and push to GitHub:
