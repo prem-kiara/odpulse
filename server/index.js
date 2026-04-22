@@ -1207,6 +1207,146 @@ app.get("/api/od/analytics/recovery-velocity", (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
+//  MONTHLY COLLECTIONS
+//  Calendar-month rollup of demand vs collected from od_client_period.
+//  A "month" here is substr(period_end, 1, 7) = YYYY-MM, so periods that end
+//  in the same calendar month are summed together. Read-only; no changes to
+//  ingest or existing data.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// GET /api/od/analytics/monthly-collections/summary?limit=36
+// Returns one row per calendar month with demand/collected per category and
+// the shortfall (remaining = demand - collected) per category.
+app.get("/api/od/analytics/monthly-collections/summary", (req, res) => {
+  const limit = Math.min(parseInt(req.query.limit || "36", 10), 120);
+  // Note: "collected" here is NET of prepayments — i.e. the demand-portion of
+  // cash received. Raw collected (incl. prepayments) is exposed as
+  // principal_collected_gross / interest_collected_gross for transparency.
+  const rows = db.prepare(`
+    SELECT
+      substr(period_end, 1, 7) AS year_month,
+      MIN(period_start) AS period_start_min,
+      MAX(period_end) AS period_end_max,
+      COUNT(*) AS accounts,
+      COUNT(DISTINCT loan_account_no) AS unique_accounts,
+      SUM(principal_demand) AS principal_demand,
+      SUM(principal_collected) AS principal_collected_gross,
+      SUM(COALESCE(principal_prepayment, 0)) AS principal_prepayment,
+      SUM(principal_collected - COALESCE(principal_prepayment, 0)) AS principal_collected,
+      SUM(interest_demand) AS interest_demand,
+      SUM(interest_collected) AS interest_collected_gross,
+      SUM(COALESCE(interest_prepayment, 0)) AS interest_prepayment,
+      SUM(interest_collected - COALESCE(interest_prepayment, 0)) AS interest_collected,
+      SUM(principal_demand + interest_demand) AS total_demand,
+      SUM((principal_collected - COALESCE(principal_prepayment, 0))
+        + (interest_collected - COALESCE(interest_prepayment, 0))) AS total_collected,
+      SUM(principal_collected + interest_collected) AS total_collected_gross,
+      SUM(principal_overdue) AS principal_overdue_end,
+      SUM(interest_overdue) AS interest_overdue_end
+    FROM od_client_period
+    WHERE period_end IS NOT NULL AND period_end <> ''
+    GROUP BY year_month
+    ORDER BY year_month DESC
+    LIMIT ?
+  `).all(limit).map(r => {
+    const principal_demand   = Number(r.principal_demand || 0);
+    const principal_collected = Number(r.principal_collected || 0);
+    const interest_demand    = Number(r.interest_demand || 0);
+    const interest_collected = Number(r.interest_collected || 0);
+    const total_demand       = Number(r.total_demand || 0);
+    const total_collected    = Number(r.total_collected || 0);
+    const remaining_principal = Math.max(0, principal_demand - principal_collected);
+    const remaining_interest  = Math.max(0, interest_demand - interest_collected);
+    return {
+      ...r,
+      remaining_principal,
+      remaining_interest,
+      // Total remaining = sum of per-category shortfalls so the headline stays
+      // consistent with the P/I subtotals.
+      remaining_total:     remaining_principal + remaining_interest,
+      // CE% is bounded at 100 because "collected" is net of prepayments.
+      ce_pct:              total_demand > 0 ? Math.min(100, (total_collected / total_demand) * 100) : 0,
+      principal_ce_pct:    principal_demand > 0 ? Math.min(100, (principal_collected / principal_demand) * 100) : 0,
+      interest_ce_pct:     interest_demand > 0 ? Math.min(100, (interest_collected / interest_demand) * 100) : 0,
+    };
+  });
+  res.json({ months: rows });
+});
+
+// GET /api/od/analytics/monthly-collections/breakdown?yearMonth=YYYY-MM&groupBy=
+//   groupBy ∈ branch | product | officer   (defaults to branch)
+// Returns one row per group for the selected calendar month with the same
+// category split as the summary endpoint.
+app.get("/api/od/analytics/monthly-collections/breakdown", (req, res) => {
+  const groupBy = String(req.query.groupBy || "branch").toLowerCase();
+  const fieldMap = {
+    branch:  "branch_name",
+    product: "product_name",
+    officer: "officer_name",
+  };
+  const col = fieldMap[groupBy] || "branch_name";
+
+  let { yearMonth } = req.query;
+  if (!yearMonth) {
+    // default to latest calendar month we have
+    const latest = db.prepare(
+      `SELECT substr(period_end, 1, 7) AS year_month
+         FROM od_client_period
+        WHERE period_end IS NOT NULL AND period_end <> ''
+        ORDER BY period_end DESC LIMIT 1`
+    ).get();
+    yearMonth = latest?.year_month || null;
+  }
+  if (!yearMonth || !/^\d{4}-\d{2}$/.test(yearMonth)) {
+    return res.json({ rows: [], yearMonth: null, groupBy });
+  }
+
+  // "Collected" is NET of prepayments (see summary endpoint for rationale).
+  const rows = db.prepare(`
+    SELECT
+      COALESCE(NULLIF(${col},''),'(unspecified)') AS label,
+      COUNT(*) AS accounts,
+      SUM(principal_demand) AS principal_demand,
+      SUM(principal_collected) AS principal_collected_gross,
+      SUM(COALESCE(principal_prepayment, 0)) AS principal_prepayment,
+      SUM(principal_collected - COALESCE(principal_prepayment, 0)) AS principal_collected,
+      SUM(interest_demand) AS interest_demand,
+      SUM(interest_collected) AS interest_collected_gross,
+      SUM(COALESCE(interest_prepayment, 0)) AS interest_prepayment,
+      SUM(interest_collected - COALESCE(interest_prepayment, 0)) AS interest_collected,
+      SUM(principal_demand + interest_demand) AS total_demand,
+      SUM((principal_collected - COALESCE(principal_prepayment, 0))
+        + (interest_collected - COALESCE(interest_prepayment, 0))) AS total_collected,
+      SUM(principal_collected + interest_collected) AS total_collected_gross,
+      SUM(principal_overdue) AS principal_overdue_end,
+      SUM(interest_overdue) AS interest_overdue_end
+    FROM od_client_period
+    WHERE substr(period_end, 1, 7) = ?
+    GROUP BY label
+    HAVING total_demand > 0 OR total_collected > 0
+    ORDER BY total_demand DESC
+    LIMIT 500
+  `).all(yearMonth).map(r => {
+    const principal_demand   = Number(r.principal_demand || 0);
+    const principal_collected = Number(r.principal_collected || 0);
+    const interest_demand    = Number(r.interest_demand || 0);
+    const interest_collected = Number(r.interest_collected || 0);
+    const total_demand       = Number(r.total_demand || 0);
+    const total_collected    = Number(r.total_collected || 0);
+    const remaining_principal = Math.max(0, principal_demand - principal_collected);
+    const remaining_interest  = Math.max(0, interest_demand - interest_collected);
+    return {
+      ...r,
+      remaining_principal,
+      remaining_interest,
+      remaining_total:     remaining_principal + remaining_interest,
+      ce_pct:              total_demand > 0 ? Math.min(100, (total_collected / total_demand) * 100) : 0,
+    };
+  });
+  res.json({ rows, yearMonth, groupBy });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
 //  BRANCH PERFORMANCE / PRODUCT PERFORMANCE / DRILLDOWN
 //  Added for the Branch Performance & Product Performance dashboards.
 // ═══════════════════════════════════════════════════════════════════════════

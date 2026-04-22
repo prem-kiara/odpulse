@@ -13,8 +13,8 @@ import {
 import {
   Upload, CheckCircle, AlertTriangle, Clock, FileText, Database, RefreshCw,
   Search, Download, Users, TrendingUp, Phone, PhoneOff, Target, DollarSign,
-  Activity, Calendar, Skull, Wallet, Layers, Gauge, X, ChevronRight, Package,
-  Building2, Grid3x3, CloudOff, Trash2,
+  Activity, Calendar, CalendarRange, Skull, Wallet, Layers, Gauge, X,
+  ChevronRight, Package, Building2, Grid3x3, CloudOff, Trash2,
 } from "lucide-react";
 import {
   enqueueUpload, listQueue, deleteFromQueue, drainQueue, isBackendUp,
@@ -834,6 +834,7 @@ export function CollectionDashboard({ user, entries, branches }) {
     { key: "branches",   label: "Branch Performance",   icon: <Building2 size={14} /> },
     { key: "products",   label: "Product Performance",  icon: <Package size={14} /> },
     { key: "efficiency", label: "Collection Efficiency", icon: <Target size={14} /> },
+    { key: "monthly",    label: "Monthly Collections",  icon: <CalendarRange size={14} /> },
     { key: "scorecard",  label: "Officer Scorecard",    icon: <Activity size={14} /> },
     { key: "daily",      label: "Daily Collections",    icon: <Calendar size={14} /> },
     { key: "risk",       label: "Risk Triage",          icon: <AlertTriangle size={14} /> },
@@ -853,6 +854,7 @@ export function CollectionDashboard({ user, entries, branches }) {
             {tab === "branches"   && <>Per-branch scorecard — book, CE%, receipts, cash exposure, NPA. Click any row or tile for customer-level detail.</>}
             {tab === "products"   && <>Per-product performance with branch × product matrix and collections split by product.</>}
             {tab === "efficiency" && <>Demand vs Collected per period — the number your lenders look at.</>}
+            {tab === "monthly"    && <>Calendar-month demand vs collected, with principal/interest split and remaining balance — branch, product, and officer cuts.</>}
             {tab === "scorecard"  && <>Officer-level book, receipts, and mode mix (cash exposure).</>}
             {tab === "daily"      && <>Day-by-day receipt activity with branch and mode breakdown.</>}
             {tab === "risk"       && <>NPA ageing, death cases, and installments-due triage from the Overdue Report.</>}
@@ -1220,6 +1222,7 @@ export function CollectionDashboard({ user, entries, branches }) {
       {tab === "branches"   && <BranchPerformanceView openDrill={openDrill} />}
       {tab === "products"   && <ProductPerformanceView openDrill={openDrill} />}
       {tab === "efficiency" && <CollectionEfficiencyView branches={branches} openDrill={openDrill} />}
+      {tab === "monthly"    && <MonthlyCollectionsView openDrill={openDrill} />}
       {tab === "scorecard"  && <OfficerScorecardView openDrill={openDrill} />}
       {tab === "daily"      && <DailyCollectionsView branches={branches} openDrill={openDrill} />}
       {tab === "risk"       && <RiskTriageView openDrill={openDrill} />}
@@ -1847,6 +1850,257 @@ function CollectionEfficiencyView({ openDrill }) {
               </tbody>
             </table>
           </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── MonthlyCollectionsView ────────────────────────────────────────────────
+// Calendar-month rollup of demand vs collected from od_client_period.
+// A "month" here = substr(period_end, 1, 7), so all periods ending in the
+// same calendar month are aggregated together.
+//
+// Layout:
+//   1. Headline KPI cards for the latest month
+//   2. Monthly rollup table (one row per month, last 36 months)
+//   3. Month selector + Group By switcher
+//   4. Breakdown table (Branch / Product / Officer) for the selected month
+//
+// Read-only. No writes, no changes to ingest or any existing endpoint.
+function MonthlyCollectionsView({ openDrill }) {
+  const [months, setMonths]   = useState([]);
+  const [loadingMonths, setLoadingMonths] = useState(false);
+
+  const [selectedMonth, setSelectedMonth] = useState("");
+  const [groupBy, setGroupBy] = useState("branch");
+  const [breakdown, setBreakdown] = useState([]);
+  const [loadingBreakdown, setLoadingBreakdown] = useState(false);
+
+  // Load monthly rollup
+  const loadMonths = useCallback(async () => {
+    setLoadingMonths(true);
+    try {
+      const r = await fetch(`${API_BASE}/od/analytics/monthly-collections/summary`)
+        .then(r => r.json()).catch(() => ({ months: [] }));
+      const rows = Array.isArray(r?.months) ? r.months : [];
+      setMonths(rows);
+      // default-select most recent month on first load
+      if (rows.length > 0) {
+        setSelectedMonth(prev => prev || rows[0].year_month);
+      }
+    } finally { setLoadingMonths(false); }
+  }, []);
+
+  useEffect(() => { loadMonths(); }, [loadMonths]);
+
+  // Load per-group breakdown for the selected month
+  const loadBreakdown = useCallback(async () => {
+    if (!selectedMonth) { setBreakdown([]); return; }
+    setLoadingBreakdown(true);
+    try {
+      const r = await fetch(
+        `${API_BASE}/od/analytics/monthly-collections/breakdown?yearMonth=${encodeURIComponent(selectedMonth)}&groupBy=${groupBy}`
+      ).then(r => r.json()).catch(() => ({ rows: [] }));
+      setBreakdown(Array.isArray(r?.rows) ? r.rows : []);
+    } finally { setLoadingBreakdown(false); }
+  }, [selectedMonth, groupBy]);
+
+  useEffect(() => { loadBreakdown(); }, [loadBreakdown]);
+
+  // Helpers
+  const monthLabel = (ym) => {
+    if (!ym || !/^\d{4}-\d{2}$/.test(ym)) return ym || "—";
+    const [y, m] = ym.split("-");
+    const names = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+    return `${names[parseInt(m, 10) - 1]} ${y}`;
+  };
+
+  const latest = months[0] || null;
+  const selectedRow = useMemo(
+    () => months.find(m => m.year_month === selectedMonth) || null,
+    [months, selectedMonth]
+  );
+
+  // Click-to-drill on breakdown rows (branch/product drillable today; officer is
+  // not supported by /od/drilldown so we just skip the drill there — same
+  // behaviour as the Collection Efficiency tab).
+  const openSliceForRow = (row) => {
+    if (!openDrill || !selectedRow) return;
+    const slice = {
+      periodStart: selectedRow.period_start_min,
+      periodEnd: selectedRow.period_end_max,
+      from: selectedRow.period_start_min,
+      to: selectedRow.period_end_max,
+      title: `${groupBy.charAt(0).toUpperCase() + groupBy.slice(1)}: ${row.label}`,
+      subtitle: `${monthLabel(selectedMonth)} · CE% ${formatPct(row.ce_pct, 1)}`,
+    };
+    if (groupBy === "branch")  slice.branch  = row.label;
+    if (groupBy === "product") slice.product = row.label;
+    openDrill(slice);
+  };
+  const drillable = groupBy === "branch" || groupBy === "product";
+
+  return (
+    <div className="space-y-4">
+      {/* Headline KPIs for the latest month */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <KpiCard icon={<CalendarRange />} label={latest ? `Latest · ${monthLabel(latest.year_month)}` : "Latest month"} color="teal"
+          value={latest ? formatLakhs(latest.total_demand) : "—"}
+          sub={latest ? `Demand · ${latest.accounts?.toLocaleString() || 0} accts` : ""} />
+        <KpiCard icon={<DollarSign />} label="Principal Collected" color="indigo"
+          value={latest ? formatLakhs(latest.principal_collected) : "—"}
+          sub={latest ? `of ${formatLakhs(latest.principal_demand)} demanded · ${formatPct(latest.principal_ce_pct, 1)}` : ""} />
+        <KpiCard icon={<DollarSign />} label="Interest Collected" color="amber"
+          value={latest ? formatLakhs(latest.interest_collected) : "—"}
+          sub={latest ? `of ${formatLakhs(latest.interest_demand)} demanded · ${formatPct(latest.interest_ce_pct, 1)}` : ""} />
+        <KpiCard icon={<AlertTriangle />} label="Remaining (Total)" color="red"
+          value={latest ? formatLakhs(latest.remaining_total) : "—"}
+          sub={latest ? `P ${formatLakhs(latest.remaining_principal)} · I ${formatLakhs(latest.remaining_interest)}` : ""} />
+      </div>
+
+      {/* Monthly rollup table */}
+      <div className="bg-white rounded-xl border">
+        <div className="px-5 py-3 border-b flex items-center justify-between">
+          <div>
+            <h3 className="font-semibold text-gray-800">Monthly Rollup</h3>
+            <p className="text-xs text-gray-500">
+              One row per calendar month · demand and collections per category · remaining = demand − collected.
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            {loadingMonths && <span className="text-xs text-gray-400">Loading…</span>}
+            <button onClick={loadMonths}
+              className="flex items-center gap-1.5 px-2.5 py-1.5 bg-white border rounded-lg text-xs hover:bg-gray-50">
+              <RefreshCw size={12} className={loadingMonths ? "animate-spin" : ""} /> Refresh
+            </button>
+            <button onClick={() => downloadCSV(months, `monthly-collections.csv`)}
+              className="text-xs text-teal-700 flex items-center gap-1"><Download size={12} /> CSV</button>
+          </div>
+        </div>
+        <div className="overflow-x-auto max-h-[28rem] overflow-y-auto">
+          <table className="w-full text-xs">
+            <thead className="sticky top-0 bg-gray-50 text-gray-600 uppercase text-[10px]">
+              <tr>
+                <th className="text-left px-4 py-2">Month</th>
+                <th className="text-right px-4 py-2">Accts</th>
+                <th className="text-right px-4 py-2">Demand</th>
+                <th className="text-right px-4 py-2">Prin. Collected</th>
+                <th className="text-right px-4 py-2">Int. Collected</th>
+                <th className="text-right px-4 py-2">Total Collected</th>
+                <th className="text-right px-4 py-2">Remaining (Prin.)</th>
+                <th className="text-right px-4 py-2">Remaining (Int.)</th>
+                <th className="text-right px-4 py-2">CE%</th>
+              </tr>
+            </thead>
+            <tbody>
+              {months.length === 0 ? (
+                <tr><td colSpan={9} className="text-center text-gray-400 py-6">
+                  {loadingMonths ? "Loading…" : "No client-period data uploaded yet."}
+                </td></tr>
+              ) : months.map(m => (
+                <tr key={m.year_month}
+                    onClick={() => setSelectedMonth(m.year_month)}
+                    className={`border-t hover:bg-gray-50 cursor-pointer ${selectedMonth === m.year_month ? "bg-teal-50/60" : ""}`}>
+                  <td className="px-4 py-1.5 font-medium text-gray-800">{monthLabel(m.year_month)}</td>
+                  <td className="px-4 py-1.5 text-right">{(m.accounts || 0).toLocaleString()}</td>
+                  <td className="px-4 py-1.5 text-right">{formatLakhs(m.total_demand)}</td>
+                  <td className="px-4 py-1.5 text-right text-indigo-700">{formatLakhs(m.principal_collected)}</td>
+                  <td className="px-4 py-1.5 text-right text-amber-700">{formatLakhs(m.interest_collected)}</td>
+                  <td className="px-4 py-1.5 text-right text-teal-700 font-medium">{formatLakhs(m.total_collected)}</td>
+                  <td className="px-4 py-1.5 text-right text-red-600">{formatLakhs(m.remaining_principal)}</td>
+                  <td className="px-4 py-1.5 text-right text-red-600">{formatLakhs(m.remaining_interest)}</td>
+                  <td className={`px-4 py-1.5 text-right font-semibold ${ceColor(m.ce_pct)}`}>{formatPct(m.ce_pct)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Breakdown controls */}
+      <div className="bg-white rounded-xl border p-4 grid grid-cols-2 md:grid-cols-4 gap-3 items-end">
+        <div>
+          <label className="block text-xs text-gray-500 mb-1">Month</label>
+          <select value={selectedMonth} onChange={e => setSelectedMonth(e.target.value)}
+            className="w-full px-2.5 py-2 border rounded-lg text-sm">
+            {months.length === 0 && <option value="">No months available</option>}
+            {months.map(m => (
+              <option key={m.year_month} value={m.year_month}>{monthLabel(m.year_month)}</option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <label className="block text-xs text-gray-500 mb-1">Group By</label>
+          <select value={groupBy} onChange={e => setGroupBy(e.target.value)}
+            className="w-full px-2.5 py-2 border rounded-lg text-sm">
+            <option value="branch">Branch</option>
+            <option value="product">Product</option>
+            <option value="officer">Officer</option>
+          </select>
+        </div>
+        <div className="md:col-span-2 text-xs text-gray-500">
+          {loadingBreakdown ? "Loading…" : selectedRow ? (
+            <>Demand <b>{formatLakhs(selectedRow.total_demand)}</b> · Collected <b>{formatLakhs(selectedRow.total_collected)}</b> ·
+              {" "}Remaining <b className="text-red-600">{formatLakhs(selectedRow.remaining_total)}</b> ·
+              {" "}{breakdown.length} {groupBy}s</>
+          ) : "—"}
+        </div>
+      </div>
+
+      {/* Breakdown table */}
+      <div className="bg-white rounded-xl border">
+        <div className="px-5 py-3 border-b flex items-center justify-between">
+          <div>
+            <h3 className="font-semibold text-gray-800">
+              {groupBy.charAt(0).toUpperCase() + groupBy.slice(1)}-wise breakdown · {monthLabel(selectedMonth)}
+            </h3>
+            <p className="text-xs text-gray-500">
+              {drillable
+                ? "Click a row to open the customer-level drill-down."
+                : "Officer-level drill-down not wired today — use Branch or Product to drill into accounts."}
+            </p>
+          </div>
+          <button onClick={() => downloadCSV(breakdown, `monthly-${groupBy}-${selectedMonth}.csv`)}
+            className="text-xs text-teal-700 flex items-center gap-1"><Download size={12} /> CSV</button>
+        </div>
+        <div className="overflow-x-auto max-h-[32rem] overflow-y-auto">
+          <table className="w-full text-xs">
+            <thead className="sticky top-0 bg-gray-50 text-gray-600 uppercase text-[10px]">
+              <tr>
+                <th className="text-left px-4 py-2">{groupBy.charAt(0).toUpperCase() + groupBy.slice(1)}</th>
+                <th className="text-right px-4 py-2">Accts</th>
+                <th className="text-right px-4 py-2">Demand</th>
+                <th className="text-right px-4 py-2">Prin. Collected</th>
+                <th className="text-right px-4 py-2">Int. Collected</th>
+                <th className="text-right px-4 py-2">Total Collected</th>
+                <th className="text-right px-4 py-2">Remaining (Prin.)</th>
+                <th className="text-right px-4 py-2">Remaining (Int.)</th>
+                <th className="text-right px-4 py-2">CE%</th>
+              </tr>
+            </thead>
+            <tbody>
+              {breakdown.length === 0 ? (
+                <tr><td colSpan={9} className="text-center text-gray-400 py-6">
+                  {loadingBreakdown ? "Loading…" : "No data for selected month."}
+                </td></tr>
+              ) : breakdown.map((r, i) => (
+                <tr key={`${r.label}-${i}`}
+                    onClick={drillable ? () => openSliceForRow(r) : undefined}
+                    className={`border-t hover:bg-gray-50 ${drillable ? "cursor-pointer" : ""}`}>
+                  <td className="px-4 py-1.5 font-medium text-gray-800">{r.label}</td>
+                  <td className="px-4 py-1.5 text-right">{(r.accounts || 0).toLocaleString()}</td>
+                  <td className="px-4 py-1.5 text-right">{formatLakhs(r.total_demand)}</td>
+                  <td className="px-4 py-1.5 text-right text-indigo-700">{formatLakhs(r.principal_collected)}</td>
+                  <td className="px-4 py-1.5 text-right text-amber-700">{formatLakhs(r.interest_collected)}</td>
+                  <td className="px-4 py-1.5 text-right text-teal-700 font-medium">{formatLakhs(r.total_collected)}</td>
+                  <td className="px-4 py-1.5 text-right text-red-600">{formatLakhs(r.remaining_principal)}</td>
+                  <td className="px-4 py-1.5 text-right text-red-600">{formatLakhs(r.remaining_interest)}</td>
+                  <td className={`px-4 py-1.5 text-right font-semibold ${ceColor(r.ce_pct)}`}>{formatPct(r.ce_pct)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       </div>
     </div>
