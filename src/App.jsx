@@ -2629,6 +2629,103 @@ function CSBApprovalModal({ candidates, groupODRows, failedRows, onConfirm, onRe
   );
 }
 
+// ─── Duplicate Review Modal ─────────────────────────────────────────────────
+// Shown during bulk Group/Individual OD upload when any incoming row shares
+// (date, loanAccountNo) with an existing entry. User decides per-row whether
+// to include it anyway or skip. Default is skip (safer — don't double-count).
+function DuplicateReviewModal({ type, newRows, dupRows, onConfirm, onCancel }) {
+  // One boolean per duplicate row: true = include anyway, false = skip.
+  // Default all to false (skip) — the whole point of the modal is to prevent
+  // accidental double-counting, so err on the side of caution.
+  const [include, setInclude] = React.useState(() => dupRows.map(() => false));
+
+  const toggleOne = (i) => setInclude(prev => prev.map((v, idx) => idx === i ? !v : v));
+  const skipAll = () => setInclude(prev => prev.map(() => false));
+  const includeAll = () => setInclude(prev => prev.map(() => true));
+
+  const includedDupes = dupRows.filter((_, i) => include[i]).map(d => d.row);
+  const importCount = newRows.length + includedDupes.length;
+  const skippedCount = dupRows.length - includedDupes.length;
+
+  const fmt = (r) => {
+    const amt = Number((r.totalPaidAmount ?? r.paidAmount ?? r.selfOdPaidAmount ?? r.groupOdPaidAmount) || 0);
+    return `Rs. ${amt.toLocaleString("en-IN")}`;
+  };
+
+  return (
+    <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+      <div className="bg-white rounded-xl shadow-xl w-full max-w-3xl max-h-[90vh] flex flex-col">
+        <div className="p-5 border-b">
+          <h3 className="font-bold text-gray-900 text-lg flex items-center gap-2">
+            <AlertTriangle size={18} className="text-amber-600" />
+            {dupRows.length} Potential Duplicate{dupRows.length === 1 ? "" : "s"} Detected
+          </h3>
+          <p className="text-sm text-gray-600 mt-1">
+            These {type === "group" ? "Group OD" : "Individual OD"} rows share the same <b>date</b> and <b>loan account number</b> as existing entries.
+            Decide which to include — default is skip so you don't double-count payments.
+          </p>
+          <div className="flex items-center gap-2 mt-3 text-xs">
+            <button onClick={skipAll}
+              className="px-2.5 py-1 border rounded-md hover:bg-gray-50 text-gray-700">Skip all</button>
+            <button onClick={includeAll}
+              className="px-2.5 py-1 border rounded-md hover:bg-amber-50 text-amber-700 border-amber-300">Include all</button>
+            <span className="ml-auto text-gray-500">
+              Will import <b className="text-gray-800">{importCount}</b> · skip <b className="text-gray-800">{skippedCount}</b>
+            </span>
+          </div>
+        </div>
+
+        <div className="overflow-y-auto flex-1 p-4 space-y-2">
+          {dupRows.map((d, i) => {
+            const chosen = include[i];
+            return (
+              <label key={i}
+                className={`flex items-start gap-3 p-3 border rounded-lg cursor-pointer transition-colors ${chosen ? "border-amber-400 bg-amber-50" : "border-gray-200 hover:bg-gray-50"}`}>
+                <input type="checkbox"
+                  checked={chosen}
+                  onChange={() => toggleOne(i)}
+                  className="mt-1 h-4 w-4 accent-amber-600" />
+                <div className="flex-1 min-w-0 text-sm">
+                  <div className="font-semibold text-gray-800 truncate">
+                    {d.row.customerName || "(no name)"} · {d.row.branch || "—"}
+                  </div>
+                  <div className="text-xs text-gray-500 truncate">
+                    Loan: {d.row.loanAccountNo || "—"} · Customer ID: {d.row.customerId || "—"}
+                  </div>
+                  <div className="mt-1.5 grid grid-cols-2 gap-2 text-xs">
+                    <div className="border rounded px-2 py-1 bg-white">
+                      <div className="text-[10px] text-amber-700 uppercase font-semibold">This row</div>
+                      <div>{d.row.date} · {fmt(d.row)}</div>
+                    </div>
+                    <div className="border rounded px-2 py-1 bg-white">
+                      <div className="text-[10px] text-gray-600 uppercase font-semibold">Existing entry</div>
+                      <div>{d.existing.date} · {fmt(d.existing)}</div>
+                    </div>
+                  </div>
+                </div>
+                <div className={`text-[10px] font-semibold px-2 py-1 rounded whitespace-nowrap ${chosen ? "bg-amber-600 text-white" : "bg-gray-200 text-gray-700"}`}>
+                  {chosen ? "Include" : "Skip"}
+                </div>
+              </label>
+            );
+          })}
+        </div>
+
+        <div className="p-4 border-t flex gap-3">
+          <button onClick={onCancel}
+            className="flex-1 py-2.5 bg-gray-200 text-gray-700 rounded-lg font-medium hover:bg-gray-300 transition-colors text-sm">
+            Cancel — import nothing
+          </button>
+          <button onClick={() => onConfirm(includedDupes)}
+            className="flex-1 py-2.5 bg-teal-600 text-white rounded-lg font-medium hover:bg-teal-700 transition-colors text-sm">
+            Import {importCount} row{importCount === 1 ? "" : "s"} ({skippedCount} skipped)
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Admin Panel ────────────────────────────────────────────────────────────
 function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig, entries, setEntries, notifications, setNotifications }) {
   const [tab, setTab] = useState("users");
@@ -2638,6 +2735,40 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
   const [editingBranch, setEditingBranch] = useState(null);
   const [lastBulkUpload, setLastBulkUpload] = useState(() => loadData(STORAGE_KEYS.lastBulkUpload, null));
   const [pendingBulkImport, setPendingBulkImport] = useState(null); // holds parsed data waiting for CSB decision
+  // Duplicate review modal state. Populated after CSV parse whenever any
+  // incoming row matches an existing entry by (date, loanAccountNo). User
+  // decides per-row whether to include anyway or skip.
+  //   { type, newRows, dupRows, onCommit }  — onCommit(includedDupes) does the insert.
+  const [pendingDuplicates, setPendingDuplicates] = useState(null);
+
+  // Strict duplicate rule: two entries are duplicates iff they share the same
+  // (date, loanAccountNo). Rows without a loanAccountNo (e.g. Mahashemam /
+  // some CSB rows) are NEVER flagged as duplicates — no reliable join key.
+  const findDuplicates = (rows) => {
+    const existingByKey = new Map();
+    for (const e of entries) {
+      const loan = (e.loanAccountNo || "").trim();
+      if (!loan) continue;
+      const key = `${e.date}|${loan}`;
+      // Keep the first match — there shouldn't be multiple existing entries
+      // with the same key, but if there are the user can see them one by one
+      // on repeated uploads.
+      if (!existingByKey.has(key)) existingByKey.set(key, e);
+    }
+    const newOnes = [];
+    const dupes = [];
+    for (const r of rows) {
+      const loan = (r.loanAccountNo || "").trim();
+      if (!loan) { newOnes.push(r); continue; }
+      const key = `${r.date}|${loan}`;
+      if (existingByKey.has(key)) {
+        dupes.push({ row: r, existing: existingByKey.get(key) });
+      } else {
+        newOnes.push(r);
+      }
+    }
+    return { newOnes, dupes };
+  };
 
   const handleUndoBulkUpload = () => {
     if (!lastBulkUpload) return;
@@ -2697,8 +2828,33 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
     a.click();
   };
 
+  // Split: dedup check runs between "final set decided" and the actual commit.
+  // On duplicates we open the review modal; its onCommit lands back in
+  // commitIndivEntries with the user's row-level decisions applied.
   const finalizeBulkIndivImport = (validRows, csbRows, csbApproved, groupODRows, failedRows) => {
     const toImport = csbApproved ? [...validRows, ...csbRows] : validRows;
+
+    const { newOnes, dupes } = findDuplicates(toImport);
+    if (dupes.length > 0) {
+      setPendingBulkImport(null); // close CSB modal if it was open
+      setPendingDuplicates({
+        type: "individual",
+        newRows: newOnes,
+        dupRows: dupes,
+        onCommit: (includedDupes) => {
+          commitIndivEntries(
+            [...newOnes, ...includedDupes],
+            validRows, csbRows, csbApproved, groupODRows, failedRows,
+            dupes.length - includedDupes.length,
+          );
+        },
+      });
+      return;
+    }
+    commitIndivEntries(toImport, validRows, csbRows, csbApproved, groupODRows, failedRows, 0);
+  };
+
+  const commitIndivEntries = (toImport, validRows, csbRows, csbApproved, groupODRows, failedRows, skippedDupCount) => {
     const allEntries = [...toImport, ...entries];
     setEntries(allEntries);
     saveData(STORAGE_KEYS.entries, allEntries);
@@ -2706,11 +2862,13 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
     saveData(STORAGE_KEYS.lastBulkUpload, snapshot);
     setLastBulkUpload(snapshot);
     setPendingBulkImport(null);
+    setPendingDuplicates(null);
     downloadResultFile(validRows, csbRows, csbApproved, groupODRows, failedRows);
     const csbMsg = csbRows.length > 0 ? (csbApproved ? `\n• ${csbRows.length} CSB entries imported.` : `\n• ${csbRows.length} CSB entries skipped.`) : "";
     const groupMsg = groupODRows.length > 0 ? `\n• ${groupODRows.length} Group OD entries were NOT imported (see result file).` : "";
     const failMsg = failedRows.length > 0 ? `\n• ${failedRows.length} entries failed (see result file).` : "";
-    alert(`Import complete.\n• ${validRows.length} Individual OD entries imported.${csbMsg}${groupMsg}${failMsg}\n\nA result file has been downloaded.`);
+    const dupMsg = skippedDupCount > 0 ? `\n• ${skippedDupCount} duplicate row(s) skipped (already existed by date + loan account).` : "";
+    alert(`Import complete.\n• ${toImport.length} Individual OD entries imported.${csbMsg}${groupMsg}${failMsg}${dupMsg}\n\nA result file has been downloaded.`);
   };
 
   const [editBranchName, setEditBranchName] = useState("");
@@ -2957,15 +3115,36 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
         });
         added++;
       });
-      const allEntries = [...newEntries, ...entries];
-      setEntries(allEntries); saveData(STORAGE_KEYS.entries, allEntries);
-      const bulkSnapshot = { type: "Group OD", ids: newEntries.map(e => e.id), count: added, timestamp: new Date().toISOString() };
-      saveData(STORAGE_KEYS.lastBulkUpload, bulkSnapshot);
-      setLastBulkUpload(bulkSnapshot);
-      alert(`Imported ${added} Group OD entries. Total: ${allEntries.length}\n\nYou can undo this upload from the Admin panel if needed.`);
+      // Strict dedup — any row whose (date, loanAccountNo) already exists
+      // is surfaced to the user. They can still include it by flipping the
+      // toggle in the review modal; default is skip.
+      const { newOnes, dupes } = findDuplicates(newEntries);
+      if (dupes.length > 0) {
+        setPendingDuplicates({
+          type: "group",
+          newRows: newOnes,
+          dupRows: dupes,
+          onCommit: (includedDupes) => {
+            commitGroupEntries([...newOnes, ...includedDupes], dupes.length - includedDupes.length);
+          },
+        });
+      } else {
+        commitGroupEntries(newEntries, 0);
+      }
     };
     reader.readAsText(file);
     e.target.value = "";
+  };
+
+  const commitGroupEntries = (rows, skippedDupCount) => {
+    const allEntries = [...rows, ...entries];
+    setEntries(allEntries); saveData(STORAGE_KEYS.entries, allEntries);
+    const bulkSnapshot = { type: "Group OD", ids: rows.map(e => e.id), count: rows.length, timestamp: new Date().toISOString() };
+    saveData(STORAGE_KEYS.lastBulkUpload, bulkSnapshot);
+    setLastBulkUpload(bulkSnapshot);
+    setPendingDuplicates(null);
+    const dupMsg = skippedDupCount > 0 ? `\n${skippedDupCount} duplicate row(s) skipped (already existed by date + loan account).` : "";
+    alert(`Imported ${rows.length} Group OD entries. Total: ${allEntries.length}${dupMsg}\n\nYou can undo this upload from the Admin panel if needed.`);
   };
 
   const handleBulkIndividualEntries = (e) => {
@@ -3290,6 +3469,16 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
           failedRows={pendingBulkImport.failedRows}
           onConfirm={() => finalizeBulkIndivImport(pendingBulkImport.validRows, pendingBulkImport.csbRows, true, pendingBulkImport.groupODRows, pendingBulkImport.failedRows)}
           onReject={() => finalizeBulkIndivImport(pendingBulkImport.validRows, pendingBulkImport.csbRows, false, pendingBulkImport.groupODRows, [...pendingBulkImport.failedRows, ...pendingBulkImport.csbRows.map(r => ({ ...r, reason: "CSB Bank — rejected by user" }))])}
+        />
+      )}
+
+      {pendingDuplicates && (
+        <DuplicateReviewModal
+          type={pendingDuplicates.type}
+          newRows={pendingDuplicates.newRows}
+          dupRows={pendingDuplicates.dupRows}
+          onConfirm={(includedDupes) => pendingDuplicates.onCommit(includedDupes)}
+          onCancel={() => setPendingDuplicates(null)}
         />
       )}
 
