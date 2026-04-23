@@ -46,6 +46,25 @@ const formatDateDMY = (isoDate) => {
 // ─── API + localStorage helpers ────────────────────────────────────────────
 const API_BASE = "/api";
 
+// ─── DPD classification (client-side, derived from overdue days) ───────────
+// Single source of truth so Group OD + Individual OD forms stay consistent,
+// even when the uploaded pool report's classification column is blank or
+// uses different labels than our 5 standard buckets.
+//   DPD = 0          → Regular
+//   DPD 1 – 30       → SMA-0
+//   DPD 31 – 60      → SMA-1
+//   DPD 61 – 90      → SMA-2
+//   DPD 91+          → NPA
+function dpdClassFromDays(days) {
+  const d = Number(days) || 0;
+  if (d <= 0)  return "Regular";
+  if (d <= 30) return "SMA-0";
+  if (d <= 60) return "SMA-1";
+  if (d <= 90) return "SMA-2";
+  return "NPA";
+}
+const DPD_DELINQUENT_CLASSES = ["SMA-0", "SMA-1", "SMA-2", "NPA"];
+
 const loadData = (key, fallback) => {
   try { const d = localStorage.getItem(key); return d ? JSON.parse(d) : fallback; }
   catch { return fallback; }
@@ -367,21 +386,29 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
   };
 
   const applyCustomer = (c) => {
-    setCustomerName(c.name);
-    setCustomerId(c.customerId);
-    setLoanAccountNo(c.loanAccountNo);
+    setCustomerName(c.name || "");
+    setCustomerId(c.customerId || "");
+    setLoanAccountNo(c.loanAccountNo || "");
+    if (c.branch) setBranch(c.branch);
     if (c.aadhaar) { setAadhaar(c.aadhaar); setAadhaarEditable(false); }
     if (c.phone) setPhone(c.phone);
-    setAutoFilledFields(new Set(["customerName", "customerId", "loanAccountNo", "aadhaar"]));
+    const filled = new Set(["customerName", "customerId", "loanAccountNo"]);
+    if (c.aadhaar) filled.add("aadhaar");
+    if (c.branch) filled.add("branch");
+    setAutoFilledFields(filled);
     setCustomerMatches([]);
     setLookupStatus("found");
     if (c.phone) fetchCentersForPhone(c.phone);
   };
-  const doLookup = (type, value) => {
-    const clean = value.replace(/\D/g, "");
-    if (clean.length < 8) { setLookupStatus(""); setCustomerMatches([]); return; }
+  // doLookup supports both numeric (phone/aadhaar) and text (customerId/loanAccountNo/name) keys.
+  const doLookup = (type, value, opts = {}) => {
+    const raw = String(value || "").trim();
+    const numeric = opts.numeric !== undefined ? opts.numeric : (type === "phone" || type === "aadhaar");
+    const minLen = opts.minLen ?? (numeric ? 8 : 3);
+    const query = numeric ? raw.replace(/\D/g, "") : raw;
+    if (query.length < minLen) { setLookupStatus(""); setCustomerMatches([]); return; }
     setLookupStatus("searching");
-    fetch(`${API_BASE}/customers/lookup?${type}=${clean}`)
+    fetch(`${API_BASE}/customers/lookup?${type}=${encodeURIComponent(query)}`)
       .then(r => r.json())
       .then(data => {
         if (data.found) {
@@ -409,6 +436,23 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
     }
     setter(newValue);
   };
+  // Typing in Customer Name / Customer ID / Loan A/C also triggers the
+  // customer database lookup (debounced, 600 ms, min 3 chars).
+  const handleCustomerNameChange = (val) => {
+    handleAutoFilledChange("customerName", setCustomerName, val);
+    clearTimeout(lookupTimerRef.current);
+    lookupTimerRef.current = setTimeout(() => doLookup("name", val), 600);
+  };
+  const handleCustomerIdChange = (val) => {
+    handleAutoFilledChange("customerId", setCustomerId, val);
+    clearTimeout(lookupTimerRef.current);
+    lookupTimerRef.current = setTimeout(() => doLookup("customerId", val), 600);
+  };
+  const handleLoanAccountNoChange = (val) => {
+    handleAutoFilledChange("loanAccountNo", setLoanAccountNo, val);
+    clearTimeout(lookupTimerRef.current);
+    lookupTimerRef.current = setTimeout(() => doLookup("loanAccountNo", val), 600);
+  };
 
   // Check if PTP date+time is in the future
   const isPtpFuture = (() => {
@@ -420,9 +464,24 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
   // Group OD calculations
   const numCust = Number(numberOfCustomers) || 0;
   const groupOdDue = Number(groupOdAmount) || 0;
+  // customerShare = this member's share (for display). If the user clicked a
+  // specific member in the Center panel we use that member's actual arrear,
+  // otherwise we fall back to an even split of the group OD amount.
   const customerShare = memberArrearOverride > 0 ? memberArrearOverride : (numCust > 0 ? Math.round(groupOdDue / numCust) : 0);
   const groupOdPaid = isPtpFuture ? 0 : (Number(groupOdPaidAmount) || 0);
-  const waiver = isPtpFuture ? 0 : Math.max(0, customerShare - memberAlreadyCollected - groupOdPaid);
+  // Individual Group OD Share = Group OD Amount Due ÷ Group Size.
+  // Waiver is derived from THIS value (not the member override) so that every
+  // change to Group Size immediately recomputes the waiver.
+  const individualGroupOdShare = numCust > 0 ? Math.round(groupOdDue / numCust) : 0;
+  const waiver = isPtpFuture ? 0 : Math.max(0, individualGroupOdShare - memberAlreadyCollected - groupOdPaid);
+
+  // Max allowed Group Size = highest non-closed-member count across the centers
+  // we've loaded for this customer. 0 means "not known yet" (no cap enforced).
+  const maxGroupSize = customerCenters.reduce(
+    (max, cs) => Math.max(max, Number(cs.nonClosedCount) || Number(cs.count) || 0),
+    0
+  );
+  const groupSizeExceeded = maxGroupSize > 0 && numCust > maxGroupSize;
 
   const handleSave = () => {
     if (!branch) { alert("Please select a branch."); return; }
@@ -430,6 +489,7 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
     if (!customerId.trim()) { alert("Please enter customer ID."); return; }
     if (!loanAccountNo.trim()) { alert("Please enter loan account number."); return; }
     if (numCust <= 0) { alert("Please enter the total number of customers in the group."); return; }
+    if (groupSizeExceeded) { alert(`Group Size (${numCust}) cannot exceed the actual number of members in this group (${maxGroupSize}).`); return; }
     if (groupOdDue <= 0) { alert("Please enter Group OD Amount Due."); return; }
     if (!isPtpFuture && groupOdPaid < 0) { alert("Paid Amount cannot be negative."); return; }
     if (!paymentMode) { alert("Please select a Payment Mode."); return; }
@@ -548,8 +608,12 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
         <h3 className="text-sm font-semibold text-teal-700 uppercase tracking-wide mb-4">Customer Details</h3>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Branch *</label>
-            <select value={branch} onChange={e => setBranch(e.target.value)} className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500">
+            <label className="flex items-center gap-1 text-sm font-medium text-gray-700 mb-1">
+              Branch * {autoFilledFields.has("branch") && <span className="text-teal-600 text-xs font-normal whitespace-nowrap">● filled</span>}
+            </label>
+            <select value={branch}
+              onChange={e => handleAutoFilledChange("branch", setBranch, e.target.value)}
+              className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500 ${autoFilledFields.has("branch") ? "bg-teal-50 border-teal-200" : ""}`}>
               <option value="">Select Branch</option>
               {branches.map(b => <option key={b} value={b}>{b}</option>)}
             </select>
@@ -597,7 +661,7 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
               Customer Name * {autoFilledFields.has("customerName") && <span className="text-teal-600 text-xs font-normal whitespace-nowrap">● filled</span>}
             </label>
             <input type="text" value={customerName}
-              onChange={e => handleAutoFilledChange("customerName", setCustomerName, e.target.value)}
+              onChange={e => handleCustomerNameChange(e.target.value)}
               className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500 ${autoFilledFields.has("customerName") ? "bg-teal-50 border-teal-200" : ""}`}
               placeholder="Full name" />
           </div>
@@ -606,7 +670,7 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
               Customer ID * {autoFilledFields.has("customerId") && <span className="text-teal-600 text-xs font-normal whitespace-nowrap">● filled</span>}
             </label>
             <input type="text" value={customerId}
-              onChange={e => handleAutoFilledChange("customerId", setCustomerId, e.target.value)}
+              onChange={e => handleCustomerIdChange(e.target.value)}
               className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500 ${autoFilledFields.has("customerId") ? "bg-teal-50 border-teal-200" : ""}`}
               placeholder="e.g. CUST001" />
           </div>
@@ -615,7 +679,7 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
               Loan Account No. * {autoFilledFields.has("loanAccountNo") && <span className="text-teal-600 text-xs font-normal whitespace-nowrap">● filled</span>}
             </label>
             <input type="text" value={loanAccountNo}
-              onChange={e => handleAutoFilledChange("loanAccountNo", setLoanAccountNo, e.target.value)}
+              onChange={e => handleLoanAccountNoChange(e.target.value)}
               className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500 ${autoFilledFields.has("loanAccountNo") ? "bg-teal-50 border-teal-200" : ""}`}
               placeholder="e.g. LA12345" />
           </div>
@@ -658,7 +722,6 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
 
       {customerCenters.length > 0 && customerCenters.map((cs, ci) => {
         const CLOSED_S = ["Closed", "Written Off"];
-        const DELINQ_DPD = ["SMA-0", "SMA-1", "SMA-2", "NPA"];
         const centerLoanNos = new Set(cs.members.map(m => m.loanNumber));
         const centerEntries = entries.filter(e => centerLoanNos.has(e.loanAccountNo));
         const totalCollected = centerEntries.reduce((s, e) => s + (Number(e.groupOdPaidAmount) || 0), 0);
@@ -668,21 +731,29 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
 
         const enriched = cs.members.map(m => {
           const isClosed = CLOSED_S.includes(m.loanStatus);
-          const isDelinquent = !isClosed && DELINQ_DPD.includes(m.customerDPDClass);
+          // Effective DPD = whichever of customer_dpd / overdue_days is populated
+          // (some pool reports leave customer_dpd blank and only fill overdue_days).
+          const effectiveDPD = Math.max(Number(m.customerDPD) || 0, Number(m.overdueDays) || 0);
+          // Derive DPD class from effective days so it's correct even when the
+          // report's classification column is blank or uses non-standard labels.
+          const derivedClass = isClosed ? (m.customerDPDClass || "") : dpdClassFromDays(effectiveDPD);
+          const isDelinquent = !isClosed && DPD_DELINQUENT_CLASSES.includes(derivedClass);
           const memberCollected = centerEntries
             .filter(e => e.loanAccountNo === m.loanNumber)
             .reduce((s, e) => s + (Number(e.groupOdPaidAmount) || 0), 0);
           const memberRemaining = Math.max(0, Math.round(m.arrearAmountTillDate) - memberCollected);
           const isSettledToday = !isClosed && memberCollected > 0 && memberRemaining === 0;
           const isPartiallyPaid = !isClosed && memberCollected > 0 && memberRemaining > 0;
-          return { ...m, isClosed, isDelinquent, memberCollected, memberRemaining, isSettledToday, isPartiallyPaid };
+          return { ...m, isClosed, isDelinquent, derivedClass, effectiveDPD, memberCollected, memberRemaining, isSettledToday, isPartiallyPaid };
         });
 
         const settledTodayCount = enriched.filter(m => m.isSettledToday).length;
         const pendingMembers = enriched.filter(m => !m.isClosed && !m.isSettledToday);
         const settledMembers = enriched.filter(m => m.isSettledToday);
         const closedMembers = enriched.filter(m => m.isClosed);
-        const adjustedActive = cs.activeCount + settledTodayCount;
+        // Regular = non-closed members whose derived class is "Regular".
+        const regularCount = enriched.filter(m => !m.isClosed && m.derivedClass === "Regular").length;
+        const adjustedActive = regularCount + settledTodayCount;
         const remainingPerMember = pendingMembers.length > 0 ? Math.round(remainingArrear / pendingMembers.length) : 0;
 
         const MemberRow = ({ m, idx }) => (
@@ -723,7 +794,7 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
             <td className="px-3 py-2.5 text-center">
               {m.isSettledToday
                 ? <span className="px-2 py-0.5 rounded-full text-xs font-bold bg-green-100 text-green-700">0d</span>
-                : <span className={`px-2 py-0.5 rounded-full text-xs font-bold ${m.customerDPD > 90 ? "bg-red-100 text-red-700" : m.customerDPD > 60 ? "bg-orange-100 text-orange-700" : m.customerDPD > 30 ? "bg-yellow-100 text-yellow-700" : m.customerDPD > 0 ? "bg-blue-100 text-blue-700" : "bg-green-100 text-green-700"}`}>{m.customerDPD}d</span>}
+                : <span className={`px-2 py-0.5 rounded-full text-xs font-bold ${m.effectiveDPD > 90 ? "bg-red-100 text-red-700" : m.effectiveDPD > 60 ? "bg-orange-100 text-orange-700" : m.effectiveDPD > 30 ? "bg-yellow-100 text-yellow-700" : m.effectiveDPD > 0 ? "bg-blue-100 text-blue-700" : "bg-green-100 text-green-700"}`}>{m.effectiveDPD}d</span>}
             </td>
             <td className="px-3 py-2.5 text-center">
               {m.isClosed
@@ -731,8 +802,8 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
                 : m.isSettledToday
                   ? <span className="px-2 py-0.5 rounded-full text-xs font-bold bg-green-200 text-green-800">Regular</span>
                   : m.isDelinquent
-                    ? <span className={`px-2 py-0.5 rounded-full text-xs font-bold ${m.customerDPDClass === "NPA" ? "bg-red-100 text-red-700" : m.customerDPDClass === "SMA-2" ? "bg-orange-100 text-orange-700" : m.customerDPDClass === "SMA-1" ? "bg-yellow-100 text-yellow-700" : "bg-blue-100 text-blue-700"}`}>{m.customerDPDClass}</span>
-                    : <span className="px-2 py-0.5 rounded-full text-xs font-bold bg-green-100 text-green-700">Active</span>}
+                    ? <span className={`px-2 py-0.5 rounded-full text-xs font-bold ${m.derivedClass === "NPA" ? "bg-red-100 text-red-700" : m.derivedClass === "SMA-2" ? "bg-orange-100 text-orange-700" : m.derivedClass === "SMA-1" ? "bg-yellow-100 text-yellow-700" : "bg-blue-100 text-blue-700"}`}>{m.derivedClass}</span>
+                    : <span className="px-2 py-0.5 rounded-full text-xs font-bold bg-green-100 text-green-700">Regular</span>}
             </td>
           </tr>
         );
@@ -754,7 +825,7 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
                   {settledTodayCount > 0 && <p className="text-xs text-green-500">(+{settledTodayCount} settled)</p>}
                 </div>
                 {[["SMA-0","blue"],["SMA-1","yellow"],["SMA-2","orange"],["NPA","red"]].map(([bucket, color]) => {
-                  const cnt = pendingMembers.filter(m => m.customerDPDClass === bucket).length;
+                  const cnt = pendingMembers.filter(m => m.derivedClass === bucket).length;
                   return (
                     <div key={bucket} className={`bg-${color}-50 border border-${color}-200 rounded-lg p-2.5 text-center`}>
                       <p className="text-xs text-gray-500 mb-1">{bucket}</p>
@@ -862,9 +933,28 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
               className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="e.g. 10000" />
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Group Size *</label>
-            <input type="number" min="1" value={numberOfCustomers} onChange={e => setNumberOfCustomers(e.target.value)}
-              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="e.g. 4" />
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Group Size *{maxGroupSize > 0 && <span className="text-gray-400 font-normal ml-1">(max {maxGroupSize})</span>}
+            </label>
+            <input
+              type="number"
+              min="1"
+              max={maxGroupSize > 0 ? maxGroupSize : undefined}
+              value={numberOfCustomers}
+              onChange={e => {
+                // Hard-cap input: if user types more than the actual group has, clamp.
+                const v = e.target.value;
+                if (maxGroupSize > 0 && v !== "" && Number(v) > maxGroupSize) {
+                  setNumberOfCustomers(String(maxGroupSize));
+                } else {
+                  setNumberOfCustomers(v);
+                }
+              }}
+              className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500 ${groupSizeExceeded ? "border-red-400 bg-red-50" : ""}`}
+              placeholder="e.g. 4" />
+            {groupSizeExceeded && (
+              <p className="text-xs text-red-600 mt-1">Cannot exceed {maxGroupSize} members in this group.</p>
+            )}
           </div>
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
@@ -916,10 +1006,22 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
             )}
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Waiver (Auto)</label>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Waiver (Auto)
+              {numCust > 0 && groupOdDue > 0 && (
+                <span className="text-gray-400 font-normal text-xs ml-1">
+                  = {formatINR(individualGroupOdShare)} − Paid
+                </span>
+              )}
+            </label>
             <input readOnly value={formatINR(waiver)}
               className={`w-full px-3 py-2 border rounded-lg font-semibold cursor-default ${waiver > 0 ? "bg-amber-50 border-amber-300 text-amber-700" : "bg-green-50 border-green-300 text-green-700"}`} />
             {waiver > 0 && <p className="text-xs text-amber-600 mt-1 font-medium">Approval required</p>}
+            {numCust > 0 && groupOdDue > 0 && (
+              <p className="text-[11px] text-gray-500 mt-1">
+                Individual Group OD Share = {formatINR(groupOdDue)} ÷ {numCust} = {formatINR(individualGroupOdShare)}
+              </p>
+            )}
           </div>
         </div>
 
@@ -998,20 +1100,28 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
   };
 
   const applyCustomer = (c) => {
-    setCustomerName(c.name);
-    setCustomerId(c.customerId);
-    setLoanAccountNo(c.loanAccountNo);
+    setCustomerName(c.name || "");
+    setCustomerId(c.customerId || "");
+    setLoanAccountNo(c.loanAccountNo || "");
+    if (c.branch) setBranch(c.branch);
     if (c.aadhaar) { setAadhaar(c.aadhaar); setAadhaarEditable(false); }
     if (c.phone) { setPhone(c.phone); fetchIndivCenters(c.phone); }
-    setAutoFilledFields(new Set(["customerName", "customerId", "loanAccountNo", "aadhaar"]));
+    const filled = new Set(["customerName", "customerId", "loanAccountNo"]);
+    if (c.aadhaar) filled.add("aadhaar");
+    if (c.branch) filled.add("branch");
+    setAutoFilledFields(filled);
     setCustomerMatches([]);
     setLookupStatus("found");
   };
-  const doLookup = (type, value) => {
-    const clean = value.replace(/\D/g, "");
-    if (clean.length < 8) { setLookupStatus(""); setCustomerMatches([]); return; }
+  // doLookup supports both numeric (phone/aadhaar) and text (customerId/loanAccountNo/name) keys.
+  const doLookup = (type, value, opts = {}) => {
+    const raw = String(value || "").trim();
+    const numeric = opts.numeric !== undefined ? opts.numeric : (type === "phone" || type === "aadhaar");
+    const minLen = opts.minLen ?? (numeric ? 8 : 3);
+    const query = numeric ? raw.replace(/\D/g, "") : raw;
+    if (query.length < minLen) { setLookupStatus(""); setCustomerMatches([]); return; }
     setLookupStatus("searching");
-    fetch(`${API_BASE}/customers/lookup?${type}=${clean}`)
+    fetch(`${API_BASE}/customers/lookup?${type}=${encodeURIComponent(query)}`)
       .then(r => r.json())
       .then(data => {
         if (data.found) {
@@ -1039,6 +1149,52 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
     }
     setter(newValue);
   };
+  // Typing in Customer Name / Customer ID / Loan A/C also triggers the
+  // customer database lookup (debounced, 600 ms, min 3 chars).
+  const handleCustomerNameChange = (val) => {
+    handleAutoFilledChange("customerName", setCustomerName, val);
+    clearTimeout(lookupTimerRef.current);
+    lookupTimerRef.current = setTimeout(() => doLookup("name", val), 600);
+  };
+  const handleCustomerIdChange = (val) => {
+    handleAutoFilledChange("customerId", setCustomerId, val);
+    clearTimeout(lookupTimerRef.current);
+    lookupTimerRef.current = setTimeout(() => doLookup("customerId", val), 600);
+  };
+  const handleLoanAccountNoChange = (val) => {
+    handleAutoFilledChange("loanAccountNo", setLoanAccountNo, val);
+    clearTimeout(lookupTimerRef.current);
+    lookupTimerRef.current = setTimeout(() => doLookup("loanAccountNo", val), 600);
+  };
+
+  // Auto-fill Amount Due with the customer's Foreclosure amount as soon as the
+  // OD Snapshot resolves. Waiver starts equal to foreclosure (= full waive if
+  // nothing paid); it then auto-adjusts whenever Paid Amount changes so that
+  // Waiver = Amount Due − Paid. Both fields remain fully editable.
+  useEffect(() => {
+    const fcl = Number(odSnap?.foreclosureValue) || 0;
+    if (fcl <= 0) return;
+    // Only auto-fill Amount Due if user hasn't typed anything of their own.
+    if (!amountDue || autoFilledFields.has("amountDue")) {
+      setAmountDue(String(Math.round(fcl)));
+      setAutoFilledFields(prev => { const n = new Set(prev); n.add("amountDue"); return n; });
+    }
+    // Only auto-fill Waiver if user hasn't overridden it.
+    if (!waiverInput || autoFilledFields.has("waiver")) {
+      const paidNum = Number(paidAmount) || 0;
+      setWaiverInput(String(Math.max(0, Math.round(fcl) - paidNum)));
+      setAutoFilledFields(prev => { const n = new Set(prev); n.add("waiver"); return n; });
+    }
+  }, [odSnap?.foreclosureValue]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // When Paid Amount changes, re-sync Waiver = Amount Due − Paid (only if
+  // Waiver is still in auto mode — user override takes precedence).
+  useEffect(() => {
+    if (!autoFilledFields.has("waiver")) return;
+    const due = Number(amountDue) || 0;
+    const paidNum = Number(paidAmount) || 0;
+    setWaiverInput(String(Math.max(0, due - paidNum)));
+  }, [paidAmount, amountDue]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const isPtpFuture = (() => {
     if (!ptpDate) return false;
@@ -1161,8 +1317,12 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
         <h3 className="text-sm font-semibold text-indigo-700 uppercase tracking-wide mb-4">Customer Details</h3>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Branch *</label>
-            <select value={branch} onChange={e => setBranch(e.target.value)} className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500">
+            <label className="flex items-center gap-1 text-sm font-medium text-gray-700 mb-1">
+              Branch * {autoFilledFields.has("branch") && <span className="text-indigo-600 text-xs font-normal whitespace-nowrap">● filled</span>}
+            </label>
+            <select value={branch}
+              onChange={e => handleAutoFilledChange("branch", setBranch, e.target.value)}
+              className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500 ${autoFilledFields.has("branch") ? "bg-indigo-50 border-indigo-200" : ""}`}>
               <option value="">Select Branch</option>
               {branches.map(b => <option key={b} value={b}>{b}</option>)}
             </select>
@@ -1209,7 +1369,7 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
               Customer Name * {autoFilledFields.has("customerName") && <span className="text-indigo-600 text-xs font-normal whitespace-nowrap">● filled</span>}
             </label>
             <input type="text" value={customerName}
-              onChange={e => handleAutoFilledChange("customerName", setCustomerName, e.target.value)}
+              onChange={e => handleCustomerNameChange(e.target.value)}
               className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500 ${autoFilledFields.has("customerName") ? "bg-indigo-50 border-indigo-200" : ""}`}
               placeholder="Full name" />
           </div>
@@ -1219,7 +1379,7 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
               <span className="text-gray-400 font-normal text-xs">(optional)</span>
             </label>
             <input type="text" value={customerId}
-              onChange={e => handleAutoFilledChange("customerId", setCustomerId, e.target.value)}
+              onChange={e => handleCustomerIdChange(e.target.value)}
               className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500 ${autoFilledFields.has("customerId") ? "bg-indigo-50 border-indigo-200" : ""}`}
               placeholder="e.g. CUST001" />
           </div>
@@ -1228,7 +1388,7 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
               Loan Account No. * {autoFilledFields.has("loanAccountNo") && <span className="text-indigo-600 text-xs font-normal whitespace-nowrap">● filled</span>}
             </label>
             <input type="text" value={loanAccountNo}
-              onChange={e => handleAutoFilledChange("loanAccountNo", setLoanAccountNo, e.target.value)}
+              onChange={e => handleLoanAccountNoChange(e.target.value)}
               className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500 ${autoFilledFields.has("loanAccountNo") ? "bg-indigo-50 border-indigo-200" : ""}`}
               placeholder="e.g. LA12345" />
           </div>
@@ -1277,15 +1437,17 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
       {/* Center / Group Context Panel — read-only reference for individual entry */}
       {indivCenters.length > 0 && indivCenters.map((cs, ci) => {
         const CLOSED_S = ["Closed", "Written Off"];
-        const DELINQ_DPD = ["SMA-0", "SMA-1", "SMA-2", "NPA"];
         const nonClosedCount = cs.count - cs.closedCount;
         const perMemberShare = nonClosedCount > 0 ? Math.round(cs.totalArrear / nonClosedCount) : 0;
         const enriched = cs.members.map(m => {
           const isClosed = CLOSED_S.includes(m.loanStatus);
-          const isDelinquent = !isClosed && DELINQ_DPD.includes(m.customerDPDClass);
-          return { ...m, isClosed, isDelinquent };
+          const effectiveDPD = Math.max(Number(m.customerDPD) || 0, Number(m.overdueDays) || 0);
+          const derivedClass = isClosed ? (m.customerDPDClass || "") : dpdClassFromDays(effectiveDPD);
+          const isDelinquent = !isClosed && DPD_DELINQUENT_CLASSES.includes(derivedClass);
+          return { ...m, isClosed, isDelinquent, derivedClass, effectiveDPD };
         });
         const pendingMembers = enriched.filter(m => !m.isClosed);
+        const regularCount = enriched.filter(m => !m.isClosed && m.derivedClass === "Regular").length;
         return (
           <div key={ci} className="bg-white rounded-xl shadow-sm border p-5 mb-4">
             <div className="flex items-center justify-between mb-3">
@@ -1303,10 +1465,10 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
               </div>
               <div className="bg-green-50 border border-green-200 rounded-lg p-2 text-center">
                 <p className="text-xs text-gray-500 mb-0.5">Regular</p>
-                <p className="text-lg font-extrabold text-green-700">{cs.activeCount > 0 ? cs.activeCount : "—"}</p>
+                <p className="text-lg font-extrabold text-green-700">{regularCount > 0 ? regularCount : "—"}</p>
               </div>
               {[["SMA-0","blue"],["SMA-1","yellow"],["SMA-2","orange"],["NPA","red"]].map(([bucket, color]) => {
-                const cnt = enriched.filter(m => !m.isClosed && m.customerDPDClass === bucket).length;
+                const cnt = enriched.filter(m => !m.isClosed && m.derivedClass === bucket).length;
                 return (
                   <div key={bucket} className={`bg-${color}-50 border border-${color}-200 rounded-lg p-2 text-center`}>
                     <p className="text-xs text-gray-500 mb-0.5">{bucket}</p>
@@ -1363,16 +1525,16 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
                       <td className="px-3 py-2.5 text-right text-gray-700">{formatINR(Math.round(m.principalOverdue))}</td>
                       <td className="px-3 py-2.5 text-right font-bold text-red-700">{formatINR(Math.round(m.arrearAmountTillDate))}</td>
                       <td className="px-3 py-2.5 text-center">
-                        <span className={`px-2 py-0.5 rounded-full text-xs font-bold ${m.customerDPD > 90 ? "bg-red-100 text-red-700" : m.customerDPD > 60 ? "bg-orange-100 text-orange-700" : m.customerDPD > 30 ? "bg-yellow-100 text-yellow-700" : m.customerDPD > 0 ? "bg-blue-100 text-blue-700" : "bg-green-100 text-green-700"}`}>
-                          {m.customerDPD}d
+                        <span className={`px-2 py-0.5 rounded-full text-xs font-bold ${m.effectiveDPD > 90 ? "bg-red-100 text-red-700" : m.effectiveDPD > 60 ? "bg-orange-100 text-orange-700" : m.effectiveDPD > 30 ? "bg-yellow-100 text-yellow-700" : m.effectiveDPD > 0 ? "bg-blue-100 text-blue-700" : "bg-green-100 text-green-700"}`}>
+                          {m.effectiveDPD}d
                         </span>
                       </td>
                       <td className="px-3 py-2.5 text-center">
                         {m.isClosed
                           ? <span className="px-2 py-0.5 rounded-full text-xs font-bold bg-gray-200 text-gray-500">Closed</span>
                           : m.isDelinquent
-                            ? <span className={`px-2 py-0.5 rounded-full text-xs font-bold ${m.customerDPDClass === "NPA" ? "bg-red-100 text-red-700" : m.customerDPDClass === "SMA-2" ? "bg-orange-100 text-orange-700" : m.customerDPDClass === "SMA-1" ? "bg-yellow-100 text-yellow-700" : "bg-blue-100 text-blue-700"}`}>{m.customerDPDClass}</span>
-                            : <span className="px-2 py-0.5 rounded-full text-xs font-bold bg-green-100 text-green-700">Active</span>}
+                            ? <span className={`px-2 py-0.5 rounded-full text-xs font-bold ${m.derivedClass === "NPA" ? "bg-red-100 text-red-700" : m.derivedClass === "SMA-2" ? "bg-orange-100 text-orange-700" : m.derivedClass === "SMA-1" ? "bg-yellow-100 text-yellow-700" : "bg-blue-100 text-blue-700"}`}>{m.derivedClass}</span>
+                            : <span className="px-2 py-0.5 rounded-full text-xs font-bold bg-green-100 text-green-700">Regular</span>}
                       </td>
                     </tr>
                   ))}
@@ -1388,9 +1550,13 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
         <h3 className="text-sm font-semibold text-indigo-700 uppercase tracking-wide mb-4">Transaction Details</h3>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">OD Amount Due *</label>
-            <input type="number" min="0" value={amountDue} onChange={e => setAmountDue(e.target.value)}
-              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500" placeholder="e.g. 10000" />
+            <label className="flex items-center gap-1 text-sm font-medium text-gray-700 mb-1">
+              OD Amount Due * {autoFilledFields.has("amountDue") && <span className="text-indigo-600 text-xs font-normal whitespace-nowrap">● foreclosure</span>}
+            </label>
+            <input type="number" min="0" value={amountDue}
+              onChange={e => handleAutoFilledChange("amountDue", setAmountDue, e.target.value)}
+              className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500 ${autoFilledFields.has("amountDue") ? "bg-indigo-50 border-indigo-200" : ""}`}
+              placeholder="e.g. 10000" />
           </div>
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Payment Mode *</label>
@@ -1445,9 +1611,12 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
             )}
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Waiver Amount</label>
-            <input type="number" min="0" value={waiverInput} onChange={e => setWaiverInput(e.target.value)}
-              className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500 ${waiver > 0 ? "bg-amber-50 border-amber-300" : ""}`}
+            <label className="flex items-center gap-1 text-sm font-medium text-gray-700 mb-1">
+              Waiver Amount {autoFilledFields.has("waiver") && <span className="text-indigo-600 text-xs font-normal whitespace-nowrap">● auto (Amount Due − Paid)</span>}
+            </label>
+            <input type="number" min="0" value={waiverInput}
+              onChange={e => handleAutoFilledChange("waiver", setWaiverInput, e.target.value)}
+              className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500 ${autoFilledFields.has("waiver") ? "bg-indigo-50 border-indigo-200" : (waiver > 0 ? "bg-amber-50 border-amber-300" : "")}`}
               placeholder="0 (leave blank if none)" />
             {waiver > 0 && <p className="text-xs text-amber-600 mt-1 font-medium">Approval required</p>}
           </div>

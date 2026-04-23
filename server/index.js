@@ -199,7 +199,9 @@ function getCustomerBase() {
 }
 
 app.get("/api/customers/lookup", (req, res) => {
-  const { phone, aadhaar } = req.query;
+  // Supported lookup keys: phone, aadhaar (numeric/exact) and
+  // customerId, loanAccountNo, name (text/partial). Any ONE should be provided.
+  const { phone, aadhaar, customerId, loanAccountNo, name } = req.query;
   const base = getCustomerBase();
   let customers = [];
   let key = "";
@@ -211,39 +213,60 @@ app.get("/api/customers/lookup", (req, res) => {
     customers = (base.byAadhaar[key] || []).slice();
   }
 
-  // Also query the OD SQLite customers table — so customers ingested via the
-  // Pool Report are reachable by phone/Aadhaar even if they aren't in the
-  // legacy customer-base.json file.
-  if (key) {
-    try {
-      let rows = [];
-      if (phone) {
-        // mobile_number in OD data may be stored with or without country code / dashes.
+  // Also query the OD SQLite customers table. Supports all 5 lookup keys so
+  // customers ingested via the OD Upload are reachable by any identifier,
+  // even if they aren't in the legacy customer-base.json file.
+  try {
+    const cols = "loan_account_no, customer_number, customer_name, mobile_number, aadhaar_number, branch";
+    let rows = [];
+    if (phone && key) {
+      // mobile_number in OD data may be stored with or without country code / dashes.
+      rows = db.prepare(
+        `SELECT ${cols} FROM customers WHERE REPLACE(REPLACE(REPLACE(mobile_number,' ',''),'-',''),'+','') LIKE ?`
+      ).all("%" + key + "%");
+    } else if (aadhaar && key) {
+      rows = db.prepare(
+        `SELECT ${cols} FROM customers WHERE REPLACE(REPLACE(aadhaar_number,' ',''),'-','') = ?`
+      ).all(key);
+    } else if (customerId) {
+      const k = String(customerId).trim();
+      if (k.length >= 3) {
         rows = db.prepare(
-          "SELECT loan_account_no, customer_number, customer_name, mobile_number, aadhaar_number FROM customers WHERE REPLACE(REPLACE(REPLACE(mobile_number,' ',''),'-',''),'+','') LIKE ?"
-        ).all("%" + key + "%");
-      } else if (aadhaar) {
+          `SELECT ${cols} FROM customers WHERE customer_number LIKE ? LIMIT 20`
+        ).all(k + "%");
+      }
+    } else if (loanAccountNo) {
+      const k = String(loanAccountNo).trim();
+      if (k.length >= 3) {
         rows = db.prepare(
-          "SELECT loan_account_no, customer_number, customer_name, mobile_number, aadhaar_number FROM customers WHERE REPLACE(REPLACE(aadhaar_number,' ',''),'-','') = ?"
-        ).all(key);
+          `SELECT ${cols} FROM customers WHERE loan_account_no LIKE ? LIMIT 20`
+        ).all(k + "%");
       }
-      // Dedupe against existing customers by loanAccountNo (or customerId fallback).
-      const seen = new Set(customers.map(c => (c.loanAccountNo || c.customerId || "").toString()));
-      for (const r of rows) {
-        const k = (r.loan_account_no || r.customer_number || "").toString();
-        if (seen.has(k)) continue;
-        seen.add(k);
-        customers.push({
-          name: r.customer_name || "",
-          customerId: r.customer_number || "",
-          loanAccountNo: r.loan_account_no || "",
-          aadhaar: r.aadhaar_number || "",
-          phone: r.mobile_number || "",
-        });
+    } else if (name) {
+      const k = String(name).trim();
+      if (k.length >= 3) {
+        rows = db.prepare(
+          `SELECT ${cols} FROM customers WHERE customer_name LIKE ? LIMIT 20`
+        ).all("%" + k + "%");
       }
-    } catch (e) {
-      console.error("[customers/lookup] OD fallback failed:", e.message);
     }
+    // Dedupe against existing customers by loanAccountNo (or customerId fallback).
+    const seen = new Set(customers.map(c => (c.loanAccountNo || c.customerId || "").toString()));
+    for (const r of rows) {
+      const k = (r.loan_account_no || r.customer_number || "").toString();
+      if (seen.has(k)) continue;
+      seen.add(k);
+      customers.push({
+        name: r.customer_name || "",
+        customerId: r.customer_number || "",
+        loanAccountNo: r.loan_account_no || "",
+        aadhaar: r.aadhaar_number || "",
+        phone: r.mobile_number || "",
+        branch: r.branch || "",
+      });
+    }
+  } catch (e) {
+    console.error("[customers/lookup] SQLite lookup failed:", e.message);
   }
 
   res.json({ found: customers.length > 0, customers });
