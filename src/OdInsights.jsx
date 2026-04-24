@@ -109,9 +109,35 @@ export function CustomerInfoPanel({ loanAccountNo, customerId, compact = false, 
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  // NEW: all active loans for the same customer (fetched from /api/customers/loans)
+  const [otherLoans, setOtherLoans] = useState([]);
+  const [selectedLoan, setSelectedLoan] = useState(null);
   const reqRef = useRef(0);
+  const loansReqRef = useRef(0);
   const onDataRef = useRef(onData);
   useEffect(() => { onDataRef.current = onData; }, [onData]);
+
+  // Fetch the customer's OTHER active loans whenever the identifiers change.
+  useEffect(() => {
+    const loan = (loanAccountNo || "").trim();
+    const cust = (customerId || "").trim();
+    if (!loan && !cust) { setOtherLoans([]); return; }
+    const myReq = ++loansReqRef.current;
+    const q = new URLSearchParams();
+    if (cust) q.set("customerId", cust);
+    else if (loan) q.set("loanAccountNo", loan);
+    const timer = setTimeout(() => {
+      fetch(`${API_BASE}/customers/loans?${q.toString()}`)
+        .then(r => r.json())
+        .then(json => {
+          if (myReq !== loansReqRef.current) return;
+          if (json && json.found) setOtherLoans(json.loans || []);
+          else setOtherLoans([]);
+        })
+        .catch(() => { if (myReq === loansReqRef.current) setOtherLoans([]); });
+    }, 500);
+    return () => clearTimeout(timer);
+  }, [loanAccountNo, customerId]);
 
   useEffect(() => {
     const loan = (loanAccountNo || "").trim();
@@ -255,6 +281,109 @@ export function CustomerInfoPanel({ loanAccountNo, customerId, compact = false, 
           {pool.installments_paid != null && (
             <span className="text-gray-500">Installments paid: <b className="text-gray-800">{pool.installments_paid}</b></span>
           )}
+        </div>
+      )}
+
+      {/* ── All Active Loans for this Customer ─────────────────────────────
+         Shown below the single-loan OD Snapshot. Skipped in compact mode and
+         when there is only one loan (the one already shown above). */}
+      {!compact && otherLoans.length > 0 && (
+        <div className="bg-white rounded-lg p-3 border border-teal-100">
+          <div className="flex items-center justify-between mb-2">
+            <div className="text-xs font-semibold text-teal-800 uppercase tracking-wide">
+              All Active Loans for this Customer ({otherLoans.length})
+            </div>
+            <span className="text-[10px] text-gray-400">Click a loan to see full details</span>
+          </div>
+          <div className="space-y-2">
+            {otherLoans.map(l => {
+              const effDPD = Math.max(Number(l.customerDPD) || 0, Number(l.overdueDays) || 0);
+              const isCurrent = l.loanAccountNo === loanAccountNo;
+              const dpdClass = effDPD > 90 ? "bg-red-100 text-red-700"
+                : effDPD > 60 ? "bg-orange-100 text-orange-700"
+                : effDPD > 30 ? "bg-amber-100 text-amber-700"
+                : effDPD > 0  ? "bg-yellow-100 text-yellow-700"
+                : "bg-green-100 text-green-700";
+              return (
+                <div key={l.loanAccountNo}
+                  onClick={() => setSelectedLoan(l)}
+                  className={`p-2.5 rounded-lg border cursor-pointer transition-colors ${isCurrent ? "border-teal-500 bg-teal-50 ring-1 ring-teal-300" : "border-gray-200 bg-white hover:bg-teal-50 hover:border-teal-300"}`}>
+                  <div className="flex items-center justify-between gap-3 flex-wrap">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="font-mono text-sm font-semibold text-gray-800">{l.loanAccountNo}</span>
+                      {isCurrent && <span className="text-[10px] font-bold text-teal-700 bg-teal-100 px-1.5 py-0.5 rounded">CURRENT</span>}
+                      {l.branch && <span className="text-xs text-gray-500">· {l.branch}</span>}
+                      {l.centerName && <span className="text-xs text-gray-500">· {l.centerName}</span>}
+                    </div>
+                    <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${dpdClass}`}>{effDPD}d</span>
+                  </div>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-2 text-xs">
+                    <div><span className="text-gray-500">Outstanding:</span> <span className="font-medium text-gray-800">{formatINR(l.principalOutstanding)}</span></div>
+                    <div><span className="text-gray-500">Unpaid Int:</span> <span className="font-medium text-gray-800">{formatINR(l.interestOverdue)}</span></div>
+                    <div><span className="text-gray-500">Accrued:</span> <span className="font-medium text-gray-800">{formatINR(l.accruedInterest)}</span></div>
+                    <div><span className="text-gray-500">Foreclosure:</span> <span className="font-bold text-teal-700">{formatINR(l.foreclosureValue)}</span></div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Loan detail modal */}
+      {selectedLoan && (
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4" onClick={() => setSelectedLoan(null)}>
+          <div className="bg-white rounded-xl shadow-xl p-5 w-full max-w-lg max-h-[90vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-4 pb-3 border-b">
+              <div>
+                <h3 className="font-bold text-gray-900">{selectedLoan.customerName || "Customer"}</h3>
+                <p className="text-xs text-gray-500 font-mono mt-0.5">Loan: {selectedLoan.loanAccountNo} · Cust ID: {selectedLoan.customerNumber}</p>
+              </div>
+              <button onClick={() => setSelectedLoan(null)} className="p-1 hover:bg-gray-100 rounded"><X size={18} /></button>
+            </div>
+            <div className="space-y-3 text-sm">
+              <div className="grid grid-cols-2 gap-3 p-3 bg-gray-50 rounded-lg">
+                <div><span className="text-gray-500">Branch:</span> <span className="font-medium">{selectedLoan.branch || "—"}</span></div>
+                <div><span className="text-gray-500">Center:</span> <span className="font-medium">{selectedLoan.centerName || "—"}</span></div>
+                <div><span className="text-gray-500">Group:</span> <span className="font-medium">{selectedLoan.groupName || "—"}</span></div>
+                <div><span className="text-gray-500">Product:</span> <span className="font-medium">{selectedLoan.productName || "—"}</span></div>
+                <div><span className="text-gray-500">Interest Rate:</span> <span className="font-medium">{selectedLoan.interestRate ? `${selectedLoan.interestRate}%` : "—"}</span></div>
+                <div><span className="text-gray-500">Loan Amount:</span> <span className="font-medium">{formatINR(selectedLoan.loanAmount)}</span></div>
+                <div><span className="text-gray-500">Disbursed:</span> <span className="font-medium">{selectedLoan.disbursementDate ? formatDateDMY(selectedLoan.disbursementDate) : "—"}</span></div>
+                <div><span className="text-gray-500">Last Paid:</span> <span className="font-medium">{selectedLoan.lastPaymentDate ? formatDateDMY(selectedLoan.lastPaymentDate) : "—"}</span></div>
+              </div>
+              <div className="p-3 bg-teal-50 rounded-lg border border-teal-200">
+                <div className="text-xs font-semibold text-teal-800 uppercase mb-2">OD Breakdown</div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div><span className="text-gray-500">Principal Outstanding:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.principalOutstanding)}</div></div>
+                  <div><span className="text-gray-500">Interest Outstanding:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.interestOutstanding)}</div></div>
+                  <div><span className="text-gray-500">Principal Overdue:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.principalOverdue)}</div></div>
+                  <div><span className="text-gray-500">Interest Overdue:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.interestOverdue)}</div></div>
+                  <div><span className="text-gray-500">Current OD:</span><div className="font-bold text-red-700">{formatINR(selectedLoan.currentOD)}</div></div>
+                  <div><span className="text-gray-500">Accrued Interest:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.accruedInterest)}</div></div>
+                </div>
+                <div className="mt-3 p-2 bg-white rounded border border-teal-300">
+                  <span className="text-xs text-gray-600">Foreclosure Value:</span>
+                  <div className="text-xl font-bold text-teal-700">{formatINR(selectedLoan.foreclosureValue)}</div>
+                </div>
+              </div>
+              <div className="grid grid-cols-3 gap-2 text-xs">
+                <div className="p-2 bg-gray-50 rounded">
+                  <span className="text-gray-500">DPD:</span>
+                  <div className="font-bold">{Math.max(Number(selectedLoan.customerDPD) || 0, Number(selectedLoan.overdueDays) || 0)} days</div>
+                </div>
+                <div className="p-2 bg-gray-50 rounded">
+                  <span className="text-gray-500">Status:</span>
+                  <div className="font-bold">{selectedLoan.loanStatus || "Active"}</div>
+                </div>
+                <div className="p-2 bg-gray-50 rounded">
+                  <span className="text-gray-500">DPD Class:</span>
+                  <div className="font-bold">{selectedLoan.dpdClassification || "—"}</div>
+                </div>
+              </div>
+            </div>
+            <button onClick={() => setSelectedLoan(null)} className="mt-4 w-full px-4 py-2 bg-teal-600 text-white rounded-lg hover:bg-teal-700 text-sm font-medium">Close</button>
+          </div>
         </div>
       )}
     </div>

@@ -65,6 +65,34 @@ function dpdClassFromDays(days) {
 }
 const DPD_DELINQUENT_CLASSES = ["SMA-0", "SMA-1", "SMA-2", "NPA"];
 
+// ─── Indian bank list (Cash deposit dropdown) ──────────────────────────────
+// Default list of major banks in India — public sector, private, small finance,
+// payments banks, and regional rural banks. To add/remove banks, edit this
+// array. (Kept alphabetised within each category for easy scanning.)
+const INDIAN_BANKS = [
+  // Public sector banks
+  "Bank of Baroda", "Bank of India", "Bank of Maharashtra", "Canara Bank",
+  "Central Bank of India", "Indian Bank", "Indian Overseas Bank",
+  "Punjab & Sind Bank", "Punjab National Bank", "State Bank of India",
+  "UCO Bank", "Union Bank of India",
+  // Private sector banks
+  "Axis Bank", "Bandhan Bank", "City Union Bank", "CSB Bank", "DCB Bank",
+  "Dhanlaxmi Bank", "Federal Bank", "HDFC Bank", "ICICI Bank", "IDBI Bank",
+  "IDFC FIRST Bank", "IndusInd Bank", "J&K Bank", "Karnataka Bank",
+  "Karur Vysya Bank", "Kotak Mahindra Bank", "Nainital Bank", "RBL Bank",
+  "South Indian Bank", "Tamilnad Mercantile Bank", "Yes Bank",
+  // Small finance banks
+  "AU Small Finance Bank", "Capital Small Finance Bank",
+  "Equitas Small Finance Bank", "ESAF Small Finance Bank",
+  "Fincare Small Finance Bank", "Jana Small Finance Bank",
+  "North East Small Finance Bank", "Shivalik Small Finance Bank",
+  "Suryoday Small Finance Bank", "Ujjivan Small Finance Bank",
+  "Unity Small Finance Bank", "Utkarsh Small Finance Bank",
+  // Payments banks
+  "Airtel Payments Bank", "Fino Payments Bank", "India Post Payments Bank",
+  "Jio Payments Bank", "NSDL Payments Bank",
+];
+
 const loadData = (key, fallback) => {
   try { const d = localStorage.getItem(key); return d ? JSON.parse(d) : fallback; }
   catch { return fallback; }
@@ -358,6 +386,17 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
   const [ptpTime, setPtpTime] = useState("");
   const [showWaiverModal, setShowWaiverModal] = useState(false);
   const [pendingEntry, setPendingEntry] = useState(null);
+  // Payment-mode specific tracking:
+  //   Cash mode → collectorStaffId + depositBank
+  //   UPI mode  → transactionId + narration  (in addition to existing upiReference)
+  const [collectorStaffId, setCollectorStaffId] = useState("");
+  const [depositBank, setDepositBank] = useState("");
+  const [transactionId, setTransactionId] = useState("");
+  const [narration, setNarration] = useState("");
+  // Flag: this recovery came from the customer closing their Gold Loan with us.
+  // Stored as `collectionSource: "Gold"` on the entry for reporting/filtering.
+  const [isGoldClosure, setIsGoldClosure] = useState(false);
+  const appUsers = loadData(STORAGE_KEYS.users, []);
   // Customer lookup
   const [phone, setPhone] = useState("");
   const [aadhaar, setAadhaar] = useState("");
@@ -494,6 +533,9 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
     if (!isPtpFuture && groupOdPaid < 0) { alert("Paid Amount cannot be negative."); return; }
     if (!paymentMode) { alert("Please select a Payment Mode."); return; }
     if (paymentMode === "UPI" && !upiReference.trim()) { alert("Please enter UPI Transaction Reference."); return; }
+    if (paymentMode === "UPI" && !transactionId.trim()) { alert("Please enter the Transaction ID."); return; }
+    if (paymentMode === "Cash" && !isPtpFuture && !collectorStaffId) { alert("Please select the Field Staff who collected the cash."); return; }
+    if (paymentMode === "Cash" && !isPtpFuture && !depositBank) { alert("Please select the Bank where the cash was deposited."); return; }
     if (paymentMode === "Cash" && ptpDate && !isValidDate(ptpDate)) { alert("Please enter a valid PTP date."); return; }
     if (paymentMode === "Cash" && ptpDate && !ptpTime) { alert("Please enter PTP time."); return; }
     if (!isPtpFuture && waiver > 0 && !approvalEmailSubject.trim()) { alert("Waiver detected. Please enter the approval email subject line."); return; }
@@ -503,6 +545,10 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
       e.customerId === customerId.trim() && e.loanAccountNo === loanAccountNo.trim() && e.date === date && e.branch === branch
     );
     if (isDup && !confirm("A similar entry already exists for this customer today. Save anyway?")) return;
+
+    // Resolve the selected field staff's display name from the app user list.
+    const selectedStaff = appUsers.find(u => u.id === collectorStaffId);
+    const collectorStaffName = selectedStaff ? (selectedStaff.name || selectedStaff.id) : "";
 
     const entry = {
       id: generateId(), date, time: nowTime(), branch,
@@ -519,6 +565,15 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
       waiver: isPtpFuture ? 0 : waiver,
       paymentMode,
       upiReference: paymentMode === "UPI" ? upiReference.trim() : "",
+      // Cash mode fields
+      collectorStaffId: paymentMode === "Cash" ? collectorStaffId : "",
+      collectorStaffName: paymentMode === "Cash" ? collectorStaffName : "",
+      depositBank:       paymentMode === "Cash" ? depositBank       : "",
+      // UPI/GPay mode fields
+      transactionId:     paymentMode === "UPI"  ? transactionId.trim()  : "",
+      narration:         paymentMode === "UPI"  ? narration.trim()      : "",
+      // Optional tag: "Gold" means this recovery came from closing a Gold loan.
+      collectionSource:  isGoldClosure ? "Gold" : "",
       ptpDate: paymentMode === "Cash" ? ptpDate : "",
       ptpTime: paymentMode === "Cash" ? ptpTime : "",
       ptpStatus: isPtpFuture ? "pending" : "na", // "pending" = awaiting payment, "paid" = settled, "na" = not applicable
@@ -585,6 +640,7 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
     setApprovalEmailSubject("");
     setNumberOfCustomers(""); setGroupOdAmount(""); setGroupOdPaidAmount("");
     setPaymentMode(""); setUpiReference(""); setPtpDate(""); setPtpTime("");
+    setCollectorStaffId(""); setDepositBank(""); setTransactionId(""); setNarration(""); setIsGoldClosure(false);
     setPhone(""); setAadhaar(""); setAadhaarEditable(true);
     setAutoFilledFields(new Set()); setLookupStatus(""); setCustomerMatches([]);
     setCustomerCenters([]); setMemberArrearOverride(0); setMemberAlreadyCollected(0);
@@ -986,6 +1042,55 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
             </div>
           )}
         </div>
+
+        {/* Payment-mode specific collection tracking */}
+        {paymentMode === "Cash" && !isPtpFuture && (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4 p-3 bg-green-50 rounded-lg border border-green-200">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Field Staff (Collector) *</label>
+              <select value={collectorStaffId} onChange={e => setCollectorStaffId(e.target.value)}
+                className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-green-500 bg-white">
+                <option value="">Select staff who collected the cash</option>
+                {appUsers.map(u => <option key={u.id} value={u.id}>{u.name || u.id}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Bank (Deposited Into) *</label>
+              <select value={depositBank} onChange={e => setDepositBank(e.target.value)}
+                className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-green-500 bg-white">
+                <option value="">Select deposit bank</option>
+                {INDIAN_BANKS.map(b => <option key={b} value={b}>{b}</option>)}
+              </select>
+            </div>
+          </div>
+        )}
+        {paymentMode === "UPI" && (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4 p-3 bg-blue-50 rounded-lg border border-blue-200">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Transaction ID *</label>
+              <input type="text" value={transactionId} onChange={e => setTransactionId(e.target.value)}
+                className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 bg-white" placeholder="e.g. 412345678901" />
+              <p className="text-[11px] text-gray-500 mt-1">Bank/UPI transaction ID for reconciliation</p>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Narration</label>
+              <input type="text" value={narration} onChange={e => setNarration(e.target.value)}
+                className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 bg-white" placeholder="As shown in the bank / UPI statement" />
+            </div>
+          </div>
+        )}
+
+        {/* Gold Loan Closure toggle — tag this entry for gold-recovery reporting */}
+        <div className="mb-4 flex items-center gap-2 p-2 bg-amber-50 rounded-lg border border-amber-200">
+          <input type="checkbox" id="gold-closure-group" checked={isGoldClosure}
+            onChange={e => setIsGoldClosure(e.target.checked)}
+            className="h-4 w-4 text-amber-600 rounded focus:ring-amber-500" />
+          <label htmlFor="gold-closure-group" className="text-sm text-gray-700 cursor-pointer select-none">
+            <span className="font-medium">Recovery through Gold Loan Closure</span>
+            <span className="text-xs text-gray-500 ml-2">(Tags this entry as a "Gold" collection for reporting)</span>
+          </label>
+        </div>
+
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Customer Share</label>
@@ -1074,6 +1179,15 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
   const [waiverInput, setWaiverInput] = useState("");
   const [showWaiverModal, setShowWaiverModal] = useState(false);
   const [pendingEntry, setPendingEntry] = useState(null);
+  // Payment-mode specific tracking (same pattern as Group OD form).
+  const [collectorStaffId, setCollectorStaffId] = useState("");
+  const [depositBank, setDepositBank] = useState("");
+  const [transactionId, setTransactionId] = useState("");
+  const [narration, setNarration] = useState("");
+  // Flag: this recovery came from the customer closing their Gold Loan with us.
+  // Stored as `collectionSource: "Gold"` on the entry for reporting/filtering.
+  const [isGoldClosure, setIsGoldClosure] = useState(false);
+  const appUsers = loadData(STORAGE_KEYS.users, []);
   // Customer lookup
   const [phone, setPhone] = useState("");
   const [aadhaar, setAadhaar] = useState("");
@@ -1216,6 +1330,9 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
     if (!isPtpFuture && paid < 0) { alert("Paid Amount cannot be negative."); return; }
     if (!paymentMode) { alert("Please select a Payment Mode."); return; }
     if (paymentMode === "UPI" && !upiReference.trim()) { alert("Please enter UPI Transaction Reference."); return; }
+    if (paymentMode === "UPI" && !transactionId.trim()) { alert("Please enter the Transaction ID."); return; }
+    if (paymentMode === "Cash" && !isPtpFuture && !collectorStaffId) { alert("Please select the Field Staff who collected the cash."); return; }
+    if (paymentMode === "Cash" && !isPtpFuture && !depositBank) { alert("Please select the Bank where the cash was deposited."); return; }
     if (paymentMode === "Cash" && ptpDate && !isValidDate(ptpDate)) { alert("Please enter a valid PTP date."); return; }
     if (paymentMode === "Cash" && ptpDate && !ptpTime) { alert("Please enter PTP time."); return; }
     if (!isPtpFuture && waiver > 0 && !approvalEmailSubject.trim()) { alert("Waiver detected. Please enter the approval email subject line."); return; }
@@ -1227,6 +1344,10 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
       e.loanAccountNo === loanAccountNo.trim() && e.date === date && e.branch === branch && e.odType === "Individual OD"
     );
     if (isDup && !confirm("A similar entry already exists for this customer today. Save anyway?")) return;
+
+    // Resolve the selected field staff's display name from the app user list.
+    const selectedStaff = appUsers.find(u => u.id === collectorStaffId);
+    const collectorStaffName = selectedStaff ? (selectedStaff.name || selectedStaff.id) : "";
 
     const entry = {
       id: generateId(), date, time: nowTime(), branch,
@@ -1241,6 +1362,13 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
       totalPaidAmount: isPtpFuture ? 0 : paid,
       paymentMode,
       upiReference: paymentMode === "UPI" ? upiReference.trim() : "",
+      collectorStaffId: paymentMode === "Cash" ? collectorStaffId : "",
+      collectorStaffName: paymentMode === "Cash" ? collectorStaffName : "",
+      depositBank:       paymentMode === "Cash" ? depositBank       : "",
+      transactionId:     paymentMode === "UPI"  ? transactionId.trim()  : "",
+      narration:         paymentMode === "UPI"  ? narration.trim()      : "",
+      // Optional tag: "Gold" means this recovery came from closing a Gold loan.
+      collectionSource:  isGoldClosure ? "Gold" : "",
       ptpDate: paymentMode === "Cash" ? ptpDate : "",
       ptpTime: paymentMode === "Cash" ? ptpTime : "",
       ptpStatus: isPtpFuture ? "pending" : "na",
@@ -1294,6 +1422,7 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
     setCustomerName(""); setCustomerId(""); setLoanAccountNo("");
     setAmountDue(""); setPaidAmount(""); setWaiverInput(""); setApprovalEmailSubject("");
     setPaymentMode(""); setUpiReference(""); setPtpDate(""); setPtpTime("");
+    setCollectorStaffId(""); setDepositBank(""); setTransactionId(""); setNarration(""); setIsGoldClosure(false);
     setSmaBucket(""); setPhone(""); setAadhaar(""); setAadhaarEditable(true);
     setAutoFilledFields(new Set()); setLookupStatus(""); setCustomerMatches([]);
     setIndivCenters([]);
@@ -1596,6 +1725,55 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
               className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500" placeholder="e.g. UPI_TRANS_12345" />
           </div>
         )}
+
+        {/* Payment-mode specific collection tracking */}
+        {paymentMode === "Cash" && !isPtpFuture && (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4 p-3 bg-green-50 rounded-lg border border-green-200">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Field Staff (Collector) *</label>
+              <select value={collectorStaffId} onChange={e => setCollectorStaffId(e.target.value)}
+                className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-green-500 bg-white">
+                <option value="">Select staff who collected the cash</option>
+                {appUsers.map(u => <option key={u.id} value={u.id}>{u.name || u.id}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Bank (Deposited Into) *</label>
+              <select value={depositBank} onChange={e => setDepositBank(e.target.value)}
+                className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-green-500 bg-white">
+                <option value="">Select deposit bank</option>
+                {INDIAN_BANKS.map(b => <option key={b} value={b}>{b}</option>)}
+              </select>
+            </div>
+          </div>
+        )}
+        {paymentMode === "UPI" && (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4 p-3 bg-blue-50 rounded-lg border border-blue-200">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Transaction ID *</label>
+              <input type="text" value={transactionId} onChange={e => setTransactionId(e.target.value)}
+                className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 bg-white" placeholder="e.g. 412345678901" />
+              <p className="text-[11px] text-gray-500 mt-1">Bank/UPI transaction ID for reconciliation</p>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Narration</label>
+              <input type="text" value={narration} onChange={e => setNarration(e.target.value)}
+                className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 bg-white" placeholder="As shown in the bank / UPI statement" />
+            </div>
+          </div>
+        )}
+
+        {/* Gold Loan Closure toggle — tag this entry for gold-recovery reporting */}
+        <div className="mb-4 flex items-center gap-2 p-2 bg-amber-50 rounded-lg border border-amber-200">
+          <input type="checkbox" id="gold-closure-indiv" checked={isGoldClosure}
+            onChange={e => setIsGoldClosure(e.target.checked)}
+            className="h-4 w-4 text-amber-600 rounded focus:ring-amber-500" />
+          <label htmlFor="gold-closure-indiv" className="text-sm text-gray-700 cursor-pointer select-none">
+            <span className="font-medium">Recovery through Gold Loan Closure</span>
+            <span className="text-xs text-gray-500 ml-2">(Tags this entry as a "Gold" collection for reporting)</span>
+          </label>
+        </div>
+
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Paid Amount {isPtpFuture ? "" : "*"}</label>
@@ -1980,6 +2158,20 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
                   { key: "branch", label: "Branch", align: "left" },
                   { key: "customer", label: "Customer", align: "left" },
                   { key: "groupod", label: "Group OD", align: "right" },
+                ].map(col => (
+                  <th key={col.key} className={`text-${col.align} px-4 py-3 font-semibold text-gray-600 cursor-pointer hover:text-teal-700 select-none`}
+                    onClick={() => { if (sortField === col.key) setSortDir(sortDir === "desc" ? "asc" : "desc"); else { setSortField(col.key); setSortDir("desc"); } }}>
+                    {col.label} {sortField === col.key ? (sortDir === "desc" ? "↓" : "↑") : ""}
+                  </th>
+                ))}
+                {/* Group OD-only columns: Group Size and Customer Share */}
+                {odTypeFilter !== "Individual OD" && (
+                  <>
+                    <th className="text-right px-4 py-3 font-semibold text-gray-600">Group Size</th>
+                    <th className="text-right px-4 py-3 font-semibold text-gray-600">Customer Share</th>
+                  </>
+                )}
+                {[
                   { key: "paid", label: "Paid", align: "right" },
                   { key: "waiver", label: "Waiver", align: "right" },
                 ].map(col => (
@@ -1989,6 +2181,13 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
                   </th>
                 ))}
                 <th className="text-left px-4 py-3 font-semibold text-gray-600">Mode</th>
+                {/* Group OD-only: PTP Date + Approver */}
+                {odTypeFilter !== "Individual OD" && (
+                  <>
+                    <th className="text-left px-4 py-3 font-semibold text-gray-600">PTP Date</th>
+                    <th className="text-left px-4 py-3 font-semibold text-gray-600">Approver</th>
+                  </>
+                )}
                 <th className="text-left px-4 py-3 font-semibold text-gray-600 cursor-pointer hover:text-teal-700 select-none"
                   onClick={() => { if (sortField === "staff") setSortDir(sortDir === "desc" ? "asc" : "desc"); else { setSortField("staff"); setSortDir("asc"); } }}>
                   Staff {sortField === "staff" ? (sortDir === "desc" ? "↓" : "↑") : ""}
@@ -1998,7 +2197,7 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
             </thead>
             <tbody>
               {visibleEntries.length === 0 ? (
-                <tr><td colSpan={9} className="text-center py-12 text-gray-400">No records found</td></tr>
+                <tr><td colSpan={odTypeFilter === "Individual OD" ? 9 : 13} className="text-center py-12 text-gray-400">No records found</td></tr>
               ) : visibleEntries.map(e => {
                 const paid = getPaid(e);
                 return (
@@ -2014,6 +2213,13 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
                       <div className="text-xs text-gray-400">{e.customerId} | {e.loanAccountNo}</div>
                     </td>
                     <td className="px-4 py-3 text-right font-medium">{formatINR(e.groupOdAmount)}</td>
+                    {/* Group OD-only: Group Size and Customer Share */}
+                    {odTypeFilter !== "Individual OD" && (
+                      <>
+                        <td className="px-4 py-3 text-right">{e.numberOfCustomers || "—"}</td>
+                        <td className="px-4 py-3 text-right">{formatINR(e.customerShare || (e.numberOfCustomers > 0 ? Math.round((e.groupOdAmount || 0) / e.numberOfCustomers) : 0))}</td>
+                      </>
+                    )}
                     <td className="px-4 py-3 text-right font-medium text-teal-700">
                       {e.ptpStatus === "pending" ? (
                         <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-orange-100 text-orange-700 rounded-full text-xs font-medium">
@@ -2040,9 +2246,36 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
                         (e.ptpPaymentMode || e.paymentMode) === "Cash" ? "bg-green-100 text-green-700" :
                         "bg-gray-100 text-gray-500"
                       }`}>{e.ptpPaymentMode || e.paymentMode || "—"}</span>
+                      {e.upiReference && (
+                        <div className="text-[10px] text-gray-400 mt-0.5 truncate max-w-[140px]" title={e.upiReference}>{e.upiReference}</div>
+                      )}
                     </td>
+                    {/* Group OD-only: PTP Date and Approver columns */}
+                    {odTypeFilter !== "Individual OD" && (
+                      <>
+                        <td className="px-4 py-3 text-left text-xs">
+                          {e.ptpDate ? (
+                            <div>
+                              <div className="text-gray-700">{formatDateDMY(e.ptpDate)}</div>
+                              {e.ptpTime && <div className="text-gray-400">{e.ptpTime}</div>}
+                            </div>
+                          ) : <span className="text-gray-300">—</span>}
+                        </td>
+                        <td className="px-4 py-3 text-left text-xs">
+                          {e.waiverApproval ? (
+                            <div>
+                              <div className="font-medium text-gray-700">{e.waiverApproval.approverName || "—"}</div>
+                              {e.waiverApproval.approvalDate && <div className="text-gray-400">{formatDateDMY(e.waiverApproval.approvalDate)}</div>}
+                            </div>
+                          ) : <span className="text-gray-300">—</span>}
+                        </td>
+                      </>
+                    )}
                     <td className="px-4 py-3">
                       <div className="text-sm font-medium text-gray-700">{e.enteredByName || e.enteredBy || "—"}</div>
+                      {e.collectionSource === "Gold" && (
+                        <span className="inline-block mt-0.5 text-[10px] font-bold text-amber-700 bg-amber-100 px-1.5 py-0.5 rounded">🔶 GOLD</span>
+                      )}
                     </td>
                     <td className="px-4 py-3 text-center">
                       <div className="flex items-center justify-center gap-2">
@@ -2063,7 +2296,7 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
                   </tr>
                   {expandedId === e.id && (
                     <tr className="bg-gray-50">
-                      <td colSpan={9} className="px-6 py-4 space-y-3">
+                      <td colSpan={odTypeFilter === "Individual OD" ? 9 : 13} className="px-6 py-4 space-y-3">
                         {/* OD pool/accrued live view */}
                         <CustomerInfoPanel loanAccountNo={e.loanAccountNo} customerId={e.customerId} />
                         {/* OD breakdown — Group or Individual */}
@@ -2590,7 +2823,8 @@ function Dashboard({ user, entries, branches, config }) {
       </div>
       <div className="mb-4"><DateRangeFilter dateFrom={dateFrom} dateTo={dateTo} setDateFrom={setDateFrom} setDateTo={setDateTo} /></div>
 
-      {/* KPI Cards — clickable */}
+      {/* KPI Cards — clickable. Data source: form entries (same as the
+          "Group OD Details" drill-down panel). */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
         <div className="bg-white rounded-xl border p-4 cursor-pointer hover:shadow-md transition-shadow" onClick={() => setDrillPanel("entries")}>
           <p className="text-xs text-gray-500 mb-1">Total Entries</p>

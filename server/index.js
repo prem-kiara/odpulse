@@ -2088,6 +2088,162 @@ app.get("/api/pool/center", (req, res) => {
   }
 });
 
+// GET /api/customers/loans?customerId=|loanAccountNo=|phone=|aadhaar=
+// Returns ALL ACTIVE loans for a single customer, each with a full OD breakdown
+// from the latest pool + accrued snapshots. Skips loans whose loan_status is
+// Closed / Written Off / Settled.
+app.get("/api/customers/loans", (req, res) => {
+  try {
+    const { customerId, loanAccountNo, phone, aadhaar } = req.query;
+    // Step 1 — resolve the customer_number(s) from any identifier.
+    let customerNumbers = [];
+    if (customerId) {
+      customerNumbers = [String(customerId).trim()];
+    } else if (loanAccountNo) {
+      const row = db.prepare("SELECT customer_number FROM customers WHERE loan_account_no = ?")
+        .get(String(loanAccountNo).trim());
+      if (row?.customer_number) customerNumbers = [row.customer_number];
+    } else if (phone) {
+      const key = String(phone).replace(/\D/g, "");
+      const rows = db.prepare(
+        "SELECT DISTINCT customer_number FROM customers WHERE REPLACE(REPLACE(REPLACE(mobile_number,' ',''),'-',''),'+','') LIKE ?"
+      ).all("%" + key + "%");
+      customerNumbers = rows.map(r => r.customer_number).filter(Boolean);
+    } else if (aadhaar) {
+      const key = String(aadhaar).replace(/\D/g, "");
+      const rows = db.prepare(
+        "SELECT DISTINCT customer_number FROM customers WHERE REPLACE(REPLACE(aadhaar_number,' ',''),'-','') = ?"
+      ).all(key);
+      customerNumbers = rows.map(r => r.customer_number).filter(Boolean);
+    }
+    if (customerNumbers.length === 0) {
+      return res.json({ found: false, customer: null, loans: [] });
+    }
+
+    // Step 2 — fetch all loans for these customer_numbers, join with latest
+    // pool_snapshots + accrued_snapshots for live OD values.
+    const latestPool = db.prepare("SELECT MAX(snapshot_date) AS d FROM pool_snapshots").get()?.d;
+    const latestAccrued = db.prepare("SELECT MAX(snapshot_date) AS d FROM accrued_snapshots").get()?.d;
+    const placeholders = customerNumbers.map(() => "?").join(",");
+    const rows = db.prepare(`
+      SELECT
+        c.loan_account_no, c.customer_number, c.customer_name, c.branch,
+        c.center_name, c.group_name, c.mobile_number, c.aadhaar_number,
+        c.product_name, c.product_interest_rate, c.loan_amount,
+        c.disbursement_date, c.last_installment_date, c.last_payment_date,
+        p.principal_outstanding, p.interest_outstanding,
+        p.principal_overdue, p.interest_overdue, p.current_od,
+        p.overdue_days, p.customer_dpd, p.loan_status, p.account_dpd_classification,
+        a.accrued_interest
+      FROM customers c
+      LEFT JOIN pool_snapshots p
+        ON p.loan_account_no = c.loan_account_no AND p.snapshot_date = ?
+      LEFT JOIN accrued_snapshots a
+        ON a.loan_account_no = c.loan_account_no AND a.snapshot_date = ?
+      WHERE c.customer_number IN (${placeholders})
+    `).all(latestPool || "", latestAccrued || "", ...customerNumbers);
+
+    const INACTIVE_STATUSES = new Set(["Closed", "Written Off", "Settled", "CLOSED", "WRITTEN OFF", "SETTLED"]);
+    const loans = rows
+      .filter(r => !INACTIVE_STATUSES.has((r.loan_status || "").trim()))
+      .map(r => {
+        const po = Number(r.principal_outstanding) || 0;
+        const ai = Number(r.accrued_interest) || 0;
+        const ui = Number(r.interest_overdue) || 0;
+        return {
+          loanAccountNo: r.loan_account_no || "",
+          customerNumber: r.customer_number || "",
+          customerName: r.customer_name || "",
+          branch: r.branch || "",
+          centerName: r.center_name || "",
+          groupName: r.group_name || "",
+          productName: r.product_name || "",
+          interestRate: Number(r.product_interest_rate) || 0,
+          loanAmount: Number(r.loan_amount) || 0,
+          disbursementDate: r.disbursement_date || "",
+          lastPaymentDate: r.last_payment_date || "",
+          principalOutstanding: po,
+          interestOutstanding: Number(r.interest_outstanding) || 0,
+          principalOverdue: Number(r.principal_overdue) || 0,
+          interestOverdue: ui,
+          currentOD: Number(r.current_od) || 0,
+          overdueDays: Number(r.overdue_days) || 0,
+          customerDPD: Number(r.customer_dpd) || 0,
+          loanStatus: r.loan_status || "",
+          dpdClassification: r.account_dpd_classification || "",
+          accruedInterest: ai,
+          foreclosureValue: po + ui + ai,
+        };
+      })
+      // Sort: highest overdue first, then highest outstanding.
+      .sort((a, b) => (b.currentOD - a.currentOD) || (b.principalOutstanding - a.principalOutstanding));
+
+    // Customer metadata (use the first row as representative).
+    const first = rows[0] || {};
+    const customer = first.customer_number ? {
+      name: first.customer_name || "",
+      customerNumber: first.customer_number || "",
+      phone: first.mobile_number || "",
+      aadhaar: first.aadhaar_number || "",
+      branch: first.branch || "",
+    } : null;
+
+    res.json({
+      found: loans.length > 0,
+      customer,
+      loans,
+      snapshotDate: latestPool || null,
+      accruedDate: latestAccrued || null,
+    });
+  } catch (e) {
+    console.error("[customers/loans]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/od/portfolio-totals?branch=
+// Returns the total OD (principal_overdue + interest_overdue) from the LATEST
+// pool snapshot, split by loan type:
+//   - "group"      → customers whose group_name or center_name is populated
+//   - "individual" → everyone else
+// Used by the dashboard KPI cards ("Group OD Amount" / "Individual OD Amount").
+app.get("/api/od/portfolio-totals", (req, res) => {
+  try {
+    const branch = String(req.query.branch || "").trim();
+    const latest = db.prepare("SELECT MAX(snapshot_date) AS d FROM pool_snapshots").get()?.d;
+    if (!latest) {
+      return res.json({ snapshotDate: null, groupOdAmount: 0, individualOdAmount: 0, groupAccounts: 0, individualAccounts: 0 });
+    }
+    let sql = `
+      SELECT
+        CASE
+          WHEN (c.group_name IS NOT NULL AND c.group_name <> '')
+            OR (c.center_name IS NOT NULL AND c.center_name <> '') THEN 'group'
+          ELSE 'individual'
+        END AS type,
+        SUM(COALESCE(p.principal_overdue, 0) + COALESCE(p.interest_overdue, 0)) AS amount,
+        COUNT(*) AS accounts
+      FROM pool_snapshots p
+      LEFT JOIN customers c ON c.loan_account_no = p.loan_account_no
+      WHERE p.snapshot_date = ?
+        AND (COALESCE(p.principal_overdue, 0) + COALESCE(p.interest_overdue, 0)) > 0
+    `;
+    const params = [latest];
+    if (branch) { sql += " AND p.branch = ?"; params.push(branch); }
+    sql += " GROUP BY type";
+    const rows = db.prepare(sql).all(...params);
+    const result = { snapshotDate: latest, groupOdAmount: 0, individualOdAmount: 0, groupAccounts: 0, individualAccounts: 0 };
+    for (const r of rows) {
+      if (r.type === "group") { result.groupOdAmount = r.amount || 0; result.groupAccounts = r.accounts || 0; }
+      else                    { result.individualOdAmount = r.amount || 0; result.individualAccounts = r.accounts || 0; }
+    }
+    res.json(result);
+  } catch (e) {
+    console.error("[od/portfolio-totals]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // GET /api/pool/search?name=XXXX
 app.get("/api/pool/search", (req, res) => {
   try {
