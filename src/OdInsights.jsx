@@ -428,6 +428,12 @@ const REPORT_KINDS = [
     hint: "Pipe-delimited. Per-account demand vs collected. Period dates are auto-detected from the file's PRINCIPAL OUTSTANDING (DD-MM-YYYY) columns on file selection.",
     accent: "amber", needsSnapshot: false, needsPeriod: true,
   },
+  {
+    key: "foreclosure", slug: "foreclosure",
+    title: "Foreclosure Report",
+    hint: "Pipe-delimited. Closed / foreclosed / matured loan accounts. Feeds the customer master so closed-loan customers appear in Group OD Entry autofill alongside active customers.",
+    accent: "violet", needsSnapshot: true,
+  },
 ];
 
 // Parse the Client-Wise CSV header client-side to auto-fill the period window.
@@ -644,6 +650,7 @@ export function DataUploadPage({ user, canUpload }) {
     red:     { icon: "text-red-600", ring: "focus:ring-red-500", fileBg: "file:bg-red-50 file:text-red-700", btn: "bg-red-600 hover:bg-red-700" },
     emerald: { icon: "text-emerald-600", ring: "focus:ring-emerald-500", fileBg: "file:bg-emerald-50 file:text-emerald-700", btn: "bg-emerald-600 hover:bg-emerald-700" },
     amber:   { icon: "text-amber-600", ring: "focus:ring-amber-500", fileBg: "file:bg-amber-50 file:text-amber-700", btn: "bg-amber-600 hover:bg-amber-700" },
+    violet:  { icon: "text-violet-600", ring: "focus:ring-violet-500", fileBg: "file:bg-violet-50 file:text-violet-700", btn: "bg-violet-600 hover:bg-violet-700" },
   }[accent] || { icon: "text-gray-600", ring: "focus:ring-gray-500", fileBg: "file:bg-gray-50 file:text-gray-700", btn: "bg-gray-600 hover:bg-gray-700" });
 
   const totalCollectionsRupees = history.totalCollections?.total || 0;
@@ -653,7 +660,7 @@ export function DataUploadPage({ user, canUpload }) {
       <div className="mb-6">
         <h2 className="text-2xl font-bold text-gray-900">OD Data Upload</h2>
         <p className="text-sm text-gray-500 mt-1">
-          Upload any of the five Finflux extracts. Snapshot-based reports are de-duplicated per date; the Collection ledger is idempotent per receipt. Retention: {history.retentionDays || 90} days.
+          Upload any of the six Finflux extracts. Snapshot-based reports are de-duplicated per date; the Collection ledger is idempotent per receipt. Retention: {history.retentionDays || 90} days.
         </p>
       </div>
 

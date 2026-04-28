@@ -94,6 +94,46 @@ CREATE TABLE IF NOT EXISTS accrued_snapshots (
 CREATE INDEX IF NOT EXISTS idx_accrued_snap_loan ON accrued_snapshots(loan_account_no);
 CREATE INDEX IF NOT EXISTS idx_accrued_snap_date ON accrued_snapshots(snapshot_date);
 
+-- ─── Foreclosure / closed-loan report ─────────────────────────────────────
+-- Per-snapshot view of CLOSED accounts (foreclosed, pre-closed, matured, etc.).
+-- Pool Report only carries active loans, so closed customers don't show up in
+-- the Group OD Entry autofill. Ingesting the Foreclosure Report into both this
+-- table AND the customers master makes closed-loan customers seamlessly
+-- discoverable via the existing /api/customers/lookup endpoint.
+CREATE TABLE IF NOT EXISTS foreclosure_snapshots (
+  snapshot_date TEXT NOT NULL,
+  loan_account_no TEXT NOT NULL,
+  branch_name TEXT,
+  branch_code TEXT,
+  center TEXT,
+  customer_number TEXT,
+  customer_name TEXT,
+  product_name TEXT,
+  loan_amount REAL,
+  cycle_number INTEGER,
+  disbursement_date TEXT,
+  maturity_date TEXT,
+  closed_date TEXT,
+  closure_reason TEXT,
+  closure_type TEXT,
+  interest_collected REAL,
+  total_interest_collected REAL,
+  closing_principal REAL,
+  penalty_collected REAL,
+  funder TEXT,
+  funding_source TEXT,
+  user_name TEXT,
+  employee_name TEXT,
+  employee_number TEXT,
+  remarks TEXT,
+  PRIMARY KEY (snapshot_date, loan_account_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fc_loan ON foreclosure_snapshots(loan_account_no);
+CREATE INDEX IF NOT EXISTS idx_fc_date ON foreclosure_snapshots(snapshot_date);
+CREATE INDEX IF NOT EXISTS idx_fc_branch ON foreclosure_snapshots(branch_name);
+CREATE INDEX IF NOT EXISTS idx_fc_customer ON foreclosure_snapshots(customer_number);
+
 CREATE TABLE IF NOT EXISTS upload_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   kind TEXT NOT NULL,

@@ -8,7 +8,7 @@ const multer = require("multer");
 const iconv = require("iconv-lite");
 
 const db = require("./db");
-const { ingestPool, ingestAccrued, ingestOverdue, ingestCollections, ingestClientPeriod, purgeOldSnapshots, rollupMonthlySnapshots } = require("./ingest");
+const { ingestPool, ingestAccrued, ingestOverdue, ingestCollections, ingestClientPeriod, ingestForeclosure, purgeOldSnapshots, rollupMonthlySnapshots } = require("./ingest");
 
 const app = express();
 const PORT = 3001;
@@ -412,6 +412,36 @@ app.post("/api/od/pool/upload", requireUploader, uploadField("file"), (req, res)
     res.json({ ok: true, snapshotDate, ...result });
   } catch (err) {
     console.error("[POOL UPLOAD] error:", err);
+    if (!res.headersSent) {
+      const code = err.statusCode || 500;
+      res.status(code).json({ error: err.message || String(err) });
+    }
+  } finally {
+    cleanupTmp(tmpPath);
+  }
+});
+
+// POST /api/od/foreclosure/upload — ingest Foreclosure / closed-loan report (pipe-delimited)
+// Mirrors /api/od/pool/upload. Writes to foreclosure_snapshots AND upserts the
+// customer master so closed-loan customers show up in /api/customers/lookup.
+app.post("/api/od/foreclosure/upload", requireUploader, uploadField("file"), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: "No file uploaded" });
+  const tmpPath = req.file.path;
+  const t0 = Date.now();
+  try {
+    const dateCheck = validateSnapshotDate(req.body.snapshotDate);
+    if (!dateCheck.ok) return res.status(400).json({ error: dateCheck.error });
+    const snapshotDate = dateCheck.value;
+    const uploadedBy = req.header("x-od-user") || "unknown";
+    console.log(`[FORECLOSURE UPLOAD] ${req.file.originalname} (${(req.file.size/1024/1024).toFixed(2)}MB) for ${snapshotDate}`);
+    const text = readUploadAsUtf8(tmpPath);
+    const result = ingestForeclosure(text, {
+      snapshotDate, branchesFile: BRANCHES_FILE, uploadedBy, filename: req.file.originalname,
+    });
+    console.log(`[FORECLOSURE UPLOAD] done in ${Date.now()-t0}ms — ${result.rowCount} rows, ${result.newBranches} new branches`);
+    res.json({ ok: true, snapshotDate, ...result });
+  } catch (err) {
+    console.error("[FORECLOSURE UPLOAD] error:", err);
     if (!res.headersSent) {
       const code = err.statusCode || 500;
       res.status(code).json({ error: err.message || String(err) });
