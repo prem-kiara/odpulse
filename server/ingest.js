@@ -280,6 +280,229 @@ function ingestPool(fileContent, opts) {
   return { rowCount, newBranches };
 }
 
+// ── Foreclosure report ingestion ──────────────────────────────────────────
+// File: ForeclosureReport_<DDMMYYYY_HHMMSS>.csv
+// Format: pipe-delimited, 24 columns. Numeric IDs (BRANCH CODE, CUSTOMER NUMBER,
+// ACCOUNT NUMBER, EMPLOYEE NUMBER) are wrapped in single quotes:
+//   '30'|'9867551156'|'8800223323'  → strip the leading/trailing single quote.
+//
+// Why this also writes to the `customers` table:
+//   The Group OD Entry autofill queries `customers` (via /api/customers/lookup).
+//   Pool ingest already populates `customers`, so to make CLOSED-loan customers
+//   discoverable in autofill without touching any frontend / autofill code,
+//   we upsert closed accounts into the same `customers` table here. The
+//   existing /api/customers/lookup endpoint then finds them automatically.
+const FORECLOSURE_REQUIRED_COLS = [
+  "BRANCH NAME",
+  "CUSTOMER NUMBER",
+  "ACCOUNT NUMBER",
+  "CLOSED DATE",
+];
+
+// Strip wrapping single quotes (e.g. "'9867551156'") OR double quotes,
+// then trim whitespace. Foreclosure-specific helper because pool's str()
+// only handles double quotes.
+const fcStr = (v) => {
+  if (v == null) return "";
+  let s = String(v).trim();
+  if (s.length >= 2) {
+    const a = s.charAt(0);
+    const b = s.charAt(s.length - 1);
+    if ((a === "'" && b === "'") || (a === '"' && b === '"')) {
+      s = s.slice(1, -1).trim();
+    }
+  }
+  return s;
+};
+
+const fcNum = (v) => {
+  if (v == null || v === "") return 0;
+  const s = String(v).replace(/['"]/g, "").trim();
+  if (!s) return 0;
+  const n = Number(s.replace(/,/g, ""));
+  return Number.isFinite(n) ? n : 0;
+};
+
+function ingestForeclosure(fileContent, opts) {
+  const { snapshotDate, branchesFile, uploadedBy, filename } = opts;
+
+  let rows;
+  try {
+    rows = parse(fileContent, {
+      delimiter: "|",
+      quote: '"',
+      columns: true,
+      relax_quotes: true,
+      relax_column_count: true,
+      skip_empty_lines: true,
+      trim: true,
+      bom: true,
+    });
+  } catch (err) {
+    const e = new Error(`Could not parse foreclosure report CSV: ${err.message}`);
+    e.statusCode = 400;
+    throw e;
+  }
+
+  if (rows.length === 0) {
+    const e = new Error("Foreclosure report contains no data rows.");
+    e.statusCode = 400;
+    throw e;
+  }
+
+  const missing = missingColumns(rows[0], FORECLOSURE_REQUIRED_COLS);
+  if (missing.length) {
+    const e = new Error(
+      `Foreclosure report is missing required columns: ${missing.join(", ")}. ` +
+      `Got: ${Object.keys(rows[0]).join(", ")}`
+    );
+    e.statusCode = 400;
+    throw e;
+  }
+
+  const existingBranches = readBranches(branchesFile);
+  const branchRegistry = new Set(existingBranches.map(b => String(b).toLowerCase()));
+  const pendingBranches = [];
+
+  // Same upsert pattern as ingestPool — keeps `customers` as the single
+  // source of truth for autofill across active + closed loans.
+  const upsertCustomer = db.prepare(`
+    INSERT INTO customers (loan_account_no, customer_number, customer_name, branch,
+      center_name, product_name, loan_amount, disbursement_date, last_installment_date,
+      officer_name, officer_code, updated_at)
+    VALUES (@loan_account_no, @customer_number, @customer_name, @branch,
+      @center_name, @product_name, @loan_amount, @disbursement_date, @last_installment_date,
+      @officer_name, @officer_code, @updated_at)
+    ON CONFLICT(loan_account_no) DO UPDATE SET
+      customer_number=excluded.customer_number,
+      customer_name=excluded.customer_name,
+      branch=excluded.branch,
+      center_name=excluded.center_name,
+      product_name=excluded.product_name,
+      loan_amount=excluded.loan_amount,
+      disbursement_date=excluded.disbursement_date,
+      last_installment_date=excluded.last_installment_date,
+      officer_name=excluded.officer_name,
+      officer_code=excluded.officer_code,
+      updated_at=excluded.updated_at
+  `);
+
+  const upsertSnap = db.prepare(`
+    INSERT INTO foreclosure_snapshots
+      (snapshot_date, loan_account_no, branch_name, branch_code, center,
+       customer_number, customer_name, product_name, loan_amount, cycle_number,
+       disbursement_date, maturity_date, closed_date, closure_reason, closure_type,
+       interest_collected, total_interest_collected, closing_principal, penalty_collected,
+       funder, funding_source, user_name, employee_name, employee_number, remarks)
+    VALUES
+      (@snapshot_date, @loan_account_no, @branch_name, @branch_code, @center,
+       @customer_number, @customer_name, @product_name, @loan_amount, @cycle_number,
+       @disbursement_date, @maturity_date, @closed_date, @closure_reason, @closure_type,
+       @interest_collected, @total_interest_collected, @closing_principal, @penalty_collected,
+       @funder, @funding_source, @user_name, @employee_name, @employee_number, @remarks)
+    ON CONFLICT(snapshot_date, loan_account_no) DO UPDATE SET
+      branch_name=excluded.branch_name, branch_code=excluded.branch_code, center=excluded.center,
+      customer_number=excluded.customer_number, customer_name=excluded.customer_name,
+      product_name=excluded.product_name, loan_amount=excluded.loan_amount, cycle_number=excluded.cycle_number,
+      disbursement_date=excluded.disbursement_date, maturity_date=excluded.maturity_date,
+      closed_date=excluded.closed_date, closure_reason=excluded.closure_reason, closure_type=excluded.closure_type,
+      interest_collected=excluded.interest_collected, total_interest_collected=excluded.total_interest_collected,
+      closing_principal=excluded.closing_principal, penalty_collected=excluded.penalty_collected,
+      funder=excluded.funder, funding_source=excluded.funding_source, user_name=excluded.user_name,
+      employee_name=excluded.employee_name, employee_number=excluded.employee_number, remarks=excluded.remarks
+  `);
+
+  const now = new Date().toISOString();
+
+  const txn = db.transaction((rs) => {
+    let count = 0;
+    for (const r of rs) {
+      const loan = fcStr(r["ACCOUNT NUMBER"]);
+      if (!loan) continue;
+
+      const branch = fcStr(r["BRANCH NAME"]);
+      if (branch) {
+        const key = branch.toLowerCase();
+        if (!branchRegistry.has(key)) {
+          branchRegistry.add(key);
+          pendingBranches.push(branch);
+        }
+      }
+
+      // Customer master upsert — keep this minimal and only overwrite fields
+      // we actually have from the foreclosure CSV. The pool report fills the
+      // richer fields (mobile, aadhaar, address, etc.) when the same loan was
+      // ever active.
+      upsertCustomer.run({
+        loan_account_no: loan,
+        customer_number: fcStr(r["CUSTOMER NUMBER"]),
+        customer_name: fcStr(r["CUSTOMER"]),
+        branch,
+        center_name: fcStr(r["CENTER"]),
+        product_name: fcStr(r["PRODUCT NAME"]),
+        loan_amount: fcNum(r["LOAN AMOUNT"]),
+        disbursement_date: fcStr(r["DISBURSEMENT DATE"]),
+        last_installment_date: fcStr(r["MATURITY DATE"]),
+        officer_name: fcStr(r["EMPLOYEE NAME"]),
+        officer_code: fcStr(r["EMPLOYEE NUMBER"]),
+        updated_at: now,
+      });
+
+      upsertSnap.run({
+        snapshot_date: snapshotDate,
+        loan_account_no: loan,
+        branch_name: branch,
+        branch_code: fcStr(r["BRANCH CODE"]),
+        center: fcStr(r["CENTER"]),
+        customer_number: fcStr(r["CUSTOMER NUMBER"]),
+        customer_name: fcStr(r["CUSTOMER"]),
+        product_name: fcStr(r["PRODUCT NAME"]),
+        loan_amount: fcNum(r["LOAN AMOUNT"]),
+        cycle_number: Math.round(fcNum(r["CYCLE NUMBER"])),
+        disbursement_date: fcStr(r["DISBURSEMENT DATE"]),
+        maturity_date: fcStr(r["MATURITY DATE"]),
+        closed_date: fcStr(r["CLOSED DATE"]),
+        closure_reason: fcStr(r["CLOSURE REASON"]),
+        closure_type: fcStr(r["CLOSURE TYPE"]),
+        interest_collected: fcNum(r["INTEREST COLLECTED"]),
+        total_interest_collected: fcNum(r["TOTAL_INTEREST_COLLECTED"]),
+        closing_principal: fcNum(r["CLOSING PRINCIPAL"]),
+        penalty_collected: fcNum(r["PENALTY COLLECTED"]),
+        funder: fcStr(r["FUNDER"]),
+        funding_source: fcStr(r["FUNDING SOURCE"]),
+        user_name: fcStr(r["USER"]),
+        employee_name: fcStr(r["EMPLOYEE NAME"]),
+        employee_number: fcStr(r["EMPLOYEE NUMBER"]),
+        remarks: fcStr(r["REMARKS"]),
+      });
+
+      count++;
+    }
+    return count;
+  });
+
+  const rowCount = txn(rows);
+
+  let newBranches = 0;
+  if (pendingBranches.length) {
+    try {
+      const updated = existingBranches.concat(pendingBranches);
+      writeBranchesAtomic(branchesFile, updated);
+      newBranches = pendingBranches.length;
+    } catch (err) {
+      console.error("[ingest] failed to update branches.json:", err.message);
+    }
+  }
+
+  db.prepare(
+    `INSERT INTO upload_log (kind, filename, snapshot_date, row_count, new_branches, uploaded_by, uploaded_at)
+     VALUES (?,?,?,?,?,?,?)`
+  ).run("foreclosure", filename, snapshotDate, rowCount, newBranches, uploadedBy, now);
+
+  checkpoint();
+  return { rowCount, newBranches };
+}
+
 // ── Accrued report ingestion ───────────────────────────────────────────────
 // Auto-detect delimiter — some exports are comma, some pipe-delimited.
 function detectDelimiter(fileContent) {
@@ -1029,6 +1252,10 @@ function purgeOldSnapshots(retentionDays = 90) {
   const r2 = db.prepare("DELETE FROM accrued_snapshots WHERE snapshot_date < ?").run(iso);
   const r3 = db.prepare("DELETE FROM upload_log WHERE uploaded_at < ?").run(cutoff.toISOString());
   const r4 = db.prepare("DELETE FROM od_overdue WHERE snapshot_date < ?").run(iso);
+  // foreclosure_snapshots: per-snapshot closure details. Customer master record
+  // in `customers` is NOT purged here, so closed-loan customers stay searchable
+  // in autofill; we only drop the historical close-out financial details.
+  const r5 = db.prepare("DELETE FROM foreclosure_snapshots WHERE snapshot_date < ?").run(iso);
   // od_collections is an immutable ledger — keep indefinitely unless admin purges.
   // od_client_period kept — typically small, one row per account per period.
   // *_monthly_* rollup tables are NEVER purged — they hold the long-horizon view.
@@ -1036,11 +1263,12 @@ function purgeOldSnapshots(retentionDays = 90) {
   // briefly exclusive-locks the DB, so schedule it on a retention run only.
   try { db.exec("VACUUM"); }
   catch (err) { console.warn("[purge] VACUUM failed:", err.message); }
-  return { poolDeleted: r1.changes, accruedDeleted: r2.changes, logDeleted: r3.changes, overdueDeleted: r4.changes, cutoff: iso };
+  return { poolDeleted: r1.changes, accruedDeleted: r2.changes, logDeleted: r3.changes, overdueDeleted: r4.changes, foreclosureDeleted: r5.changes, cutoff: iso };
 }
 
 module.exports = {
   ingestPool, ingestAccrued, ingestOverdue, ingestCollections, ingestClientPeriod,
+  ingestForeclosure,
   purgeOldSnapshots, rollupMonthlySnapshots,
   toIsoDate, detectDelimiter,
 };
