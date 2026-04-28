@@ -1,7 +1,9 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend, LineChart, Line } from "recharts";
-import { Plus, Trash2, LogOut, Settings, Users, GitBranch, LayoutDashboard, FileText, ChevronDown, ChevronRight, ArrowLeft, Search, Eye, EyeOff, Edit2, Save, X, AlertTriangle, CheckCircle, Database, Shield, UserPlus, ChevronUp, Download, Calendar, Tag, Lock, Upload, Bell, Clock, CreditCard, TrendingUp } from "lucide-react";
+import { Plus, Trash2, LogOut, Settings, Users, GitBranch, LayoutDashboard, FileText, ChevronDown, ChevronRight, ArrowLeft, Search, Eye, EyeOff, Edit2, Save, X, AlertTriangle, CheckCircle, Database, Shield, UserPlus, ChevronUp, Download, Calendar, Tag, Lock, Upload, Bell, Clock, CreditCard, TrendingUp, Activity } from "lucide-react";
 import { CustomerInfoPanel, DataUploadPage, CollectionDashboard } from "./OdInsights.jsx";
+import ReportsAnalytics from "./ReportsAnalytics.jsx";
+import { SortableSection } from "./tableSort.jsx";
 
 // ─── Constants & Helpers ────────────────────────────────────────────────────
 const COLORS = ["#0f766e", "#06b6d4", "#8b5cf6", "#f59e0b", "#ef4444", "#10b981", "#ec4899", "#6366f1", "#14b8a6", "#f97316"];
@@ -548,7 +550,7 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
 
     // Resolve the selected field staff's display name from the app user list.
     const selectedStaff = appUsers.find(u => u.id === collectorStaffId);
-    const collectorStaffName = selectedStaff ? (selectedStaff.name || selectedStaff.id) : "";
+    const collectorStaffName = isGoldClosure ? "Gold" : (selectedStaff ? (selectedStaff.name || selectedStaff.id) : "");
 
     const entry = {
       id: generateId(), date, time: nowTime(), branch,
@@ -925,24 +927,26 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
                 <>
                   <p className="text-xs text-teal-600 mb-2 font-medium">👆 Click a member row to auto-fill their details into the form below</p>
                   <div className="overflow-x-auto rounded-lg border mb-3">
-                    <table className="w-full text-xs">
-                      <thead className="bg-gray-50">
-                        <tr>
-                          <th className="px-3 py-2 text-left font-semibold text-gray-600">#</th>
-                          <th className="px-3 py-2 text-left font-semibold text-gray-600">Member Name</th>
-                          <th className="px-3 py-2 text-left font-semibold text-gray-600">Loan No.</th>
-                          <th className="px-3 py-2 text-left font-semibold text-gray-600">Customer ID</th>
-                          <th className="px-3 py-2 text-right font-semibold text-gray-600">Arrear (Till Today)</th>
-                          <th className="px-3 py-2 text-right font-semibold text-green-600">Collected</th>
-                          <th className="px-3 py-2 text-right font-semibold text-orange-600">Remaining</th>
-                          <th className="px-3 py-2 text-center font-semibold text-gray-600">DPD</th>
-                          <th className="px-3 py-2 text-center font-semibold text-gray-600">Status</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-gray-100">
-                        {pendingMembers.map((m, i) => <MemberRow key={m.loanNumber} m={m} idx={i + 1} />)}
-                      </tbody>
-                    </table>
+                    <SortableSection initialKey="memberName" initialDir="asc" render={sort => (
+                      <table className="w-full text-xs">
+                        <thead className="bg-gray-50">
+                          <tr>
+                            <th className="px-3 py-2 text-left font-semibold text-gray-600">#</th>
+                            <th className="px-3 py-2 text-left font-semibold text-gray-600">{sort.header("memberName", "Member Name")}</th>
+                            <th className="px-3 py-2 text-left font-semibold text-gray-600">{sort.header("loanNumber", "Loan No.")}</th>
+                            <th className="px-3 py-2 text-left font-semibold text-gray-600">{sort.header("customerNumber", "Customer ID")}</th>
+                            <th className="px-3 py-2 text-right font-semibold text-gray-600">{sort.header("arrearAmountTillDate", "Arrear (Till Today)")}</th>
+                            <th className="px-3 py-2 text-right font-semibold text-green-600">{sort.header("memberCollected", "Collected")}</th>
+                            <th className="px-3 py-2 text-right font-semibold text-orange-600">{sort.header("memberRemaining", "Remaining")}</th>
+                            <th className="px-3 py-2 text-center font-semibold text-gray-600">{sort.header("effectiveDPD", "DPD")}</th>
+                            <th className="px-3 py-2 text-center font-semibold text-gray-600">{sort.header("derivedClass", "Status")}</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-gray-100">
+                          {sort.apply(pendingMembers).map((m, i) => <MemberRow key={m.loanNumber} m={m} idx={i + 1} />)}
+                        </tbody>
+                      </table>
+                    )} />
                   </div>
                 </>
               )}
@@ -950,24 +954,26 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
                 <div className="mb-3">
                   <p className="text-xs font-semibold text-green-700 uppercase tracking-wide mb-1">✓ Settled Today ({settledMembers.length})</p>
                   <div className="overflow-x-auto rounded-lg border border-green-200">
-                    <table className="w-full text-xs">
-                      <thead className="bg-green-50">
-                        <tr>
-                          <th className="px-3 py-2 text-left font-semibold text-green-700">#</th>
-                          <th className="px-3 py-2 text-left font-semibold text-green-700">Member Name</th>
-                          <th className="px-3 py-2 text-left font-semibold text-green-700">Loan No.</th>
-                          <th className="px-3 py-2 text-left font-semibold text-green-700">Customer ID</th>
-                          <th className="px-3 py-2 text-right font-semibold text-green-700">Arrear (Till Today)</th>
-                          <th className="px-3 py-2 text-right font-semibold text-green-700">Collected</th>
-                          <th className="px-3 py-2 text-right font-semibold text-green-700">Remaining</th>
-                          <th className="px-3 py-2 text-center font-semibold text-green-700">DPD</th>
-                          <th className="px-3 py-2 text-center font-semibold text-green-700">Status</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-green-100">
-                        {settledMembers.map((m, i) => <MemberRow key={m.loanNumber} m={m} idx={i + 1} />)}
-                      </tbody>
-                    </table>
+                    <SortableSection initialKey="memberName" initialDir="asc" render={sort => (
+                      <table className="w-full text-xs">
+                        <thead className="bg-green-50">
+                          <tr>
+                            <th className="px-3 py-2 text-left font-semibold text-green-700">#</th>
+                            <th className="px-3 py-2 text-left font-semibold text-green-700">{sort.header("memberName", "Member Name")}</th>
+                            <th className="px-3 py-2 text-left font-semibold text-green-700">{sort.header("loanNumber", "Loan No.")}</th>
+                            <th className="px-3 py-2 text-left font-semibold text-green-700">{sort.header("customerNumber", "Customer ID")}</th>
+                            <th className="px-3 py-2 text-right font-semibold text-green-700">{sort.header("arrearAmountTillDate", "Arrear (Till Today)")}</th>
+                            <th className="px-3 py-2 text-right font-semibold text-green-700">{sort.header("memberCollected", "Collected")}</th>
+                            <th className="px-3 py-2 text-right font-semibold text-green-700">{sort.header("memberRemaining", "Remaining")}</th>
+                            <th className="px-3 py-2 text-center font-semibold text-green-700">{sort.header("effectiveDPD", "DPD")}</th>
+                            <th className="px-3 py-2 text-center font-semibold text-green-700">{sort.header("derivedClass", "Status")}</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-green-100">
+                          {sort.apply(settledMembers).map((m, i) => <MemberRow key={m.loanNumber} m={m} idx={i + 1} />)}
+                        </tbody>
+                      </table>
+                    )} />
                   </div>
                 </div>
               )}
@@ -1048,11 +1054,17 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4 p-3 bg-green-50 rounded-lg border border-green-200">
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">Field Staff (Collector) *</label>
-              <select value={collectorStaffId} onChange={e => setCollectorStaffId(e.target.value)}
-                className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-green-500 bg-white">
-                <option value="">Select staff who collected the cash</option>
-                {appUsers.map(u => <option key={u.id} value={u.id}>{u.name || u.id}</option>)}
-              </select>
+              {isGoldClosure ? (
+                <input readOnly value="Gold"
+                  className="w-full px-3 py-2 border rounded-lg bg-amber-50 border-amber-300 text-amber-800 font-semibold cursor-default"
+                  title="Auto-set because 'Recovery through Gold Loan Closure' is checked" />
+              ) : (
+                <select value={collectorStaffId} onChange={e => setCollectorStaffId(e.target.value)}
+                  className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-green-500 bg-white">
+                  <option value="">Select staff who collected the cash</option>
+                  {appUsers.map(u => <option key={u.id} value={u.id}>{u.name || u.id}</option>)}
+                </select>
+              )}
             </div>
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">Bank (Deposited Into) *</label>
@@ -1347,7 +1359,7 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
 
     // Resolve the selected field staff's display name from the app user list.
     const selectedStaff = appUsers.find(u => u.id === collectorStaffId);
-    const collectorStaffName = selectedStaff ? (selectedStaff.name || selectedStaff.id) : "";
+    const collectorStaffName = isGoldClosure ? "Gold" : (selectedStaff ? (selectedStaff.name || selectedStaff.id) : "");
 
     const entry = {
       id: generateId(), date, time: nowTime(), branch,
@@ -1629,46 +1641,48 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
 
             {/* Member list — read-only */}
             <div className="overflow-x-auto rounded-lg border">
-              <table className="w-full text-xs">
-                <thead className="bg-gray-50">
-                  <tr>
-                    <th className="px-3 py-2 text-left font-semibold text-gray-600">#</th>
-                    <th className="px-3 py-2 text-left font-semibold text-gray-600">Member Name</th>
-                    <th className="px-3 py-2 text-left font-semibold text-gray-600">Loan No.</th>
-                    <th className="px-3 py-2 text-right font-semibold text-gray-600">Principal OD</th>
-                    <th className="px-3 py-2 text-right font-semibold text-gray-600">Arrear Till Today</th>
-                    <th className="px-3 py-2 text-center font-semibold text-gray-600">DPD</th>
-                    <th className="px-3 py-2 text-center font-semibold text-gray-600">Status</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-100">
-                  {enriched.map((m, i) => (
-                    <tr key={m.loanNumber}
-                      className={`${m.isClosed ? "opacity-40 bg-gray-50" : m.loanNumber === loanAccountNo ? "bg-indigo-50 ring-1 ring-inset ring-indigo-300" : ""}`}>
-                      <td className="px-3 py-2.5 text-gray-400">{i + 1}</td>
-                      <td className="px-3 py-2.5 font-semibold text-gray-800">
-                        {m.memberName}
-                        {m.loanNumber === loanAccountNo && <span className="ml-1 text-indigo-600 text-xs font-bold">← You</span>}
-                      </td>
-                      <td className="px-3 py-2.5 text-gray-500 font-mono text-xs">{m.loanNumber}</td>
-                      <td className="px-3 py-2.5 text-right text-gray-700">{formatINR(Math.round(m.principalOverdue))}</td>
-                      <td className="px-3 py-2.5 text-right font-bold text-red-700">{formatINR(Math.round(m.arrearAmountTillDate))}</td>
-                      <td className="px-3 py-2.5 text-center">
-                        <span className={`px-2 py-0.5 rounded-full text-xs font-bold ${m.effectiveDPD > 90 ? "bg-red-100 text-red-700" : m.effectiveDPD > 60 ? "bg-orange-100 text-orange-700" : m.effectiveDPD > 30 ? "bg-yellow-100 text-yellow-700" : m.effectiveDPD > 0 ? "bg-blue-100 text-blue-700" : "bg-green-100 text-green-700"}`}>
-                          {m.effectiveDPD}d
-                        </span>
-                      </td>
-                      <td className="px-3 py-2.5 text-center">
-                        {m.isClosed
-                          ? <span className="px-2 py-0.5 rounded-full text-xs font-bold bg-gray-200 text-gray-500">Closed</span>
-                          : m.isDelinquent
-                            ? <span className={`px-2 py-0.5 rounded-full text-xs font-bold ${m.derivedClass === "NPA" ? "bg-red-100 text-red-700" : m.derivedClass === "SMA-2" ? "bg-orange-100 text-orange-700" : m.derivedClass === "SMA-1" ? "bg-yellow-100 text-yellow-700" : "bg-blue-100 text-blue-700"}`}>{m.derivedClass}</span>
-                            : <span className="px-2 py-0.5 rounded-full text-xs font-bold bg-green-100 text-green-700">Regular</span>}
-                      </td>
+              <SortableSection initialKey="memberName" initialDir="asc" render={sort => (
+                <table className="w-full text-xs">
+                  <thead className="bg-gray-50">
+                    <tr>
+                      <th className="px-3 py-2 text-left font-semibold text-gray-600">#</th>
+                      <th className="px-3 py-2 text-left font-semibold text-gray-600">{sort.header("memberName", "Member Name")}</th>
+                      <th className="px-3 py-2 text-left font-semibold text-gray-600">{sort.header("loanNumber", "Loan No.")}</th>
+                      <th className="px-3 py-2 text-right font-semibold text-gray-600">{sort.header("principalOverdue", "Principal OD")}</th>
+                      <th className="px-3 py-2 text-right font-semibold text-gray-600">{sort.header("arrearAmountTillDate", "Arrear Till Today")}</th>
+                      <th className="px-3 py-2 text-center font-semibold text-gray-600">{sort.header("effectiveDPD", "DPD")}</th>
+                      <th className="px-3 py-2 text-center font-semibold text-gray-600">{sort.header("derivedClass", "Status")}</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody className="divide-y divide-gray-100">
+                    {sort.apply(enriched).map((m, i) => (
+                      <tr key={m.loanNumber}
+                        className={`${m.isClosed ? "opacity-40 bg-gray-50" : m.loanNumber === loanAccountNo ? "bg-indigo-50 ring-1 ring-inset ring-indigo-300" : ""}`}>
+                        <td className="px-3 py-2.5 text-gray-400">{i + 1}</td>
+                        <td className="px-3 py-2.5 font-semibold text-gray-800">
+                          {m.memberName}
+                          {m.loanNumber === loanAccountNo && <span className="ml-1 text-indigo-600 text-xs font-bold">← You</span>}
+                        </td>
+                        <td className="px-3 py-2.5 text-gray-500 font-mono text-xs">{m.loanNumber}</td>
+                        <td className="px-3 py-2.5 text-right text-gray-700">{formatINR(Math.round(m.principalOverdue))}</td>
+                        <td className="px-3 py-2.5 text-right font-bold text-red-700">{formatINR(Math.round(m.arrearAmountTillDate))}</td>
+                        <td className="px-3 py-2.5 text-center">
+                          <span className={`px-2 py-0.5 rounded-full text-xs font-bold ${m.effectiveDPD > 90 ? "bg-red-100 text-red-700" : m.effectiveDPD > 60 ? "bg-orange-100 text-orange-700" : m.effectiveDPD > 30 ? "bg-yellow-100 text-yellow-700" : m.effectiveDPD > 0 ? "bg-blue-100 text-blue-700" : "bg-green-100 text-green-700"}`}>
+                            {m.effectiveDPD}d
+                          </span>
+                        </td>
+                        <td className="px-3 py-2.5 text-center">
+                          {m.isClosed
+                            ? <span className="px-2 py-0.5 rounded-full text-xs font-bold bg-gray-200 text-gray-500">Closed</span>
+                            : m.isDelinquent
+                              ? <span className={`px-2 py-0.5 rounded-full text-xs font-bold ${m.derivedClass === "NPA" ? "bg-red-100 text-red-700" : m.derivedClass === "SMA-2" ? "bg-orange-100 text-orange-700" : m.derivedClass === "SMA-1" ? "bg-yellow-100 text-yellow-700" : "bg-blue-100 text-blue-700"}`}>{m.derivedClass}</span>
+                              : <span className="px-2 py-0.5 rounded-full text-xs font-bold bg-green-100 text-green-700">Regular</span>}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )} />
             </div>
           </div>
         );
@@ -1731,11 +1745,17 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4 p-3 bg-green-50 rounded-lg border border-green-200">
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">Field Staff (Collector) *</label>
-              <select value={collectorStaffId} onChange={e => setCollectorStaffId(e.target.value)}
-                className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-green-500 bg-white">
-                <option value="">Select staff who collected the cash</option>
-                {appUsers.map(u => <option key={u.id} value={u.id}>{u.name || u.id}</option>)}
-              </select>
+              {isGoldClosure ? (
+                <input readOnly value="Gold"
+                  className="w-full px-3 py-2 border rounded-lg bg-amber-50 border-amber-300 text-amber-800 font-semibold cursor-default"
+                  title="Auto-set because 'Recovery through Gold Loan Closure' is checked" />
+              ) : (
+                <select value={collectorStaffId} onChange={e => setCollectorStaffId(e.target.value)}
+                  className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-green-500 bg-white">
+                  <option value="">Select staff who collected the cash</option>
+                  {appUsers.map(u => <option key={u.id} value={u.id}>{u.name || u.id}</option>)}
+                </select>
+              )}
             </div>
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-1">Bank (Deposited Into) *</label>
@@ -2015,6 +2035,11 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
       else if (sortField === "customer") cmp = (a.customerName || "").localeCompare(b.customerName || "");
       else if (sortField === "staff") cmp = (a.enteredByName || a.enteredBy || "").localeCompare(b.enteredByName || b.enteredBy || "");
       else if (sortField === "sma") cmp = (a.smaBucket || "").localeCompare(b.smaBucket || "");
+      else if (sortField === "groupsize") cmp = (Number(a.numberOfCustomers) || 0) - (Number(b.numberOfCustomers) || 0);
+      else if (sortField === "customershare") cmp = (Number(a.customerShare) || 0) - (Number(b.customerShare) || 0);
+      else if (sortField === "mode") cmp = (a.paymentMode || a.ptpPaymentMode || "").localeCompare(b.paymentMode || b.ptpPaymentMode || "");
+      else if (sortField === "ptpdate") cmp = (a.ptpDate || "").localeCompare(b.ptpDate || "");
+      else if (sortField === "approver") cmp = (a.approver || "").localeCompare(b.approver || "");
       return sortDir === "desc" ? -cmp : cmp;
     });
     return data;
@@ -2167,8 +2192,14 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
                 {/* Group OD-only columns: Group Size and Customer Share */}
                 {odTypeFilter !== "Individual OD" && (
                   <>
-                    <th className="text-right px-4 py-3 font-semibold text-gray-600">Group Size</th>
-                    <th className="text-right px-4 py-3 font-semibold text-gray-600">Customer Share</th>
+                    <th className="text-right px-4 py-3 font-semibold text-gray-600 cursor-pointer hover:text-teal-700 select-none"
+                      onClick={() => { if (sortField === "groupsize") setSortDir(sortDir === "desc" ? "asc" : "desc"); else { setSortField("groupsize"); setSortDir("desc"); } }}>
+                      Group Size {sortField === "groupsize" ? (sortDir === "desc" ? "↓" : "↑") : ""}
+                    </th>
+                    <th className="text-right px-4 py-3 font-semibold text-gray-600 cursor-pointer hover:text-teal-700 select-none"
+                      onClick={() => { if (sortField === "customershare") setSortDir(sortDir === "desc" ? "asc" : "desc"); else { setSortField("customershare"); setSortDir("desc"); } }}>
+                      Customer Share {sortField === "customershare" ? (sortDir === "desc" ? "↓" : "↑") : ""}
+                    </th>
                   </>
                 )}
                 {[
@@ -2180,12 +2211,21 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
                     {col.label} {sortField === col.key ? (sortDir === "desc" ? "↓" : "↑") : ""}
                   </th>
                 ))}
-                <th className="text-left px-4 py-3 font-semibold text-gray-600">Mode</th>
+                <th className="text-left px-4 py-3 font-semibold text-gray-600 cursor-pointer hover:text-teal-700 select-none"
+                  onClick={() => { if (sortField === "mode") setSortDir(sortDir === "desc" ? "asc" : "desc"); else { setSortField("mode"); setSortDir("desc"); } }}>
+                  Mode {sortField === "mode" ? (sortDir === "desc" ? "↓" : "↑") : ""}
+                </th>
                 {/* Group OD-only: PTP Date + Approver */}
                 {odTypeFilter !== "Individual OD" && (
                   <>
-                    <th className="text-left px-4 py-3 font-semibold text-gray-600">PTP Date</th>
-                    <th className="text-left px-4 py-3 font-semibold text-gray-600">Approver</th>
+                    <th className="text-left px-4 py-3 font-semibold text-gray-600 cursor-pointer hover:text-teal-700 select-none"
+                      onClick={() => { if (sortField === "ptpdate") setSortDir(sortDir === "desc" ? "asc" : "desc"); else { setSortField("ptpdate"); setSortDir("desc"); } }}>
+                      PTP Date {sortField === "ptpdate" ? (sortDir === "desc" ? "↓" : "↑") : ""}
+                    </th>
+                    <th className="text-left px-4 py-3 font-semibold text-gray-600 cursor-pointer hover:text-teal-700 select-none"
+                      onClick={() => { if (sortField === "approver") setSortDir(sortDir === "desc" ? "asc" : "desc"); else { setSortField("approver"); setSortDir("desc"); } }}>
+                      Approver {sortField === "approver" ? (sortDir === "desc" ? "↓" : "↑") : ""}
+                    </th>
                   </>
                 )}
                 <th className="text-left px-4 py-3 font-semibold text-gray-600 cursor-pointer hover:text-teal-700 select-none"
@@ -2604,57 +2644,61 @@ function Dashboard({ user, entries, branches, config }) {
         {/* Branch-wise breakdown */}
         <div className="bg-white rounded-xl border overflow-hidden mb-6">
           <h3 className="text-sm font-semibold text-gray-700 p-4 border-b">Branch-wise Breakdown</h3>
-          <table className="w-full text-sm">
-            <thead className="bg-gray-50 border-b">
-              <tr>
-                <th className="text-left px-4 py-2">Branch</th>
-                <th className="text-right px-4 py-2">Entries</th>
-                <th className="text-right px-4 py-2">Recovered</th>
-                <th className="text-right px-4 py-2">Waiver</th>
-                <th className="text-right px-4 py-2">Group OD</th>
-              </tr>
-            </thead>
-            <tbody>
-              {branchSummary.map(b => (
-                <tr key={b.branch} className="border-b hover:bg-gray-50 cursor-pointer" onClick={() => { setDrillPanel(null); setDrillBranch(b.branch); }}>
-                  <td className="px-4 py-2 font-medium">{b.branch}</td>
-                  <td className="px-4 py-2 text-right">{b.entries}</td>
-                  <td className={`px-4 py-2 text-right font-medium ${highlightField === "paid" ? "text-teal-700" : ""}`}>{formatINR(b.recovered)}</td>
-                  <td className={`px-4 py-2 text-right font-medium ${highlightField === "waiver" ? "text-amber-700" : ""}`}>{b.waiver > 0 ? formatINR(b.waiver) : "—"}</td>
-                  <td className={`px-4 py-2 text-right font-medium ${highlightField === "groupod" ? "text-gray-700" : ""}`}>{formatINR(b.groupOD)}</td>
+          <SortableSection initialKey="recovered" initialDir="desc" render={sort => (
+            <table className="w-full text-sm">
+              <thead className="bg-gray-50 border-b">
+                <tr>
+                  <th className="text-left px-4 py-2">{sort.header("branch", "Branch")}</th>
+                  <th className="text-right px-4 py-2">{sort.header("entries", "Entries")}</th>
+                  <th className="text-right px-4 py-2">{sort.header("recovered", "Recovered")}</th>
+                  <th className="text-right px-4 py-2">{sort.header("waiver", "Waiver")}</th>
+                  <th className="text-right px-4 py-2">{sort.header("groupOD", "Group OD")}</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {sort.apply(branchSummary).map(b => (
+                  <tr key={b.branch} className="border-b hover:bg-gray-50 cursor-pointer" onClick={() => { setDrillPanel(null); setDrillBranch(b.branch); }}>
+                    <td className="px-4 py-2 font-medium">{b.branch}</td>
+                    <td className="px-4 py-2 text-right">{b.entries}</td>
+                    <td className={`px-4 py-2 text-right font-medium ${highlightField === "paid" ? "text-teal-700" : ""}`}>{formatINR(b.recovered)}</td>
+                    <td className={`px-4 py-2 text-right font-medium ${highlightField === "waiver" ? "text-amber-700" : ""}`}>{b.waiver > 0 ? formatINR(b.waiver) : "—"}</td>
+                    <td className={`px-4 py-2 text-right font-medium ${highlightField === "groupod" ? "text-gray-700" : ""}`}>{formatINR(b.groupOD)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )} />
         </div>
 
         {/* Recent entries */}
         <div className="bg-white rounded-xl border overflow-hidden">
           <h3 className="text-sm font-semibold text-gray-700 p-4 border-b">Recent Entries ({Math.min(panelEntries.length, 25)} of {panelEntries.length})</h3>
-          <table className="w-full text-sm">
-            <thead className="bg-gray-50 border-b">
-              <tr>
-                <th className="text-left px-4 py-2">Date</th>
-                <th className="text-left px-4 py-2">Branch</th>
-                <th className="text-left px-4 py-2">Customer</th>
-                <th className="text-right px-4 py-2">Paid</th>
-                <th className="text-right px-4 py-2">Waiver</th>
-                <th className="text-left px-4 py-2">Payment Mode</th>
-              </tr>
-            </thead>
-            <tbody>
-              {panelEntries.slice(0, 25).map(e => (
-                <tr key={e.id} className="border-b">
-                  <td className="px-4 py-2">{formatDateDMY(e.date)}</td>
-                  <td className="px-4 py-2">{e.branch}</td>
-                  <td className="px-4 py-2">{e.customerName} <span className="text-xs text-gray-400">({e.customerId})</span></td>
-                  <td className="px-4 py-2 text-right text-teal-700 font-medium">{formatINR(getEntryPaid(e))}</td>
-                  <td className="px-4 py-2 text-right">{e.waiver > 0 ? <span className="text-amber-600">{formatINR(e.waiver)}</span> : <span className="text-gray-400">—</span>}</td>
-                  <td className="px-4 py-2">{e.ptpPaymentMode || e.paymentMode || "—"}</td>
+          <SortableSection initialKey="date" initialDir="desc" render={sort => (
+            <table className="w-full text-sm">
+              <thead className="bg-gray-50 border-b">
+                <tr>
+                  <th className="text-left px-4 py-2">{sort.header("date", "Date")}</th>
+                  <th className="text-left px-4 py-2">{sort.header("branch", "Branch")}</th>
+                  <th className="text-left px-4 py-2">{sort.header("customerName", "Customer")}</th>
+                  <th className="text-right px-4 py-2">{sort.header("paid", "Paid")}</th>
+                  <th className="text-right px-4 py-2">{sort.header("waiver", "Waiver")}</th>
+                  <th className="text-left px-4 py-2">{sort.header("paymentMode", "Payment Mode")}</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {sort.apply(panelEntries.slice(0, 25)).map(e => (
+                  <tr key={e.id} className="border-b">
+                    <td className="px-4 py-2">{formatDateDMY(e.date)}</td>
+                    <td className="px-4 py-2">{e.branch}</td>
+                    <td className="px-4 py-2">{e.customerName} <span className="text-xs text-gray-400">({e.customerId})</span></td>
+                    <td className="px-4 py-2 text-right text-teal-700 font-medium">{formatINR(getEntryPaid(e))}</td>
+                    <td className="px-4 py-2 text-right">{e.waiver > 0 ? <span className="text-amber-600">{formatINR(e.waiver)}</span> : <span className="text-gray-400">—</span>}</td>
+                    <td className="px-4 py-2">{e.ptpPaymentMode || e.paymentMode || "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )} />
         </div>
       </div>
     );
@@ -2704,28 +2748,30 @@ function Dashboard({ user, entries, branches, config }) {
         )}
         <div className="bg-white rounded-xl border overflow-hidden">
           <h3 className="text-sm font-semibold text-gray-700 p-4 border-b">Recent Entries</h3>
-          <table className="w-full text-sm">
-            <thead className="bg-gray-50 border-b">
-              <tr>
-                <th className="text-left px-4 py-2">Date</th>
-                <th className="text-left px-4 py-2">Branch</th>
-                <th className="text-left px-4 py-2">Customer</th>
-                <th className="text-right px-4 py-2">Share Paid</th>
-                <th className="text-right px-4 py-2">Waiver</th>
-              </tr>
-            </thead>
-            <tbody>
-              {staffEntries.slice(0, 20).map(e => (
-                <tr key={e.id} className="border-b">
-                  <td className="px-4 py-2">{formatDateDMY(e.date)}</td>
-                  <td className="px-4 py-2">{e.branch}</td>
-                  <td className="px-4 py-2">{e.customerName} <span className="text-xs text-gray-400">({e.customerId})</span></td>
-                  <td className="px-4 py-2 text-right text-teal-700 font-medium">{formatINR(getEntryPaid(e))}</td>
-                  <td className="px-4 py-2 text-right">{e.waiver > 0 ? <span className="text-amber-600">{formatINR(e.waiver)}</span> : <span className="text-gray-400">—</span>}</td>
+          <SortableSection initialKey="date" initialDir="desc" render={sort => (
+            <table className="w-full text-sm">
+              <thead className="bg-gray-50 border-b">
+                <tr>
+                  <th className="text-left px-4 py-2">{sort.header("date", "Date")}</th>
+                  <th className="text-left px-4 py-2">{sort.header("branch", "Branch")}</th>
+                  <th className="text-left px-4 py-2">{sort.header("customerName", "Customer")}</th>
+                  <th className="text-right px-4 py-2">{sort.header("paid", "Share Paid")}</th>
+                  <th className="text-right px-4 py-2">{sort.header("waiver", "Waiver")}</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {sort.apply(staffEntries.slice(0, 20)).map(e => (
+                  <tr key={e.id} className="border-b">
+                    <td className="px-4 py-2">{formatDateDMY(e.date)}</td>
+                    <td className="px-4 py-2">{e.branch}</td>
+                    <td className="px-4 py-2">{e.customerName} <span className="text-xs text-gray-400">({e.customerId})</span></td>
+                    <td className="px-4 py-2 text-right text-teal-700 font-medium">{formatINR(getEntryPaid(e))}</td>
+                    <td className="px-4 py-2 text-right">{e.waiver > 0 ? <span className="text-amber-600">{formatINR(e.waiver)}</span> : <span className="text-gray-400">—</span>}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )} />
         </div>
       </div>
     );
@@ -2776,26 +2822,28 @@ function Dashboard({ user, entries, branches, config }) {
         {/* Recent entries */}
         <div className="bg-white rounded-xl border overflow-hidden">
           <h3 className="text-sm font-semibold text-gray-700 p-4 border-b">Recent Entries</h3>
-          <table className="w-full text-sm">
-            <thead className="bg-gray-50 border-b">
-              <tr>
-                <th className="text-left px-4 py-2">Date</th>
-                <th className="text-left px-4 py-2">Customer</th>
-                <th className="text-right px-4 py-2">Share Paid</th>
-                <th className="text-right px-4 py-2">Waiver</th>
-              </tr>
-            </thead>
-            <tbody>
-              {branchEntries.slice(0, 20).map(e => (
-                <tr key={e.id} className="border-b">
-                  <td className="px-4 py-2">{formatDateDMY(e.date)}</td>
-                  <td className="px-4 py-2">{e.customerName} <span className="text-xs text-gray-400">({e.customerId})</span></td>
-                  <td className="px-4 py-2 text-right text-teal-700 font-medium">{formatINR(getEntryPaid(e))}</td>
-                  <td className="px-4 py-2 text-right">{e.waiver > 0 ? <span className="text-amber-600">{formatINR(e.waiver)}</span> : <span className="text-gray-400">—</span>}</td>
+          <SortableSection initialKey="date" initialDir="desc" render={sort => (
+            <table className="w-full text-sm">
+              <thead className="bg-gray-50 border-b">
+                <tr>
+                  <th className="text-left px-4 py-2">{sort.header("date", "Date")}</th>
+                  <th className="text-left px-4 py-2">{sort.header("customerName", "Customer")}</th>
+                  <th className="text-right px-4 py-2">{sort.header("paid", "Share Paid")}</th>
+                  <th className="text-right px-4 py-2">{sort.header("waiver", "Waiver")}</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {sort.apply(branchEntries.slice(0, 20)).map(e => (
+                  <tr key={e.id} className="border-b">
+                    <td className="px-4 py-2">{formatDateDMY(e.date)}</td>
+                    <td className="px-4 py-2">{e.customerName} <span className="text-xs text-gray-400">({e.customerId})</span></td>
+                    <td className="px-4 py-2 text-right text-teal-700 font-medium">{formatINR(getEntryPaid(e))}</td>
+                    <td className="px-4 py-2 text-right">{e.waiver > 0 ? <span className="text-amber-600">{formatINR(e.waiver)}</span> : <span className="text-gray-400">—</span>}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )} />
         </div>
       </div>
     );
@@ -3688,47 +3736,49 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
             <button onClick={handleAddUser} className="mt-3 px-4 py-2 bg-teal-600 text-white rounded-lg text-sm hover:bg-teal-700 transition-colors">Add User</button>
           </div>
           <div className="bg-white rounded-xl border overflow-hidden">
-            <table className="w-full text-sm">
-              <thead className="bg-gray-50 border-b">
-                <tr>
-                  <th className="text-left px-4 py-3">Name</th>
-                  <th className="text-left px-4 py-3">Username</th>
-                  <th className="text-left px-4 py-3">Password</th>
-                  <th className="text-left px-4 py-3">Role</th>
-                  <th className="text-left px-4 py-3">Branch</th>
-                  <th className="text-center px-4 py-3">Status</th>
-                  <th className="text-center px-4 py-3">Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                {users.map(u => (
-                  <tr key={u.id} className="border-b">
-                    <td className="px-4 py-3 font-medium">{u.name}</td>
-                    <td className="px-4 py-3">{u.username}</td>
-                    <td className="px-4 py-3">
-                      <div className="flex items-center gap-1">
-                        <span>{showPassId === u.id ? u.password : "••••••"}</span>
-                        <button onClick={() => setShowPassId(showPassId === u.id ? null : u.id)} className="p-1 hover:bg-gray-100 rounded">
-                          {showPassId === u.id ? <EyeOff size={12} /> : <Eye size={12} />}
-                        </button>
-                      </div>
-                    </td>
-                    <td className="px-4 py-3"><span className={`px-2 py-0.5 rounded-full text-xs font-medium ${u.role === "admin" ? "bg-purple-100 text-purple-700" : u.role === "elevated_staff" ? "bg-amber-100 text-amber-700" : "bg-blue-100 text-blue-700"}`}>{u.role === "elevated_staff" ? "MIS Staff" : u.role}</span></td>
-                    <td className="px-4 py-3">{u.branch || "—"}</td>
-                    <td className="px-4 py-3 text-center">
-                      <button onClick={() => toggleUser(u.id)} className={`px-2 py-0.5 rounded-full text-xs font-medium ${u.active ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"}`}>
-                        {u.active ? "Active" : "Disabled"}
-                      </button>
-                    </td>
-                    <td className="px-4 py-3 text-center">
-                      {u.username !== "admin" && (
-                        <button onClick={() => deleteUser(u.id)} className="p-1 hover:bg-red-100 rounded text-red-500"><Trash2 size={14} /></button>
-                      )}
-                    </td>
+            <SortableSection initialKey="name" initialDir="asc" render={sort => (
+              <table className="w-full text-sm">
+                <thead className="bg-gray-50 border-b">
+                  <tr>
+                    <th className="text-left px-4 py-3">{sort.header("name", "Name")}</th>
+                    <th className="text-left px-4 py-3">{sort.header("username", "Username")}</th>
+                    <th className="text-left px-4 py-3">Password</th>
+                    <th className="text-left px-4 py-3">{sort.header("role", "Role")}</th>
+                    <th className="text-left px-4 py-3">{sort.header("branch", "Branch")}</th>
+                    <th className="text-center px-4 py-3">{sort.header("active", "Status")}</th>
+                    <th className="text-center px-4 py-3">Actions</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {sort.apply(users).map(u => (
+                    <tr key={u.id} className="border-b">
+                      <td className="px-4 py-3 font-medium">{u.name}</td>
+                      <td className="px-4 py-3">{u.username}</td>
+                      <td className="px-4 py-3">
+                        <div className="flex items-center gap-1">
+                          <span>{showPassId === u.id ? u.password : "••••••"}</span>
+                          <button onClick={() => setShowPassId(showPassId === u.id ? null : u.id)} className="p-1 hover:bg-gray-100 rounded">
+                            {showPassId === u.id ? <EyeOff size={12} /> : <Eye size={12} />}
+                          </button>
+                        </div>
+                      </td>
+                      <td className="px-4 py-3"><span className={`px-2 py-0.5 rounded-full text-xs font-medium ${u.role === "admin" ? "bg-purple-100 text-purple-700" : u.role === "elevated_staff" ? "bg-amber-100 text-amber-700" : "bg-blue-100 text-blue-700"}`}>{u.role === "elevated_staff" ? "MIS Staff" : u.role}</span></td>
+                      <td className="px-4 py-3">{u.branch || "—"}</td>
+                      <td className="px-4 py-3 text-center">
+                        <button onClick={() => toggleUser(u.id)} className={`px-2 py-0.5 rounded-full text-xs font-medium ${u.active ? "bg-green-100 text-green-700" : "bg-red-100 text-red-700"}`}>
+                          {u.active ? "Active" : "Disabled"}
+                        </button>
+                      </td>
+                      <td className="px-4 py-3 text-center">
+                        {u.username !== "admin" && (
+                          <button onClick={() => deleteUser(u.id)} className="p-1 hover:bg-red-100 rounded text-red-500"><Trash2 size={14} /></button>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )} />
           </div>
         </div>
       )}
@@ -4281,6 +4331,7 @@ export default function App() {
     { key: "ind_records", icon: FileText, label: "Individual OD" },
     ...(canViewInsights ? [{ key: "od_insights", icon: TrendingUp, label: "OD Insights" }] : []),
     ...(canUploadOD ? [{ key: "od_upload", icon: Upload, label: "OD Upload" }] : []),
+    { key: "reports_analytics", icon: Activity, label: "Reports & Analytics" },
     { key: "notifications", icon: Bell, label: "Notifications", badge: unreadNotificationsCount > 0 ? unreadNotificationsCount : null },
     ...(isAdmin ? [{ key: "admin", icon: Shield, label: "Admin" }] : []),
   ];
@@ -4364,6 +4415,7 @@ export default function App() {
           {page === "ind_records" && <RecordsTable user={user} entries={entries} setEntries={setEntries} config={config} branches={branches} notifications={notifications} setNotifications={setNotifications} odTypeFilter="Individual OD" />}
           {page === "od_insights" && canViewInsights && <CollectionDashboard user={user} entries={entries} branches={branches} />}
           {page === "od_upload" && canUploadOD && <DataUploadPage user={user} canUpload={canUploadOD} />}
+          {page === "reports_analytics" && <ReportsAnalytics user={user} />}
           {page === "notifications" && <NotificationsPage user={user} users={users} notifications={notifications} setNotifications={setNotifications} />}
           {page === "admin" && user.role === "admin" && <AdminPanel users={users} setUsers={setUsers} branches={branches} setBranches={setBranches} config={config} setConfig={setConfig} entries={entries} setEntries={setEntries} notifications={notifications} setNotifications={setNotifications} />}
         </main>

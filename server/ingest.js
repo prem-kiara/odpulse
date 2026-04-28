@@ -133,12 +133,12 @@ function ingestPool(fileContent, opts) {
   const upsertCustomer = db.prepare(`
     INSERT INTO customers (loan_account_no, customer_number, customer_name, spouse_name, branch,
       center_name, group_name, mobile_number, residence_phone, aadhaar_number, voter_id, ration_card,
-      gender, date_of_birth, officer_name, officer_code, product_name, product_interest_rate,
+      gender, date_of_birth, officer_name, officer_code, product_name, loan_category, product_interest_rate,
       loan_amount, disbursement_date, first_installment_date, last_installment_date, last_payment_date,
       village, district, pincode, address, updated_at)
     VALUES (@loan_account_no, @customer_number, @customer_name, @spouse_name, @branch,
       @center_name, @group_name, @mobile_number, @residence_phone, @aadhaar_number, @voter_id, @ration_card,
-      @gender, @date_of_birth, @officer_name, @officer_code, @product_name, @product_interest_rate,
+      @gender, @date_of_birth, @officer_name, @officer_code, @product_name, @loan_category, @product_interest_rate,
       @loan_amount, @disbursement_date, @first_installment_date, @last_installment_date, @last_payment_date,
       @village, @district, @pincode, @address, @updated_at)
     ON CONFLICT(loan_account_no) DO UPDATE SET
@@ -146,7 +146,7 @@ function ingestPool(fileContent, opts) {
       center_name=excluded.center_name, group_name=excluded.group_name, mobile_number=excluded.mobile_number,
       residence_phone=excluded.residence_phone, aadhaar_number=excluded.aadhaar_number, voter_id=excluded.voter_id, ration_card=excluded.ration_card,
       gender=excluded.gender, date_of_birth=excluded.date_of_birth, officer_name=excluded.officer_name, officer_code=excluded.officer_code,
-      product_name=excluded.product_name, product_interest_rate=excluded.product_interest_rate,
+      product_name=excluded.product_name, loan_category=excluded.loan_category, product_interest_rate=excluded.product_interest_rate,
       loan_amount=excluded.loan_amount, disbursement_date=excluded.disbursement_date, first_installment_date=excluded.first_installment_date,
       last_installment_date=excluded.last_installment_date, last_payment_date=excluded.last_payment_date,
       village=excluded.village, district=excluded.district, pincode=excluded.pincode, address=excluded.address,
@@ -215,6 +215,9 @@ function ingestPool(fileContent, opts) {
         officer_name: str(r["Officer Name"]),
         officer_code: str(r["Officer Employee Number"]),
         product_name: str(r["Product Name"]),
+        // "Category of Loan" from the Pool Report — values like "Group Loan" /
+        // "Individual Loan". Drives the OD Insights Group vs Individual tab split.
+        loan_category: str(r["Category of Loan"]),
         product_interest_rate: num(r["Product Interest Rate(%)"]),
         loan_amount: num(r["Loan Amount"]),
         disbursement_date: str(r["Disbursement Date"]),

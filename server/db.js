@@ -33,6 +33,10 @@ CREATE TABLE IF NOT EXISTS customers (
   officer_name TEXT,
   officer_code TEXT,
   product_name TEXT,
+  -- Loan classification from the "Category of Loan" column of the Pool Report.
+  -- Values are 'Group Loan' / 'Individual Loan' (free-text, so compared case-
+  -- insensitively in queries). Drives the OD Insights Group vs Individual tab split.
+  loan_category TEXT,
   product_interest_rate REAL,
   loan_amount REAL,
   disbursement_date TEXT,
@@ -389,5 +393,21 @@ CREATE TABLE IF NOT EXISTS rollup_log (
   trigger TEXT                      -- 'cron' | 'manual' | 'startup'
 );
 `);
+
+// ─── Idempotent schema migrations ──────────────────────────────────────────
+// For databases created before a column was added, ALTER TABLE ADD COLUMN.
+// SQLite throws "duplicate column name" if it already exists, which we swallow.
+function safeAddColumn(table, column, type) {
+  try {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+  } catch (err) {
+    if (!/duplicate column name/i.test(err.message)) throw err;
+  }
+}
+
+// Pool-Report "Category of Loan" — backfills on next upload, NULL for legacy rows.
+safeAddColumn("customers", "loan_category", "TEXT");
+// Index for fast Group/Individual filtering in OD Insights.
+try { db.exec(`CREATE INDEX IF NOT EXISTS idx_customers_loan_category ON customers(loan_category)`); } catch {}
 
 module.exports = db;

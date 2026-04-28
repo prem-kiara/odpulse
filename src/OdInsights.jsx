@@ -19,6 +19,7 @@ import {
 import {
   enqueueUpload, listQueue, deleteFromQueue, drainQueue, isBackendUp,
 } from "./uploadQueue";
+import { SortableSection } from "./tableSort.jsx";
 
 const API_BASE = "/api";
 const COLORS = ["#0f766e", "#06b6d4", "#8b5cf6", "#f59e0b", "#ef4444", "#10b981", "#ec4899", "#6366f1", "#14b8a6", "#f97316"];
@@ -823,36 +824,42 @@ export function DataUploadPage({ user, canUpload }) {
           </button>
         </div>
         <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead className="bg-gray-50 text-xs uppercase text-gray-500">
-              <tr>
-                <th className="text-left px-4 py-2">Kind</th>
-                <th className="text-left px-4 py-2">Snapshot Date</th>
-                <th className="text-left px-4 py-2">Filename</th>
-                <th className="text-right px-4 py-2">Rows</th>
-                <th className="text-right px-4 py-2">New Branches</th>
-                <th className="text-left px-4 py-2">Uploaded By</th>
-                <th className="text-left px-4 py-2">At</th>
-              </tr>
-            </thead>
-            <tbody>
-              {(!history.uploads || history.uploads.length === 0) ? (
-                <tr><td colSpan={7} className="text-center text-gray-400 py-6">No uploads yet.</td></tr>
-              ) : history.uploads.map(h => (
-                <tr key={h.id} className="border-t">
-                  <td className="px-4 py-2">
-                    <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${h.kind === "pool" ? "bg-teal-100 text-teal-700" : "bg-indigo-100 text-indigo-700"}`}>{h.kind}</span>
-                  </td>
-                  <td className="px-4 py-2">{formatDateDMY(h.snapshot_date)}</td>
-                  <td className="px-4 py-2 text-gray-600">{h.filename}</td>
-                  <td className="px-4 py-2 text-right font-medium">{(h.row_count || 0).toLocaleString()}</td>
-                  <td className="px-4 py-2 text-right">{h.new_branches || 0}</td>
-                  <td className="px-4 py-2">{h.uploaded_by}</td>
-                  <td className="px-4 py-2 text-gray-500 text-xs">{h.uploaded_at ? new Date(h.uploaded_at).toLocaleString() : "—"}</td>
+          <SortableSection initialKey="uploaded_at" initialDir="desc" render={sort => (
+            <table className="w-full text-sm">
+              <thead className="bg-gray-50 text-xs uppercase text-gray-500">
+                <tr>
+                  <th className="text-left px-4 py-2">{sort.header("kind", "Kind")}</th>
+                  <th className="text-left px-4 py-2">{sort.header("snapshot_date", "Snapshot Date")}</th>
+                  <th className="text-left px-4 py-2">{sort.header("filename", "Filename")}</th>
+                  <th className="text-right px-4 py-2">{sort.header("row_count", "Rows")}</th>
+                  <th className="text-right px-4 py-2">{sort.header("new_branches", "New Branches")}</th>
+                  <th className="text-left px-4 py-2">{sort.header("uploaded_by", "Uploaded By")}</th>
+                  <th className="text-left px-4 py-2">{sort.header("uploaded_at", "At")}</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {(() => {
+                  const sortedUploads = sort.apply(history.uploads || []);
+                  if (!sortedUploads || sortedUploads.length === 0) {
+                    return <tr><td colSpan={7} className="text-center text-gray-400 py-6">No uploads yet.</td></tr>;
+                  }
+                  return sortedUploads.map(h => (
+                    <tr key={h.id} className="border-t">
+                      <td className="px-4 py-2">
+                        <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${h.kind === "pool" ? "bg-teal-100 text-teal-700" : "bg-indigo-100 text-indigo-700"}`}>{h.kind}</span>
+                      </td>
+                      <td className="px-4 py-2">{formatDateDMY(h.snapshot_date)}</td>
+                      <td className="px-4 py-2 text-gray-600">{h.filename}</td>
+                      <td className="px-4 py-2 text-right font-medium">{(h.row_count || 0).toLocaleString()}</td>
+                      <td className="px-4 py-2 text-right">{h.new_branches || 0}</td>
+                      <td className="px-4 py-2">{h.uploaded_by}</td>
+                      <td className="px-4 py-2 text-gray-500 text-xs">{h.uploaded_at ? new Date(h.uploaded_at).toLocaleString() : "—"}</td>
+                    </tr>
+                  ));
+                })()}
+              </tbody>
+            </table>
+          )} />
         </div>
       </div>
     </div>
@@ -869,6 +876,14 @@ export function CollectionDashboard({ user, entries, branches }) {
   const [toDate, setToDate] = useState(() => new Date().toISOString().slice(0, 10));
   const [branchFilter, setBranchFilter] = useState("");
 
+  // Outer category filter — Group Loan vs Individual Loan. Drives all 8 sub-tabs.
+  // Sourced from the Pool Report's "Category of Loan" column (ingested into
+  // customers.loan_category). Matching is case-insensitive:
+  //   Group      = loan_category contains 'GROUP'       → shows Group Loan rows only
+  //   Individual = loan_category contains 'INDIVIDUAL'  → shows Individual Loan rows only
+  // Default is "group" — matches the compressed pool report tab order.
+  const [category, setCategory] = useState("group");
+
   const [dpd, setDpd] = useState(null);                 // {snapshotDate, buckets:[{bucket, accounts, overdue_amount, principal_outstanding}]}
   const [odTrend, setOdTrend] = useState([]);           // trend[] from {trend:[...]}
   const [branchConc, setBranchConc] = useState([]);     // branches[] from {snapshotDate, branches:[...]}
@@ -882,6 +897,7 @@ export function CollectionDashboard({ user, entries, branches }) {
   const q = (params = {}) => {
     const p = new URLSearchParams();
     if (branchFilter) p.set("branch", branchFilter);
+    if (category) p.set("category", category);
     for (const [k, v] of Object.entries(params)) if (v != null && v !== "") p.set(k, v);
     return p.toString();
   };
@@ -910,7 +926,7 @@ export function CollectionDashboard({ user, entries, branches }) {
     } finally {
       setLoading(false);
     }
-  }, [granularity, fromDate, toDate, branchFilter]);
+  }, [granularity, fromDate, toDate, branchFilter, category]);
 
   useEffect(() => { loadAll(); }, [loadAll]);
 
@@ -995,6 +1011,37 @@ export function CollectionDashboard({ user, entries, branches }) {
             <RefreshCw size={14} className={loading ? "animate-spin" : ""} /> Refresh
           </button>
         )}
+      </div>
+
+      {/* Outer category toggle — Group Loan vs Individual Loan, sourced from
+          customers.loan_category (the Pool Report's "Category of Loan" column). */}
+      <div className="flex items-center gap-2 flex-wrap">
+        <span className="text-xs uppercase tracking-wide text-gray-500 font-semibold mr-1">Loan Category</span>
+        <div className="inline-flex rounded-full bg-gray-100 p-1 border border-gray-200 shadow-sm">
+          <button
+            type="button"
+            onClick={() => setCategory("group")}
+            className={`px-4 py-1.5 rounded-full text-sm font-semibold transition-all ${
+              category === "group"
+                ? "bg-teal-600 text-white shadow"
+                : "text-gray-600 hover:text-gray-900"
+            }`}>
+            Group Loan
+          </button>
+          <button
+            type="button"
+            onClick={() => setCategory("individual")}
+            className={`px-4 py-1.5 rounded-full text-sm font-semibold transition-all ${
+              category === "individual"
+                ? "bg-indigo-600 text-white shadow"
+                : "text-gray-600 hover:text-gray-900"
+            }`}>
+            Individual Loan
+          </button>
+        </div>
+        <span className="text-[11px] text-gray-500 ml-1">
+          Applies across all 8 tabs · filter: customers.loan_category
+        </span>
       </div>
 
       {/* Tab bar */}
@@ -1170,19 +1217,47 @@ export function CollectionDashboard({ user, entries, branches }) {
                 <Stat label="Pending" value={(ptpConv.pending || 0).toLocaleString()} tone="amber" />
                 <Stat label="Missed" value={(ptpConv.missed || 0).toLocaleString()} tone="red" />
               </div>
-              <ResponsiveContainer width="100%" height={180}>
-                <PieChart>
-                  <Pie data={[
-                    { name: "Paid", value: ptpConv.paid || 0 },
-                    { name: "Pending", value: ptpConv.pending || 0 },
-                    { name: "Missed", value: ptpConv.missed || 0 },
-                  ]} cx="50%" cy="50%" innerRadius={50} outerRadius={75} dataKey="value"
-                    label={(e) => `${e.name}: ${e.value}`}>
-                    <Cell fill="#10b981" /><Cell fill="#f59e0b" /><Cell fill="#ef4444" />
-                  </Pie>
-                  <Tooltip />
-                </PieChart>
-              </ResponsiveContainer>
+              {(() => {
+                // Only show non-zero slices in the donut so labels don't stack
+                // on top of each other when one or two segments are 0. The four
+                // Stat boxes above already display every value, so nothing is
+                // hidden by this filter.
+                const COLOR_BY_NAME = { Paid: "#10b981", Pending: "#f59e0b", Missed: "#ef4444" };
+                const slices = [
+                  { name: "Paid",    value: ptpConv.paid    || 0 },
+                  { name: "Pending", value: ptpConv.pending || 0 },
+                  { name: "Missed",  value: ptpConv.missed  || 0 },
+                ].filter(s => s.value > 0);
+
+                if (slices.length === 0) {
+                  return (
+                    <div className="h-[180px] flex items-center justify-center text-gray-400 text-sm">
+                      No PTP activity in this period.
+                    </div>
+                  );
+                }
+                return (
+                  <ResponsiveContainer width="100%" height={180}>
+                    <PieChart>
+                      <Pie
+                        data={slices}
+                        cx="50%"
+                        cy="50%"
+                        innerRadius={50}
+                        outerRadius={75}
+                        dataKey="value"
+                        label={(e) => `${e.name}: ${e.value}`}
+                        labelLine={true}
+                      >
+                        {slices.map((s, i) => (
+                          <Cell key={s.name} fill={COLOR_BY_NAME[s.name]} />
+                        ))}
+                      </Pie>
+                      <Tooltip />
+                    </PieChart>
+                  </ResponsiveContainer>
+                );
+              })()}
               <div className="text-center mt-2 text-xs text-gray-500">
                 Conversion Rate: <b className="text-gray-800">{Number(ptpConv.conversionPct || 0).toFixed(1)}%</b>
               </div>
@@ -1223,32 +1298,38 @@ export function CollectionDashboard({ user, entries, branches }) {
               className="text-xs text-teal-700 flex items-center gap-1"><Download size={12} /> CSV</button>
           </div>
           <div className="overflow-y-auto max-h-80">
-            <table className="w-full text-xs">
-              <thead className="sticky top-0 bg-white shadow-sm">
-                <tr className="text-left text-gray-500 border-b">
-                  <th className="py-2 pr-2">Officer</th>
-                  <th className="py-2 pr-2 text-right">Entries</th>
-                  <th className="py-2 pr-2 text-right">Collected</th>
-                  <th className="py-2 pr-2 text-right">PTPs</th>
-                  <th className="py-2 pr-2 text-right">Paid</th>
-                  <th className="py-2 pr-2 text-right">Missed</th>
-                </tr>
-              </thead>
-              <tbody>
-                {officerProd.length === 0 ? (
-                  <tr><td colSpan={6} className="py-4 text-center text-gray-400">No activity.</td></tr>
-                ) : officerProd.map((o, i) => (
-                  <tr key={i} className="border-b">
-                    <td className="py-1.5 pr-2">{o.officer || "—"}</td>
-                    <td className="py-1.5 pr-2 text-right">{o.entries}</td>
-                    <td className="py-1.5 pr-2 text-right font-medium text-teal-700">{formatLakhs(o.collected || 0)}</td>
-                    <td className="py-1.5 pr-2 text-right">{o.ptps || 0}</td>
-                    <td className="py-1.5 pr-2 text-right text-green-700">{o.ptpsPaid || 0}</td>
-                    <td className="py-1.5 pr-2 text-right text-red-600">{o.ptpsMissed || 0}</td>
+            <SortableSection initialKey="collected" initialDir="desc" render={sort => (
+              <table className="w-full text-xs">
+                <thead className="sticky top-0 bg-white shadow-sm">
+                  <tr className="text-left text-gray-500 border-b">
+                    <th className="py-2 pr-2">{sort.header("officer", "Officer")}</th>
+                    <th className="py-2 pr-2 text-right">{sort.header("entries", "Entries")}</th>
+                    <th className="py-2 pr-2 text-right">{sort.header("collected", "Collected")}</th>
+                    <th className="py-2 pr-2 text-right">{sort.header("ptps", "PTPs")}</th>
+                    <th className="py-2 pr-2 text-right">{sort.header("ptpsPaid", "Paid")}</th>
+                    <th className="py-2 pr-2 text-right">{sort.header("ptpsMissed", "Missed")}</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {(() => {
+                    const sortedOfficers = sort.apply(officerProd);
+                    if (sortedOfficers.length === 0) {
+                      return <tr><td colSpan={6} className="py-4 text-center text-gray-400">No activity.</td></tr>;
+                    }
+                    return sortedOfficers.map((o, i) => (
+                      <tr key={i} className="border-b">
+                        <td className="py-1.5 pr-2">{o.officer || "—"}</td>
+                        <td className="py-1.5 pr-2 text-right">{o.entries}</td>
+                        <td className="py-1.5 pr-2 text-right font-medium text-teal-700">{formatLakhs(o.collected || 0)}</td>
+                        <td className="py-1.5 pr-2 text-right">{o.ptps || 0}</td>
+                        <td className="py-1.5 pr-2 text-right text-green-700">{o.ptpsPaid || 0}</td>
+                        <td className="py-1.5 pr-2 text-right text-red-600">{o.ptpsMissed || 0}</td>
+                      </tr>
+                    ));
+                  })()}
+                </tbody>
+              </table>
+            )} />
           </div>
         </div>
       </div>
@@ -1265,39 +1346,45 @@ export function CollectionDashboard({ user, entries, branches }) {
               className="text-xs text-teal-700 flex items-center gap-1"><Download size={12} /> CSV</button>
           </div>
           <div className="overflow-y-auto max-h-80">
-            <table className="w-full text-xs">
-              <thead className="sticky top-0 bg-white">
-                <tr className="text-left text-gray-500 border-b">
-                  <th className="py-2 pr-2">Customer</th>
-                  <th className="py-2 pr-2">Branch</th>
-                  <th className="py-2 pr-2 text-right">Foreclosure</th>
-                  <th className="py-2 pr-2 text-right">Orig. Loan</th>
-                  <th className="py-2 pr-2 text-right">DPD</th>
-                </tr>
-              </thead>
-              <tbody>
-                {foreOpp.length === 0 ? (
-                  <tr><td colSpan={5} className="py-4 text-center text-gray-400">None.</td></tr>
-                ) : foreOpp.slice(0, 100).map((f, i) => (
-                  <tr key={i} className="border-b hover:bg-teal-50/50 cursor-pointer"
-                      onClick={() => openDrill({
-                        branch: f.branch,
-                        from: fromDate, to: toDate,
-                        title: f.customer_name || f.loan_account_no,
-                        subtitle: `Foreclosure candidate · ${f.branch}`,
-                      })}>
-                    <td className="py-1.5 pr-2">
-                      <div className="font-medium">{f.customer_name || "—"}</div>
-                      <div className="text-[10px] text-gray-400">{f.loan_account_no}</div>
-                    </td>
-                    <td className="py-1.5 pr-2">{f.branch}</td>
-                    <td className="py-1.5 pr-2 text-right font-medium text-teal-700">{formatINR(f.foreclosure_value)}</td>
-                    <td className="py-1.5 pr-2 text-right text-gray-500">{formatINR(f.loan_amount)}</td>
-                    <td className="py-1.5 pr-2 text-right">{f.overdue_days || 0}</td>
+            <SortableSection initialKey="dpd" initialDir="desc" render={sort => (
+              <table className="w-full text-xs">
+                <thead className="sticky top-0 bg-white">
+                  <tr className="text-left text-gray-500 border-b">
+                    <th className="py-2 pr-2">{sort.header("customer", "Customer")}</th>
+                    <th className="py-2 pr-2">{sort.header("branch", "Branch")}</th>
+                    <th className="py-2 pr-2 text-right">{sort.header("foreclosure", "Foreclosure")}</th>
+                    <th className="py-2 pr-2 text-right">{sort.header("originalLoan", "Orig. Loan")}</th>
+                    <th className="py-2 pr-2 text-right">{sort.header("dpd", "DPD")}</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {(() => {
+                    const sortedFore = sort.apply(foreOpp.slice(0, 100));
+                    if (sortedFore.length === 0) {
+                      return <tr><td colSpan={5} className="py-4 text-center text-gray-400">None.</td></tr>;
+                    }
+                    return sortedFore.map((f, i) => (
+                      <tr key={i} className="border-b hover:bg-teal-50/50 cursor-pointer"
+                          onClick={() => openDrill({
+                            branch: f.branch,
+                            from: fromDate, to: toDate,
+                            title: f.customer_name || f.loan_account_no,
+                            subtitle: `Foreclosure candidate · ${f.branch}`,
+                          })}>
+                        <td className="py-1.5 pr-2">
+                          <div className="font-medium">{f.customer_name || "—"}</div>
+                          <div className="text-[10px] text-gray-400">{f.loan_account_no}</div>
+                        </td>
+                        <td className="py-1.5 pr-2">{f.branch}</td>
+                        <td className="py-1.5 pr-2 text-right font-medium text-teal-700">{formatINR(f.foreclosure_value)}</td>
+                        <td className="py-1.5 pr-2 text-right text-gray-500">{formatINR(f.loan_amount)}</td>
+                        <td className="py-1.5 pr-2 text-right">{f.overdue_days || 0}</td>
+                      </tr>
+                    ));
+                  })()}
+                </tbody>
+              </table>
+            )} />
           </div>
         </div>
 
@@ -1311,50 +1398,56 @@ export function CollectionDashboard({ user, entries, branches }) {
               className="text-xs text-teal-700 flex items-center gap-1"><Download size={12} /> CSV</button>
           </div>
           <div className="overflow-y-auto max-h-80">
-            <table className="w-full text-xs">
-              <thead className="sticky top-0 bg-white">
-                <tr className="text-left text-gray-500 border-b">
-                  <th className="py-2 pr-2">Customer</th>
-                  <th className="py-2 pr-2">Branch</th>
-                  <th className="py-2 pr-2 text-right">DPD</th>
-                  <th className="py-2 pr-2 text-right">Overdue</th>
-                </tr>
-              </thead>
-              <tbody>
-                {nonContact.length === 0 ? (
-                  <tr><td colSpan={4} className="py-4 text-center text-gray-400">None.</td></tr>
-                ) : nonContact.slice(0, 100).map((n, i) => (
-                  <tr key={i} className="border-b hover:bg-amber-50/50 cursor-pointer"
-                      onClick={() => openDrill({
-                        branch: n.branch,
-                        from: fromDate, to: toDate,
-                        title: n.customer_name || n.loan_account_no,
-                        subtitle: `Non-contactable · ${n.branch}`,
-                      })}>
-                    <td className="py-1.5 pr-2">
-                      <div className="font-medium">{n.customer_name || "—"}</div>
-                      <div className="text-[10px] text-gray-400">{n.loan_account_no}</div>
-                    </td>
-                    <td className="py-1.5 pr-2">{n.branch}</td>
-                    <td className="py-1.5 pr-2 text-right">{n.overdue_days || 0}</td>
-                    <td className="py-1.5 pr-2 text-right font-medium">{formatINR(n.overdue_amount)}</td>
+            <SortableSection initialKey="overdue_days" initialDir="desc" render={sort => (
+              <table className="w-full text-xs">
+                <thead className="sticky top-0 bg-white">
+                  <tr className="text-left text-gray-500 border-b">
+                    <th className="py-2 pr-2">{sort.header("customer_name", "Customer")}</th>
+                    <th className="py-2 pr-2">{sort.header("branch", "Branch")}</th>
+                    <th className="py-2 pr-2 text-right">{sort.header("overdue_days", "DPD")}</th>
+                    <th className="py-2 pr-2 text-right">{sort.header("overdue_amount", "Overdue")}</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {(() => {
+                    const sortedNonContact = sort.apply(nonContact.slice(0, 100));
+                    if (sortedNonContact.length === 0) {
+                      return <tr><td colSpan={4} className="py-4 text-center text-gray-400">None.</td></tr>;
+                    }
+                    return sortedNonContact.map((n, i) => (
+                      <tr key={i} className="border-b hover:bg-amber-50/50 cursor-pointer"
+                          onClick={() => openDrill({
+                            branch: n.branch,
+                            from: fromDate, to: toDate,
+                            title: n.customer_name || n.loan_account_no,
+                            subtitle: `Non-contactable · ${n.branch}`,
+                          })}>
+                        <td className="py-1.5 pr-2">
+                          <div className="font-medium">{n.customer_name || "—"}</div>
+                          <div className="text-[10px] text-gray-400">{n.loan_account_no}</div>
+                        </td>
+                        <td className="py-1.5 pr-2">{n.branch}</td>
+                        <td className="py-1.5 pr-2 text-right">{n.overdue_days || 0}</td>
+                        <td className="py-1.5 pr-2 text-right font-medium">{formatINR(n.overdue_amount)}</td>
+                      </tr>
+                    ));
+                  })()}
+                </tbody>
+              </table>
+            )} />
           </div>
         </div>
       </div>
       </>
       )}
 
-      {tab === "branches"   && <BranchPerformanceView openDrill={openDrill} />}
-      {tab === "products"   && <ProductPerformanceView openDrill={openDrill} />}
-      {tab === "efficiency" && <CollectionEfficiencyView branches={branches} openDrill={openDrill} />}
-      {tab === "monthly"    && <MonthlyCollectionsView openDrill={openDrill} />}
-      {tab === "scorecard"  && <OfficerScorecardView openDrill={openDrill} />}
-      {tab === "daily"      && <DailyCollectionsView branches={branches} openDrill={openDrill} />}
-      {tab === "risk"       && <RiskTriageView openDrill={openDrill} />}
+      {tab === "branches"   && <BranchPerformanceView category={category} openDrill={openDrill} />}
+      {tab === "products"   && <ProductPerformanceView category={category} openDrill={openDrill} />}
+      {tab === "efficiency" && <CollectionEfficiencyView category={category} branches={branches} openDrill={openDrill} />}
+      {tab === "monthly"    && <MonthlyCollectionsView category={category} openDrill={openDrill} />}
+      {tab === "scorecard"  && <OfficerScorecardView category={category} openDrill={openDrill} />}
+      {tab === "daily"      && <DailyCollectionsView category={category} branches={branches} openDrill={openDrill} />}
+      {tab === "risk"       && <RiskTriageView category={category} openDrill={openDrill} />}
 
       {/* Shared drilldown drawer */}
       <DrilldownDrawer slice={drill} onClose={closeDrill} />
@@ -1559,12 +1652,12 @@ function DrilldownDrawer({ slice, onClose }) {
                   <tr className="text-left text-gray-500 border-b">
                     <th className="py-2 pr-2">{sortBtn("customer_name", "Customer / Loan")}</th>
                     <th className="py-2 pr-2">{sortBtn("branch_name", "Branch")}</th>
-                    <th className="py-2 pr-2">Officer</th>
-                    <th className="py-2 pr-2">Product</th>
+                    <th className="py-2 pr-2">{sortBtn("officer_name", "Officer")}</th>
+                    <th className="py-2 pr-2">{sortBtn("product_name", "Product")}</th>
                     <th className="py-2 pr-2 text-right">{sortBtn("principal_outstanding", "Principal O/S")}</th>
                     <th className="py-2 pr-2 text-right">{sortBtn("total_overdue", "Total OD")}</th>
                     <th className="py-2 pr-2 text-right">{sortBtn("cePct", "CE%")}</th>
-                    <th className="py-2 pr-2">Phone</th>
+                    <th className="py-2 pr-2">{sortBtn("mobile_number", "Phone")}</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -1625,43 +1718,49 @@ function DrilldownDrawer({ slice, onClose }) {
 
           {!loading && tab === "receipts" && (
             <div className="overflow-x-auto">
-              <table className="w-full text-xs">
-                <thead className="sticky top-0 bg-white shadow-sm">
-                  <tr className="text-left text-gray-500 border-b">
-                    <th className="py-2 pr-2">Date</th>
-                    <th className="py-2 pr-2">Receipt</th>
-                    <th className="py-2 pr-2">Customer / Loan</th>
-                    <th className="py-2 pr-2">Branch</th>
-                    <th className="py-2 pr-2">Mode</th>
-                    <th className="py-2 pr-2 text-right">Amount</th>
-                    <th className="py-2 pr-2">Officer</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {receipts.length === 0 ? (
-                    <tr><td colSpan={7} className="py-6 text-center text-gray-400">No receipts.</td></tr>
-                  ) : receipts.map((r, i) => (
-                    <tr key={r.receipt_no + "-" + i} className="border-b hover:bg-gray-50">
-                      <td className="py-1.5 pr-2 text-gray-600">{formatDateDMY(r.payment_date)}</td>
-                      <td className="py-1.5 pr-2 font-mono text-[10px] text-gray-500">{r.receipt_no}</td>
-                      <td className="py-1.5 pr-2">
-                        <div className="font-medium">{r.customer_name || "—"}</div>
-                        <div className="text-[10px] text-gray-400">{r.loan_account_no}</div>
-                      </td>
-                      <td className="py-1.5 pr-2">{r.branch_name || "—"}</td>
-                      <td className="py-1.5 pr-2">
-                        <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${
-                          (r.mode || "").toUpperCase() === "CASH" ? "bg-amber-100 text-amber-800" :
-                          ["UPI","DIGITAL","ONLINE"].includes((r.mode || "").toUpperCase()) ? "bg-emerald-100 text-emerald-800" :
-                          "bg-indigo-100 text-indigo-800"
-                        }`}>{r.mode || "—"}</span>
-                      </td>
-                      <td className="py-1.5 pr-2 text-right font-semibold text-teal-700">{formatINR(r.amount)}</td>
-                      <td className="py-1.5 pr-2 text-gray-600">{r.payment_officer_name || "—"}</td>
+              <SortableSection initialKey="payment_date" initialDir="desc" render={sort => (
+                <table className="w-full text-xs">
+                  <thead className="sticky top-0 bg-white shadow-sm">
+                    <tr className="text-left text-gray-500 border-b">
+                      <th className="py-2 pr-2">{sort.header("payment_date", "Date")}</th>
+                      <th className="py-2 pr-2">{sort.header("receipt_no", "Receipt")}</th>
+                      <th className="py-2 pr-2">{sort.header("customer_name", "Customer / Loan")}</th>
+                      <th className="py-2 pr-2">{sort.header("branch_name", "Branch")}</th>
+                      <th className="py-2 pr-2">{sort.header("mode", "Mode")}</th>
+                      <th className="py-2 pr-2 text-right">{sort.header("amount", "Amount")}</th>
+                      <th className="py-2 pr-2">{sort.header("payment_officer_name", "Officer")}</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {(() => {
+                      const sortedReceipts = sort.apply(receipts);
+                      if (sortedReceipts.length === 0) {
+                        return <tr><td colSpan={7} className="py-6 text-center text-gray-400">No receipts.</td></tr>;
+                      }
+                      return sortedReceipts.map((r, i) => (
+                        <tr key={r.receipt_no + "-" + i} className="border-b hover:bg-gray-50">
+                          <td className="py-1.5 pr-2 text-gray-600">{formatDateDMY(r.payment_date)}</td>
+                          <td className="py-1.5 pr-2 font-mono text-[10px] text-gray-500">{r.receipt_no}</td>
+                          <td className="py-1.5 pr-2">
+                            <div className="font-medium">{r.customer_name || "—"}</div>
+                            <div className="text-[10px] text-gray-400">{r.loan_account_no}</div>
+                          </td>
+                          <td className="py-1.5 pr-2">{r.branch_name || "—"}</td>
+                          <td className="py-1.5 pr-2">
+                            <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${
+                              (r.mode || "").toUpperCase() === "CASH" ? "bg-amber-100 text-amber-800" :
+                              ["UPI","DIGITAL","ONLINE"].includes((r.mode || "").toUpperCase()) ? "bg-emerald-100 text-emerald-800" :
+                              "bg-indigo-100 text-indigo-800"
+                            }`}>{r.mode || "—"}</span>
+                          </td>
+                          <td className="py-1.5 pr-2 text-right font-semibold text-teal-700">{formatINR(r.amount)}</td>
+                          <td className="py-1.5 pr-2 text-gray-600">{r.payment_officer_name || "—"}</td>
+                        </tr>
+                      ));
+                    })()}
+                  </tbody>
+                </table>
+              )} />
             </div>
           )}
         </div>
@@ -1686,7 +1785,7 @@ function Stat({ label, value, tone }) {
 // ─── CollectionEfficiencyView ──────────────────────────────────────────────
 // Demand vs Collected for a period, grouped by branch/officer/product/funder/center.
 // The headline CE% is the number lenders care about; the breakdown is the drill-down.
-function CollectionEfficiencyView({ openDrill }) {
+function CollectionEfficiencyView({ category, openDrill }) {
   const { periods, latest } = useLatestPeriod();
   const [period, setPeriod] = useState({ start: "", end: "" });
   const [groupBy, setGroupBy] = useState("branch");
@@ -1704,17 +1803,18 @@ function CollectionEfficiencyView({ openDrill }) {
     if (!period.start || !period.end) return;
     setLoading(true);
     try {
+      const catPart = category ? `&category=${encodeURIComponent(category)}` : "";
       const qs = `periodStart=${period.start}&periodEnd=${period.end}`;
       const [ce, fm, rv] = await Promise.all([
-        fetch(`${API_BASE}/od/analytics/collection-efficiency?${qs}&groupBy=${groupBy}`).then(r => r.json()).catch(() => null),
-        fetch(`${API_BASE}/od/analytics/funder-mix?${qs}`).then(r => r.json()).catch(() => ({ rows: [] })),
-        fetch(`${API_BASE}/od/analytics/recovery-velocity?${qs}&limit=50`).then(r => r.json()).catch(() => ({ rows: [] })),
+        fetch(`${API_BASE}/od/analytics/collection-efficiency?${qs}&groupBy=${groupBy}${catPart}`).then(r => r.json()).catch(() => null),
+        fetch(`${API_BASE}/od/analytics/funder-mix?${qs}${catPart}`).then(r => r.json()).catch(() => ({ rows: [] })),
+        fetch(`${API_BASE}/od/analytics/recovery-velocity?${qs}&limit=50${catPart}`).then(r => r.json()).catch(() => ({ rows: [] })),
       ]);
       setData(ce);
       setFunderMix(Array.isArray(fm?.rows) ? fm.rows : []);
       setRecovery(Array.isArray(rv?.rows) ? rv.rows : []);
     } finally { setLoading(false); }
-  }, [period.start, period.end, groupBy]);
+  }, [period.start, period.end, groupBy, category]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -1854,49 +1954,53 @@ function CollectionEfficiencyView({ openDrill }) {
           <span className="text-xs text-gray-500">{breakdown.length.toLocaleString()} rows</span>
         </div>
         <div className="overflow-x-auto max-h-96 overflow-y-auto">
-          <table className="w-full text-xs">
-            <thead className="sticky top-0 bg-gray-50 text-gray-600 uppercase text-[10px]">
-              <tr>
-                <th className="text-left px-4 py-2">{groupBy.charAt(0).toUpperCase() + groupBy.slice(1)}</th>
-                <th className="text-right px-4 py-2">Accts</th>
-                <th className="text-right px-4 py-2">Demand</th>
-                <th className="text-right px-4 py-2">Collected</th>
-                <th className="text-right px-4 py-2">CE%</th>
-                <th className="text-right px-4 py-2">Prin. Overdue</th>
-                <th className="text-right px-4 py-2">Int. Overdue</th>
-              </tr>
-            </thead>
-            <tbody>
-              {breakdown.length === 0 ? (
-                <tr><td colSpan={7} className="text-center text-gray-400 py-6">No data for selected period.</td></tr>
-              ) : breakdown.map((r, i) => {
-                // Map groupBy → drilldown slice key
-                const slice = {
-                  periodStart: period.start, periodEnd: period.end,
-                  from: period.start, to: period.end,
-                  title: `${groupBy.charAt(0).toUpperCase() + groupBy.slice(1)}: ${r.label}`,
-                  subtitle: `${formatDateDMY(period.start)} → ${formatDateDMY(period.end)} · CE% ${formatPct(r.cePct, 1)}`,
-                };
-                if (groupBy === "branch")  slice.branch = r.label;
-                if (groupBy === "product") slice.product = r.label;
-                // officer/funder/center not supported in drilldown filter today; click still opens a branch-less drill.
-                const drillable = groupBy === "branch" || groupBy === "product";
-                return (
-                  <tr key={i}
-                      onClick={drillable && openDrill ? () => openDrill(slice) : undefined}
-                      className={`border-t hover:bg-gray-50 ${drillable ? "cursor-pointer" : ""}`}>
-                    <td className="px-4 py-1.5 font-medium text-gray-800">{r.label}</td>
-                    <td className="px-4 py-1.5 text-right">{(r.accounts || 0).toLocaleString()}</td>
-                    <td className="px-4 py-1.5 text-right">{formatLakhs(r.demand)}</td>
-                    <td className="px-4 py-1.5 text-right text-teal-700 font-medium">{formatLakhs(r.collected)}</td>
-                    <td className={`px-4 py-1.5 text-right font-semibold ${ceColor(r.cePct)}`}>{formatPct(r.cePct)}</td>
-                    <td className="px-4 py-1.5 text-right text-red-600">{formatLakhs(r.principal_overdue)}</td>
-                    <td className="px-4 py-1.5 text-right text-amber-600">{formatLakhs(r.interest_overdue)}</td>
-                  </tr>
-                );
-              })}
-            </tbody>
-          </table>
+          <SortableSection initialKey="collected" initialDir="desc" render={sort => (
+            <table className="w-full text-xs">
+              <thead className="sticky top-0 bg-gray-50 text-gray-600 uppercase text-[10px]">
+                <tr>
+                  <th className="text-left px-4 py-2">{sort.header("label", groupBy.charAt(0).toUpperCase() + groupBy.slice(1))}</th>
+                  <th className="text-right px-4 py-2">{sort.header("accounts", "Accts")}</th>
+                  <th className="text-right px-4 py-2">{sort.header("demand", "Demand")}</th>
+                  <th className="text-right px-4 py-2">{sort.header("collected", "Collected")}</th>
+                  <th className="text-right px-4 py-2">{sort.header("cePct", "CE%")}</th>
+                  <th className="text-right px-4 py-2">{sort.header("principal_overdue", "Prin. Overdue")}</th>
+                  <th className="text-right px-4 py-2">{sort.header("interest_overdue", "Int. Overdue")}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(() => {
+                  const sortedBreakdown = sort.apply(breakdown);
+                  if (sortedBreakdown.length === 0) {
+                    return <tr><td colSpan={7} className="text-center text-gray-400 py-6">No data for selected period.</td></tr>;
+                  }
+                  return sortedBreakdown.map((r, i) => {
+                    const slice = {
+                      periodStart: period.start, periodEnd: period.end,
+                      from: period.start, to: period.end,
+                      title: `${groupBy.charAt(0).toUpperCase() + groupBy.slice(1)}: ${r.label}`,
+                      subtitle: `${formatDateDMY(period.start)} → ${formatDateDMY(period.end)} · CE% ${formatPct(r.cePct, 1)}`,
+                    };
+                    if (groupBy === "branch")  slice.branch = r.label;
+                    if (groupBy === "product") slice.product = r.label;
+                    const drillable = groupBy === "branch" || groupBy === "product";
+                    return (
+                      <tr key={i}
+                          onClick={drillable && openDrill ? () => openDrill(slice) : undefined}
+                          className={`border-t hover:bg-gray-50 ${drillable ? "cursor-pointer" : ""}`}>
+                        <td className="px-4 py-1.5 font-medium text-gray-800">{r.label}</td>
+                        <td className="px-4 py-1.5 text-right">{(r.accounts || 0).toLocaleString()}</td>
+                        <td className="px-4 py-1.5 text-right">{formatLakhs(r.demand)}</td>
+                        <td className="px-4 py-1.5 text-right text-teal-700 font-medium">{formatLakhs(r.collected)}</td>
+                        <td className={`px-4 py-1.5 text-right font-semibold ${ceColor(r.cePct)}`}>{formatPct(r.cePct)}</td>
+                        <td className="px-4 py-1.5 text-right text-red-600">{formatLakhs(r.principal_overdue)}</td>
+                        <td className="px-4 py-1.5 text-right text-amber-600">{formatLakhs(r.interest_overdue)}</td>
+                      </tr>
+                    );
+                  });
+                })()}
+              </tbody>
+            </table>
+          )} />
         </div>
       </div>
 
@@ -1912,32 +2016,38 @@ function CollectionEfficiencyView({ openDrill }) {
               className="text-xs text-teal-700 flex items-center gap-1"><Download size={12} /> CSV</button>
           </div>
           <div className="overflow-y-auto max-h-72">
-            <table className="w-full text-xs">
-              <thead className="sticky top-0 bg-white">
-                <tr className="text-left text-gray-500 border-b">
-                  <th className="py-2 pr-2">Funder</th>
-                  <th className="py-2 pr-2">Fund Source</th>
-                  <th className="py-2 pr-2 text-right">POS End</th>
-                  <th className="py-2 pr-2 text-right">Demand</th>
-                  <th className="py-2 pr-2 text-right">Collected</th>
-                  <th className="py-2 pr-2 text-right">CE%</th>
-                </tr>
-              </thead>
-              <tbody>
-                {funderMix.length === 0 ? (
-                  <tr><td colSpan={6} className="py-4 text-center text-gray-400">None.</td></tr>
-                ) : funderMix.map((f, i) => (
-                  <tr key={i} className="border-b">
-                    <td className="py-1.5 pr-2 font-medium">{f.funder}</td>
-                    <td className="py-1.5 pr-2 text-gray-600">{f.fund_source}</td>
-                    <td className="py-1.5 pr-2 text-right">{formatLakhs(f.principal_outstanding_end)}</td>
-                    <td className="py-1.5 pr-2 text-right">{formatLakhs(f.demand)}</td>
-                    <td className="py-1.5 pr-2 text-right text-teal-700">{formatLakhs(f.collected)}</td>
-                    <td className={`py-1.5 pr-2 text-right font-semibold ${ceColor(f.cePct)}`}>{formatPct(f.cePct)}</td>
+            <SortableSection initialKey="collected" initialDir="desc" render={sort => (
+              <table className="w-full text-xs">
+                <thead className="sticky top-0 bg-white">
+                  <tr className="text-left text-gray-500 border-b">
+                    <th className="py-2 pr-2">{sort.header("funder", "Funder")}</th>
+                    <th className="py-2 pr-2">{sort.header("fund_source", "Fund Source")}</th>
+                    <th className="py-2 pr-2 text-right">{sort.header("principal_outstanding_end", "POS End")}</th>
+                    <th className="py-2 pr-2 text-right">{sort.header("demand", "Demand")}</th>
+                    <th className="py-2 pr-2 text-right">{sort.header("collected", "Collected")}</th>
+                    <th className="py-2 pr-2 text-right">{sort.header("cePct", "CE%")}</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {(() => {
+                    const sortedFunder = sort.apply(funderMix);
+                    if (sortedFunder.length === 0) {
+                      return <tr><td colSpan={6} className="py-4 text-center text-gray-400">None.</td></tr>;
+                    }
+                    return sortedFunder.map((f, i) => (
+                      <tr key={i} className="border-b">
+                        <td className="py-1.5 pr-2 font-medium">{f.funder}</td>
+                        <td className="py-1.5 pr-2 text-gray-600">{f.fund_source}</td>
+                        <td className="py-1.5 pr-2 text-right">{formatLakhs(f.principal_outstanding_end)}</td>
+                        <td className="py-1.5 pr-2 text-right">{formatLakhs(f.demand)}</td>
+                        <td className="py-1.5 pr-2 text-right text-teal-700">{formatLakhs(f.collected)}</td>
+                        <td className={`py-1.5 pr-2 text-right font-semibold ${ceColor(f.cePct)}`}>{formatPct(f.cePct)}</td>
+                      </tr>
+                    ));
+                  })()}
+                </tbody>
+              </table>
+            )} />
           </div>
         </div>
 
@@ -1951,33 +2061,39 @@ function CollectionEfficiencyView({ openDrill }) {
               className="text-xs text-teal-700 flex items-center gap-1"><Download size={12} /> CSV</button>
           </div>
           <div className="overflow-y-auto max-h-72">
-            <table className="w-full text-xs">
-              <thead className="sticky top-0 bg-white">
-                <tr className="text-left text-gray-500 border-b">
-                  <th className="py-2 pr-2">Customer</th>
-                  <th className="py-2 pr-2">Branch</th>
-                  <th className="py-2 pr-2 text-right">POS Start</th>
-                  <th className="py-2 pr-2 text-right">POS End</th>
-                  <th className="py-2 pr-2 text-right">Reduced</th>
-                </tr>
-              </thead>
-              <tbody>
-                {recovery.length === 0 ? (
-                  <tr><td colSpan={5} className="py-4 text-center text-gray-400">None.</td></tr>
-                ) : recovery.map((r, i) => (
-                  <tr key={i} className="border-b">
-                    <td className="py-1.5 pr-2">
-                      <div className="font-medium">{r.customer_name || "—"}</div>
-                      <div className="text-[10px] text-gray-400">{r.loan_account_no}</div>
-                    </td>
-                    <td className="py-1.5 pr-2">{r.branch_name}</td>
-                    <td className="py-1.5 pr-2 text-right text-gray-500">{formatLakhs(r.principal_outstanding_start)}</td>
-                    <td className="py-1.5 pr-2 text-right">{formatLakhs(r.principal_outstanding_end)}</td>
-                    <td className="py-1.5 pr-2 text-right font-semibold text-emerald-700">{formatLakhs(r.principal_reduced)}</td>
+            <SortableSection initialKey="principal_reduction" initialDir="desc" render={sort => (
+              <table className="w-full text-xs">
+                <thead className="sticky top-0 bg-white">
+                  <tr className="text-left text-gray-500 border-b">
+                    <th className="py-2 pr-2">{sort.header("customer_name", "Customer")}</th>
+                    <th className="py-2 pr-2">{sort.header("branch_name", "Branch")}</th>
+                    <th className="py-2 pr-2 text-right">{sort.header("principal_start", "POS Start")}</th>
+                    <th className="py-2 pr-2 text-right">{sort.header("principal_end", "POS End")}</th>
+                    <th className="py-2 pr-2 text-right">{sort.header("principal_reduction", "Reduced")}</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {(() => {
+                    const sortedRecovery = sort.apply(recovery);
+                    if (sortedRecovery.length === 0) {
+                      return <tr><td colSpan={5} className="py-4 text-center text-gray-400">None.</td></tr>;
+                    }
+                    return sortedRecovery.map((r, i) => (
+                      <tr key={i} className="border-b">
+                        <td className="py-1.5 pr-2">
+                          <div className="font-medium">{r.customer_name || "—"}</div>
+                          <div className="text-[10px] text-gray-400">{r.loan_account_no}</div>
+                        </td>
+                        <td className="py-1.5 pr-2">{r.branch_name}</td>
+                        <td className="py-1.5 pr-2 text-right text-gray-500">{formatLakhs(r.principal_outstanding_start)}</td>
+                        <td className="py-1.5 pr-2 text-right">{formatLakhs(r.principal_outstanding_end)}</td>
+                        <td className="py-1.5 pr-2 text-right font-semibold text-emerald-700">{formatLakhs(r.principal_reduced)}</td>
+                      </tr>
+                    ));
+                  })()}
+                </tbody>
+              </table>
+            )} />
           </div>
         </div>
       </div>
@@ -1997,7 +2113,7 @@ function CollectionEfficiencyView({ openDrill }) {
 //   4. Breakdown table (Branch / Product / Officer) for the selected month
 //
 // Read-only. No writes, no changes to ingest or any existing endpoint.
-function MonthlyCollectionsView({ openDrill }) {
+function MonthlyCollectionsView({ category, openDrill }) {
   const [months, setMonths]   = useState([]);
   const [loadingMonths, setLoadingMonths] = useState(false);
 
@@ -2010,7 +2126,8 @@ function MonthlyCollectionsView({ openDrill }) {
   const loadMonths = useCallback(async () => {
     setLoadingMonths(true);
     try {
-      const r = await fetch(`${API_BASE}/od/analytics/monthly-collections/summary`)
+      const catPart = category ? `?category=${encodeURIComponent(category)}` : "";
+      const r = await fetch(`${API_BASE}/od/analytics/monthly-collections/summary${catPart}`)
         .then(r => r.json()).catch(() => ({ months: [] }));
       const rows = Array.isArray(r?.months) ? r.months : [];
       setMonths(rows);
@@ -2019,7 +2136,7 @@ function MonthlyCollectionsView({ openDrill }) {
         setSelectedMonth(prev => prev || rows[0].year_month);
       }
     } finally { setLoadingMonths(false); }
-  }, []);
+  }, [category]);
 
   useEffect(() => { loadMonths(); }, [loadMonths]);
 
@@ -2028,12 +2145,13 @@ function MonthlyCollectionsView({ openDrill }) {
     if (!selectedMonth) { setBreakdown([]); return; }
     setLoadingBreakdown(true);
     try {
+      const catPart = category ? `&category=${encodeURIComponent(category)}` : "";
       const r = await fetch(
-        `${API_BASE}/od/analytics/monthly-collections/breakdown?yearMonth=${encodeURIComponent(selectedMonth)}&groupBy=${groupBy}`
+        `${API_BASE}/od/analytics/monthly-collections/breakdown?yearMonth=${encodeURIComponent(selectedMonth)}&groupBy=${groupBy}${catPart}`
       ).then(r => r.json()).catch(() => ({ rows: [] }));
       setBreakdown(Array.isArray(r?.rows) ? r.rows : []);
     } finally { setLoadingBreakdown(false); }
-  }, [selectedMonth, groupBy]);
+  }, [selectedMonth, groupBy, category]);
 
   useEffect(() => { loadBreakdown(); }, [loadBreakdown]);
 
@@ -2240,7 +2358,7 @@ function MonthlyCollectionsView({ openDrill }) {
 // Merges owned-book (from client-period, keyed on officer_code = relationship officer)
 // with posted receipts (from od_collections, keyed on payment_officer_code = who
 // physically collected). Cash % flags officers with heavy cash exposure.
-function OfficerScorecardView({ openDrill }) {
+function OfficerScorecardView({ category, openDrill }) {
   const { periods, latest } = useLatestPeriod();
   const [period, setPeriod] = useState({ start: "", end: "" });
   const [rows, setRows] = useState([]);
@@ -2257,10 +2375,11 @@ function OfficerScorecardView({ openDrill }) {
     if (!period.start || !period.end) return;
     setLoading(true);
     try {
-      const j = await fetch(`${API_BASE}/od/analytics/officer-scorecard?periodStart=${period.start}&periodEnd=${period.end}`).then(r => r.json());
+      const catPart = category ? `&category=${encodeURIComponent(category)}` : "";
+      const j = await fetch(`${API_BASE}/od/analytics/officer-scorecard?periodStart=${period.start}&periodEnd=${period.end}${catPart}`).then(r => r.json());
       setRows(Array.isArray(j?.rows) ? j.rows : []);
     } finally { setLoading(false); }
-  }, [period.start, period.end]);
+  }, [period.start, period.end, category]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -2441,7 +2560,7 @@ function OfficerScorecardView({ openDrill }) {
 // ─── DailyCollectionsView ──────────────────────────────────────────────────
 // Day-by-day rupees collected with stacked mode breakdown + branch leaderboard
 // + overall mode mix pie. Highlights missed days in the selected window.
-function DailyCollectionsView({ branches, openDrill }) {
+function DailyCollectionsView({ category, branches, openDrill }) {
   const [from, setFrom] = useState(() => { const d = new Date(); d.setDate(d.getDate() - 30); return d.toISOString().slice(0, 10); });
   const [to, setTo] = useState(() => new Date().toISOString().slice(0, 10));
   const [branch, setBranch] = useState("");
@@ -2455,6 +2574,7 @@ function DailyCollectionsView({ branches, openDrill }) {
       if (from) p.set("from", from);
       if (to) p.set("to", to);
       if (branch) p.set("branch", branch);
+      if (category) p.set("category", category);
       const j = await fetch(`${API_BASE}/od/analytics/daily-collections?${p.toString()}`).then(r => r.json());
       setData({
         byDay: Array.isArray(j?.byDay) ? j.byDay : [],
@@ -2462,7 +2582,7 @@ function DailyCollectionsView({ branches, openDrill }) {
         modeMix: Array.isArray(j?.modeMix) ? j.modeMix : [],
       });
     } finally { setLoading(false); }
-  }, [from, to, branch]);
+  }, [from, to, branch, category]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -2685,7 +2805,7 @@ function DailyCollectionsView({ branches, openDrill }) {
 // ─── RiskTriageView ────────────────────────────────────────────────────────
 // NPA ageing + death-case tracker + installments-due distribution
 // — driven by the Overdue Report snapshot.
-function RiskTriageView({ openDrill }) {
+function RiskTriageView({ category, openDrill }) {
   const [snap, setSnap] = useState("");
   const [ageing, setAgeing] = useState(null);
   const [deaths, setDeaths] = useState(null);
@@ -2695,7 +2815,10 @@ function RiskTriageView({ openDrill }) {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const q = snap ? `?snapshotDate=${snap}` : "";
+      const params = new URLSearchParams();
+      if (snap) params.set("snapshotDate", snap);
+      if (category) params.set("category", category);
+      const q = params.toString() ? `?${params.toString()}` : "";
       const [ag, de, ins] = await Promise.all([
         fetch(`${API_BASE}/od/analytics/npa-ageing${q}`).then(r => r.json()).catch(() => null),
         fetch(`${API_BASE}/od/analytics/death-cases${q}`).then(r => r.json()).catch(() => null),
@@ -2704,7 +2827,7 @@ function RiskTriageView({ openDrill }) {
       setAgeing(ag); setDeaths(de); setInst(ins);
       if (!snap && ag?.snapshotDate) setSnap(ag.snapshotDate);
     } finally { setLoading(false); }
-  }, [snap]);
+  }, [snap, category]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -2946,7 +3069,7 @@ function RiskTriageView({ openDrill }) {
 
 // ─── BranchPerformanceView ─────────────────────────────────────────────────
 // Per-branch scorecard with click-through to customer-level detail.
-function BranchPerformanceView({ openDrill }) {
+function BranchPerformanceView({ category, openDrill }) {
   const { periods, latest } = useLatestPeriod();
   const [period, setPeriod] = useState({ start: "", end: "" });
   const [rows, setRows] = useState([]);
@@ -2963,10 +3086,11 @@ function BranchPerformanceView({ openDrill }) {
     if (!period.start || !period.end) return;
     setLoading(true);
     try {
-      const j = await fetch(`${API_BASE}/od/analytics/branch-scorecard?periodStart=${period.start}&periodEnd=${period.end}`).then(r => r.json());
+      const catPart = category ? `&category=${encodeURIComponent(category)}` : "";
+      const j = await fetch(`${API_BASE}/od/analytics/branch-scorecard?periodStart=${period.start}&periodEnd=${period.end}${catPart}`).then(r => r.json());
       setRows(Array.isArray(j?.rows) ? j.rows : []);
     } finally { setLoading(false); }
-  }, [period.start, period.end]);
+  }, [period.start, period.end, category]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -3198,7 +3322,7 @@ function BranchPerformanceView({ openDrill }) {
 // ─── ProductPerformanceView ────────────────────────────────────────────────
 // Per-product scorecard + collections-by-product mode mix + branch × product
 // CE% heatmap. Cells and rows are clickable to open the shared drilldown.
-function ProductPerformanceView({ openDrill }) {
+function ProductPerformanceView({ category, openDrill }) {
   const { periods, latest } = useLatestPeriod();
   const [period, setPeriod] = useState({ start: "", end: "" });
   const [rows, setRows] = useState([]);
@@ -3220,11 +3344,12 @@ function ProductPerformanceView({ openDrill }) {
     if (!period.start || !period.end) return;
     setLoading(true);
     try {
+      const catPart = category ? `&category=${encodeURIComponent(category)}` : "";
       const qs = `periodStart=${period.start}&periodEnd=${period.end}`;
       const [ps, cp, mx] = await Promise.all([
-        fetch(`${API_BASE}/od/analytics/product-scorecard?${qs}`).then(r => r.json()),
-        fetch(`${API_BASE}/od/analytics/collections-by-product?from=${period.start}&to=${period.end}`).then(r => r.json()),
-        fetch(`${API_BASE}/od/analytics/branch-product-matrix?${qs}`).then(r => r.json()),
+        fetch(`${API_BASE}/od/analytics/product-scorecard?${qs}${catPart}`).then(r => r.json()),
+        fetch(`${API_BASE}/od/analytics/collections-by-product?from=${period.start}&to=${period.end}${catPart}`).then(r => r.json()),
+        fetch(`${API_BASE}/od/analytics/branch-product-matrix?${qs}${catPart}`).then(r => r.json()),
       ]);
       setRows(Array.isArray(ps?.rows) ? ps.rows : []);
       setCollByProduct(Array.isArray(cp?.rows) ? cp.rows : []);
@@ -3234,7 +3359,7 @@ function ProductPerformanceView({ openDrill }) {
         matrix:   Array.isArray(mx?.matrix)   ? mx.matrix   : [],
       });
     } finally { setLoading(false); }
-  }, [period.start, period.end]);
+  }, [period.start, period.end, category]);
 
   useEffect(() => { load(); }, [load]);
 
