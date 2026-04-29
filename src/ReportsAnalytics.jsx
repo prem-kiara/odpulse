@@ -28,6 +28,7 @@ import {
   TrendingUp, Wallet, Receipt, Users, Filter, Info, Search,
   ChevronUp, ChevronDown, RefreshCw, Building2, Package,
 } from "lucide-react";
+import { usePagination, PaginationBar } from "./Pagination";
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 const formatINR = (n) => {
@@ -147,6 +148,66 @@ function SortHeader({ children, sortKey, currentKey, currentDir, onSort, align =
 }
 
 const PIE_COLORS = ["#0d9488", "#6366f1", "#f59e0b", "#ef4444", "#10b981", "#8b5cf6", "#ec4899", "#14b8a6", "#f43f5e", "#84cc16"];
+
+// ─── Customer-grouped list (used by the "Unique Customers" focused view) ──
+// Pulled out as its own component so we can use the usePagination hook
+// without breaking the rules-of-hooks (no conditional hook calls in the
+// parent component when this view isn't selected).
+function CustomerListView({ recent, summary, custSortKey, custSortDir, handleCustSort, formatINR, formatNum }) {
+  const arr = useMemo(() => {
+    const grouped = new Map();
+    for (const r of recent) {
+      const k = r.customer_number || r.customer_name || "-";
+      const cur = grouped.get(k) || { id: k, name: r.customer_name || "", branch: r.branch || "", loans: 0, total: 0 };
+      cur.loans += 1;
+      cur.total += Number(r.loan_amount) || 0;
+      grouped.set(k, cur);
+    }
+    const out = [...grouped.values()];
+    out.sort((a, b) => {
+      const av = a[custSortKey], bv = b[custSortKey];
+      const an = Number(av), bn = Number(bv);
+      const numeric = Number.isFinite(an) && Number.isFinite(bn) && av !== "" && bv !== "";
+      const cmp = numeric ? an - bn : String(av ?? "").localeCompare(String(bv ?? ""));
+      return custSortDir === "asc" ? cmp : -cmp;
+    });
+    return out;
+  }, [recent, custSortKey, custSortDir]);
+
+  const pg = usePagination(arr, 10);
+
+  return (
+    <SectionCard title="Unique Customers" subtitle={`${formatNum(summary.customerCount)} distinct customer IDs across the filtered disbursements`}>
+      <div className="overflow-x-auto rounded-lg border">
+        <table className="w-full text-xs">
+          <thead className="bg-gray-50">
+            <tr>
+              <SortHeader sortKey="id" currentKey={custSortKey} currentDir={custSortDir} onSort={handleCustSort}>Customer ID</SortHeader>
+              <SortHeader sortKey="name" currentKey={custSortKey} currentDir={custSortDir} onSort={handleCustSort}>Customer Name</SortHeader>
+              <SortHeader sortKey="branch" currentKey={custSortKey} currentDir={custSortDir} onSort={handleCustSort}>Branch</SortHeader>
+              <SortHeader sortKey="loans" currentKey={custSortKey} currentDir={custSortDir} onSort={handleCustSort} align="right">Loans</SortHeader>
+              <SortHeader sortKey="total" currentKey={custSortKey} currentDir={custSortDir} onSort={handleCustSort} align="right">Total Disbursed</SortHeader>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-gray-100">
+            {arr.length === 0 ? (
+              <tr><td colSpan={5} className="px-3 py-6 text-center text-gray-400">No customers in current filter.</td></tr>
+            ) : pg.pageRows.map(c => (
+              <tr key={c.id} className="hover:bg-gray-50">
+                <td className="px-3 py-2 font-mono text-gray-500">{c.id}</td>
+                <td className="px-3 py-2 font-medium text-gray-800">{c.name || "—"}</td>
+                <td className="px-3 py-2 text-gray-700">{c.branch || "—"}</td>
+                <td className="px-3 py-2 text-right">{c.loans}</td>
+                <td className="px-3 py-2 text-right font-semibold">{formatINR(c.total)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <PaginationBar {...pg} label="customers" />
+    </SectionCard>
+  );
+}
 
 // ─── main component ─────────────────────────────────────────────────────────
 export default function ReportsAnalytics({ user }) {
@@ -304,6 +365,11 @@ export default function ReportsAnalytics({ user }) {
     if (sortKey === key) setSortDir(d => d === "asc" ? "desc" : "asc");
     else { setSortKey(key); setSortDir("desc"); }
   };
+
+  // Pagination for the Recent Disbursements table — paginates the already
+  // sorted+filtered+search-narrowed list, so existing search/sort/filters
+  // continue to work unchanged.
+  const recentPg = usePagination(filteredRecent, 10);
 
   // ── exports ──
   const exportRowsForCSV = () =>
@@ -557,60 +623,18 @@ export default function ReportsAnalytics({ user }) {
         </SectionCard>
       )}
 
-      {/* Focused view — Customer-grouped list (sortable by any column, both
-          ascending and descending). Uses an independent sort state so it
-          doesn't interfere with the recent-disbursements table below. */}
-      {view === "customers" && (() => {
-        // Group recent disbursements by customer_number (build once per render).
-        const grouped = new Map();
-        for (const r of recent) {
-          const k = r.customer_number || r.customer_name || "-";
-          const cur = grouped.get(k) || { id: k, name: r.customer_name || "", branch: r.branch || "", loans: 0, total: 0 };
-          cur.loans += 1;
-          cur.total += Number(r.loan_amount) || 0;
-          grouped.set(k, cur);
-        }
-        const arr = [...grouped.values()].sort((a, b) => {
-          const av = a[custSortKey], bv = b[custSortKey];
-          const an = Number(av), bn = Number(bv);
-          const numeric = Number.isFinite(an) && Number.isFinite(bn) && av !== "" && bv !== "";
-          const cmp = numeric ? an - bn : String(av ?? "").localeCompare(String(bv ?? ""));
-          return custSortDir === "asc" ? cmp : -cmp;
-        });
-        return (
-          <SectionCard title="Unique Customers" subtitle={`${formatNum(summary.customerCount)} distinct customer IDs across the filtered disbursements`}>
-            <div className="overflow-x-auto rounded-lg border max-h-[500px] overflow-y-auto">
-              <table className="w-full text-xs">
-                <thead className="bg-gray-50 sticky top-0">
-                  <tr>
-                    <SortHeader sortKey="id" currentKey={custSortKey} currentDir={custSortDir} onSort={handleCustSort}>Customer ID</SortHeader>
-                    <SortHeader sortKey="name" currentKey={custSortKey} currentDir={custSortDir} onSort={handleCustSort}>Customer Name</SortHeader>
-                    <SortHeader sortKey="branch" currentKey={custSortKey} currentDir={custSortDir} onSort={handleCustSort}>Branch</SortHeader>
-                    <SortHeader sortKey="loans" currentKey={custSortKey} currentDir={custSortDir} onSort={handleCustSort} align="right">Loans</SortHeader>
-                    <SortHeader sortKey="total" currentKey={custSortKey} currentDir={custSortDir} onSort={handleCustSort} align="right">Total Disbursed</SortHeader>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-gray-100">
-                  {arr.length === 0 ? (
-                    <tr><td colSpan={5} className="px-3 py-6 text-center text-gray-400">No customers in current filter.</td></tr>
-                  ) : arr.map(c => (
-                    <tr key={c.id} className="hover:bg-gray-50">
-                      <td className="px-3 py-2 font-mono text-gray-500">{c.id}</td>
-                      <td className="px-3 py-2 font-medium text-gray-800">{c.name || "—"}</td>
-                      <td className="px-3 py-2 text-gray-700">{c.branch || "—"}</td>
-                      <td className="px-3 py-2 text-right">{c.loans}</td>
-                      <td className="px-3 py-2 text-right font-semibold">{formatINR(c.total)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-            <div className="text-[11px] text-gray-500 mt-2">
-              Showing {arr.length} unique customers · Click any column header to sort ascending/descending.
-            </div>
-          </SectionCard>
-        );
-      })()}
+      {/* Focused view — Customer-grouped list (sortable + paginated) */}
+      {view === "customers" && (
+        <CustomerListView
+          recent={recent}
+          summary={summary}
+          custSortKey={custSortKey}
+          custSortDir={custSortDir}
+          handleCustSort={handleCustSort}
+          formatINR={formatINR}
+          formatNum={formatNum}
+        />
+      )}
 
       {/* 5. Trend chart — overview + dates view */}
       {(view === "overview" || view === "dates") && (
@@ -743,7 +767,7 @@ export default function ReportsAnalytics({ user }) {
               {filteredRecent.length === 0 ? (
                 <tr><td colSpan={8} className="px-3 py-6 text-center text-gray-400">No disbursements match the current filters.</td></tr>
               ) : (
-                filteredRecent.map((r) => (
+                recentPg.pageRows.map((r) => (
                   <tr key={r.loan_account_no} className="hover:bg-gray-50">
                     <td className="px-3 py-2 text-gray-700">{r.disbursement_date_iso || "—"}</td>
                     <td className="px-3 py-2 font-medium text-gray-800">{r.customer_name || "—"}</td>
@@ -771,10 +795,7 @@ export default function ReportsAnalytics({ user }) {
             </tbody>
           </table>
         </div>
-        <div className="text-[11px] text-gray-500 mt-2">
-          Showing {filteredRecent.length} of {recent.length} disbursements
-          {search && <> · filtered by "<b>{search}</b>"</>}
-        </div>
+        <PaginationBar {...recentPg} label={search ? `disbursements (filtered by "${search}")` : "disbursements"} />
       </SectionCard>
 
       {/* 9. Reports — Export only (no upload here; OD Upload is the single write path) */}

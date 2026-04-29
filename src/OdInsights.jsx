@@ -970,10 +970,22 @@ export function CollectionDashboard({ user, entries, branches }) {
   const [ptpConv, setPtpConv] = useState(null);         // {totalPTPs, paid, pending, missed, conversionPct}
   const [loading, setLoading] = useState(false);
 
+  // Common query-string builder for all OD Insights metric endpoints.
+  // Forwards the user's date range (from/to) AND a `date` cursor (= toDate)
+  // so snapshot-based endpoints (DPD buckets, OD trend, non-contactable,
+  // foreclosure-opportunity) honor the selection too. Each endpoint reads
+  // only the params it needs and ignores the rest.
   const q = (params = {}) => {
     const p = new URLSearchParams();
     if (branchFilter) p.set("branch", branchFilter);
     if (category) p.set("category", category);
+    if (fromDate) p.set("from", fromDate);
+    if (toDate) {
+      p.set("to", toDate);
+      // `date` is the snapshot cursor for current-state metrics —
+      // pick the snapshot taken on or before the user's "To" date.
+      p.set("date", toDate);
+    }
     for (const [k, v] of Object.entries(params)) if (v != null && v !== "") p.set(k, v);
     return p.toString();
   };
