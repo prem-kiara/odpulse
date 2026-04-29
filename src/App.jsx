@@ -463,12 +463,16 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
     setAutoFilledFields(filled);
     setCustomerMatches([]);
     setLookupStatus("found");
-    if (c.phone) {
-      fetchCentersForPhone(c.phone);
-    } else if (c.loanAccountNo) {
-      // Closed-loan customers from the Foreclosure Report have no phone in
-      // the customers table; resolve their center via the loan number instead.
+    // Prefer LOAN-based center lookup over phone-based: a phone is sometimes
+    // shared by multiple customers (family members, co-applicants), and
+    // looking it up returns every center those customers belong to. Resolving
+    // by loan_account_no gives exactly the one center for THIS loan, which is
+    // what the user is recording an entry against. Phone is only the fallback
+    // when no loan number is available.
+    if (c.loanAccountNo) {
       fetchCentersForLoan(c.loanAccountNo);
+    } else if (c.phone) {
+      fetchCentersForPhone(c.phone);
     }
   };
   // doLookup supports both numeric (phone/aadhaar) and text (customerId/loanAccountNo/name) keys.
@@ -494,8 +498,12 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
   const handlePhoneChange = (val) => {
     setPhone(val);
     clearTimeout(lookupTimerRef.current);
+    // doLookup → applyCustomer → fetchCentersForLoan resolves the customer's
+    // single correct center via their loan account. We deliberately don't
+    // fire fetchCentersForPhone here — it can return centers for unrelated
+    // family members who share the same phone number, causing extra Group /
+    // Center cards to appear.
     lookupTimerRef.current = setTimeout(() => doLookup("phone", val), 600);
-    if (val.replace(/\D/g, "").length >= 10) fetchCentersForPhone(val);
   };
   const handleAadhaarInputChange = (val) => {
     setAadhaar(val);
@@ -575,11 +583,20 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
     if (paymentMode === "Cash" && ptpDate && !ptpTime) { alert("Please enter PTP time."); return; }
     if (!isPtpFuture && waiver > 0 && !approvalEmailSubject.trim()) { alert("Waiver detected. Please enter the approval email subject line."); return; }
 
-    // Check duplicate
+    // Check duplicate — only against OTHER Group OD entries for this customer
+    // today. An earlier Individual OD payment by the same customer must NOT
+    // trigger this warning, because Individual and Group OD are separate
+    // payable modules. Legacy entries without an explicit odType field
+    // default to Group OD (for backward compatibility with old entries.json).
+    const isGroupEntry = (e) => !e.odType || e.odType === "Group OD";
     const isDup = entries.some(e =>
-      e.customerId === customerId.trim() && e.loanAccountNo === loanAccountNo.trim() && e.date === date && e.branch === branch
+      isGroupEntry(e) &&
+      e.customerId === customerId.trim() &&
+      e.loanAccountNo === loanAccountNo.trim() &&
+      e.date === date &&
+      e.branch === branch
     );
-    if (isDup && !confirm("A similar entry already exists for this customer today. Save anyway?")) return;
+    if (isDup && !confirm("A similar Group OD entry already exists for this customer today. Save anyway?")) return;
 
     // Resolve the selected field staff's display name from the app user list.
     const selectedStaff = appUsers.find(u => u.id === collectorStaffId);
@@ -815,33 +832,83 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
         const CLOSED_S = ["Closed", "Written Off"];
         const centerLoanNos = new Set(cs.members.map(m => m.loanNumber));
         const centerEntries = entries.filter(e => centerLoanNos.has(e.loanAccountNo));
-        const totalCollected = centerEntries.reduce((s, e) => s + (Number(e.groupOdPaidAmount) || 0), 0);
+        // A payment counts the same regardless of whether it came in via the
+        // Group OD form (groupOdPaidAmount) or the Individual OD form
+        // (paidAmount). This ensures Individual OD payments instantly reflect
+        // in the Group OD totals/remaining for the same customer.
+        const entryPaid = (e) =>
+          e.odType === "Individual OD"
+            ? (Number(e.paidAmount) || 0)
+            : (Number(e.groupOdPaidAmount) || 0);
+        const totalCollected = centerEntries.reduce((s, e) => s + entryPaid(e), 0);
         const nonClosedCount = cs.count - cs.closedCount;
         const perMemberShare = nonClosedCount > 0 ? Math.round(cs.totalArrear / nonClosedCount) : 0;
         const remainingArrear = Math.max(0, Math.round(cs.totalArrear) - totalCollected);
 
         const enriched = cs.members.map(m => {
           const isClosed = CLOSED_S.includes(m.loanStatus);
-          // Effective DPD = whichever of customer_dpd / overdue_days is populated
-          // (some pool reports leave customer_dpd blank and only fill overdue_days).
           const effectiveDPD = Math.max(Number(m.customerDPD) || 0, Number(m.overdueDays) || 0);
-          // Derive DPD class from effective days so it's correct even when the
-          // report's classification column is blank or uses non-standard labels.
           const derivedClass = isClosed ? (m.customerDPDClass || "") : dpdClassFromDays(effectiveDPD);
           const isDelinquent = !isClosed && DPD_DELINQUENT_CLASSES.includes(derivedClass);
+
+          // Combined Individual + Group OD for the "Collected" column display.
           const memberCollected = centerEntries
             .filter(e => e.loanAccountNo === m.loanNumber)
+            .reduce((s, e) => s + entryPaid(e), 0);
+
+          // Individual OD payments only — drives the "Settled Today" badge
+          // for customers who fully cleared their personal arrear today.
+          const memberPaidIndividual = centerEntries
+            .filter(e => e.loanAccountNo === m.loanNumber && e.odType === "Individual OD")
+            .reduce((s, e) => s + (Number(e.paidAmount) || 0), 0);
+
+          // Group OD payments only — drives true duplicate prevention so a
+          // member who already paid Group OD today can't be clicked again.
+          const memberPaidGroup = centerEntries
+            .filter(e => e.loanAccountNo === m.loanNumber && (!e.odType || e.odType === "Group OD"))
             .reduce((s, e) => s + (Number(e.groupOdPaidAmount) || 0), 0);
+
           const memberRemaining = Math.max(0, Math.round(m.arrearAmountTillDate) - memberCollected);
-          const isSettledToday = !isClosed && memberCollected > 0 && memberRemaining === 0;
-          const isPartiallyPaid = !isClosed && memberCollected > 0 && memberRemaining > 0;
-          return { ...m, isClosed, isDelinquent, derivedClass, effectiveDPD, memberCollected, memberRemaining, isSettledToday, isPartiallyPaid };
+
+          // "Settled Today" = customer paid Individual OD that fully cleared
+          // their personal arrear today. Shown as a badge inside the Closed
+          // Members section so the user knows this person's loan is
+          // effectively settled for today, while remaining eligible for
+          // Group OD as a group contributor.
+          const isSettledTodayIndividual = !isClosed && memberPaidIndividual > 0 && memberRemaining === 0;
+
+          // Group OD already paid today (regardless of full-arrear or not) —
+          // used purely for click-block (duplicate prevention).
+          const isSettledTodayGroup = memberPaidGroup > 0;
+
+          // Group OD eligibility: pool-closed OR settled-today-via-Individual
+          // are the eligible contributors. Both go in the Closed Members table.
+          const isEligibleContributor = isClosed || isSettledTodayIndividual;
+
+          // Backward-compat alias used elsewhere in the code; semantically the
+          // same as the Individual settlement state.
+          const isSettledToday = isSettledTodayIndividual;
+          const isPartiallyPaid = !isClosed && (memberPaidIndividual > 0 || memberPaidGroup > 0) && memberRemaining > 0 && !isSettledTodayIndividual;
+
+          return { ...m, isClosed, isDelinquent, derivedClass, effectiveDPD,
+            memberCollected, memberPaidIndividual, memberPaidGroup, memberRemaining,
+            isSettledToday, isSettledTodayIndividual, isSettledTodayGroup,
+            isEligibleContributor, isPartiallyPaid };
         });
 
-        const settledTodayCount = enriched.filter(m => m.isSettledToday).length;
-        const pendingMembers = enriched.filter(m => !m.isClosed && !m.isSettledToday);
-        const settledMembers = enriched.filter(m => m.isSettledToday);
-        const closedMembers = enriched.filter(m => m.isClosed);
+        const settledTodayCount = enriched.filter(m => m.isSettledTodayIndividual).length;
+        // Closed Members (Group OD contributors) — pool-closed loans PLUS
+        // active customers who fully settled their Individual OD today.
+        // Both are eligible to make a Group OD payment.
+        const closedMembers = enriched.filter(m => m.isEligibleContributor);
+        // Other Members — defaulters and active members who haven't settled
+        // their Individual OD yet today.
+        const pendingMembers = enriched.filter(m => !m.isEligibleContributor);
+        // Settled Members section is no longer needed as a separate table;
+        // those rows now live inside Closed Members with a "Settled Today"
+        // badge. Kept as an empty array so legacy template references don't
+        // crash.
+        const settledMembers = [];
         // Regular = non-closed members whose derived class is "Regular".
         const regularCount = enriched.filter(m => !m.isClosed && m.derivedClass === "Regular").length;
         const adjustedActive = regularCount + settledTodayCount;
@@ -857,31 +924,27 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
         const perGroupMemberShare = Number(cs.perGroupMemberShare) || 0;
         const groupSize = Number(cs.count) || 0;
         const MemberRow = ({ m, idx }) => {
-          // Display rule: every member shows the same calculated Group OD share
-          // (= totalDefaultDue ÷ group size), purely as a computed display value.
-          // Click rule: only closed members can actually pay it (fill the form).
-          // Defaulters and active members see the share but the row is greyed
-          // out and not clickable.
-          const isContributor = m.isClosed && !m.isSettledToday;
-          const isExcluded = !m.isClosed && !m.isDelinquent && !m.isSettledToday; // active/regular
-          const titleMsg = isContributor
-            ? `Click to fill Group OD share (₹${perGroupMemberShare.toLocaleString("en-IN")})`
-            : m.isSettledToday
-              ? "Fully settled today"
-              : m.isDelinquent
-                ? "Defaulter — only closed members can record Group OD; use Individual OD for this member"
-                : isExcluded
-                  ? "Active/Regular member — only closed members can record Group OD; use Individual OD for this member"
-                  : "Loan closed";
-          const rowCls = isContributor
-            ? "cursor-pointer hover:bg-teal-50 bg-white"
-            : m.isSettledToday
-              ? "opacity-60 bg-gray-50"
-              : m.isDelinquent
-                ? "bg-red-50 opacity-90"
-                : isExcluded
-                  ? "opacity-50 bg-gray-50"
-                  : "opacity-60 bg-gray-50";
+          // Click rule: row is clickable UNLESS the customer has already paid
+          // Group OD today (true duplicate prevention via isSettledTodayGroup).
+          // Pool-closed members and active members who settled Individual OD
+          // today are both treated as eligible Group OD contributors. Paying
+          // Individual OD must NOT block Group OD payment on the same day.
+          const isContributor = !m.isSettledTodayGroup;
+          const isExcluded = !m.isClosed && !m.isDelinquent && !m.isSettledTodayIndividual; // visual badge only
+          const titleMsg = m.isSettledTodayGroup
+            ? "Group OD already paid today — duplicate prevention"
+            : `Click to fill Group OD share (₹${perGroupMemberShare.toLocaleString("en-IN")})`;
+          const rowCls = m.isSettledTodayGroup
+            ? "opacity-60 bg-gray-50"
+            : m.isClosed
+              ? "cursor-pointer hover:bg-teal-50 bg-white"
+              : m.isSettledTodayIndividual
+                ? "cursor-pointer hover:bg-emerald-50 bg-emerald-50/40"
+                : m.isDelinquent
+                  ? "cursor-pointer hover:bg-red-100 bg-red-50"
+                  : isExcluded
+                    ? "cursor-pointer hover:bg-gray-100 bg-white"
+                    : "cursor-pointer hover:bg-teal-50 bg-white";
         return (
           <tr key={m.loanNumber}
             onClick={() => {
@@ -905,19 +968,38 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
             <td className="px-3 py-2.5 text-gray-400">{idx}</td>
             <td className="px-3 py-2.5 font-semibold text-gray-800">
               {m.memberName}
-              {m.isSettledToday && <span className="ml-1 text-green-600 text-xs font-bold">✓ Settled</span>}
-              {m.isPartiallyPaid && <span className="ml-1 text-yellow-600 text-xs font-bold">~ Partial</span>}
+              {m.isSettledTodayIndividual && !m.isSettledTodayGroup && (
+                <span className="ml-1 text-emerald-700 text-[10px] font-bold whitespace-nowrap">✓ Indiv Settled</span>
+              )}
+              {m.isSettledTodayGroup && (
+                <span className="ml-1 text-teal-700 text-[10px] font-bold whitespace-nowrap">✓ Group Settled</span>
+              )}
+              {m.isPartiallyPaid && <span className="ml-1 text-yellow-600 text-[10px] font-bold">~ Partial</span>}
             </td>
             <td className="px-3 py-2.5 text-gray-500 font-mono text-xs">{m.loanNumber}</td>
             <td className="px-3 py-2.5 text-gray-500">{m.customerNumber}</td>
             <td className="px-3 py-2.5 text-right font-bold text-red-700">{formatINR(Math.round(m.arrearAmountTillDate))}</td>
             <td className="px-3 py-2.5 text-right font-bold text-green-700">{m.memberCollected > 0 ? formatINR(m.memberCollected) : "—"}</td>
             <td className="px-3 py-2.5 text-right font-bold">
-              {m.memberRemaining > 0
-                ? <span className="text-orange-700">{formatINR(m.memberRemaining)}</span>
-                : m.memberCollected > 0
-                  ? <span className="text-green-600 font-bold">Cleared</span>
-                  : <span className="text-red-700">{formatINR(Math.round(m.arrearAmountTillDate))}</span>}
+              {/* Status reflects BOTH Individual arrear and Group OD share.
+                  "Cleared" only shows when both are settled — otherwise we
+                  display the residual personal arrear or, when personal is
+                  cleared but Group OD still pending, an explicit "Group ₹X
+                  due" badge so the user knows action is still required. */}
+              {m.memberRemaining > 0 ? (
+                <span className="text-orange-700">{formatINR(m.memberRemaining)}</span>
+              ) : m.memberCollected > 0 && m.isSettledTodayGroup ? (
+                <span className="text-green-600 font-bold">Fully Cleared</span>
+              ) : m.memberCollected > 0 && perGroupMemberShare > 0 ? (
+                <span className="flex flex-col items-end gap-0.5 leading-tight">
+                  <span className="text-emerald-700 text-[11px]">Indiv Cleared</span>
+                  <span className="text-orange-700 text-[10px] font-semibold whitespace-nowrap">Group {formatINR(Math.round(perGroupMemberShare))} due</span>
+                </span>
+              ) : m.memberCollected > 0 ? (
+                <span className="text-green-600 font-bold">Cleared</span>
+              ) : (
+                <span className="text-red-700">{formatINR(Math.round(m.arrearAmountTillDate))}</span>
+              )}
             </td>
             <td className="px-3 py-2.5 text-right">
               {/* Computed-only Group OD share — same value for every member in
@@ -974,7 +1056,10 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-4">
                 <div className="bg-gray-50 border border-gray-200 rounded-lg p-2.5 text-center">
                   <p className="text-xs text-gray-500 mb-1">Closed (Contributors)</p>
-                  <p className="text-xl font-extrabold text-gray-700">{cs.closedCount > 0 ? cs.closedCount : "—"}</p>
+                  <p className="text-xl font-extrabold text-gray-700">{closedMembers.length > 0 ? closedMembers.length : "—"}</p>
+                  {settledTodayCount > 0 && (
+                    <p className="text-[10px] text-emerald-600 mt-0.5">+{settledTodayCount} settled today</p>
+                  )}
                 </div>
                 <div className="bg-red-50 border border-red-200 rounded-lg p-2.5 text-center">
                   <p className="text-xs text-gray-500 mb-1">Total Default Due (SMA/NPA)</p>
@@ -1125,9 +1210,19 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
         <h3 className="text-sm font-semibold text-teal-700 uppercase tracking-wide mb-4">Transaction Details</h3>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Total Amount Due *</label>
-            <input type="number" min="0" value={groupOdAmount} onChange={e => setGroupOdAmount(e.target.value)}
-              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="e.g. 10000" />
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Total Amount Due *
+              <span className="ml-1 text-[10px] font-normal text-gray-400">(auto-calculated)</span>
+            </label>
+            {/* Read-only / auto-populated. The value is set programmatically by
+                the member-row click handler from cs.totalDefaultDue (sum of
+                SMA/NPA arrears in the group). User cannot edit. tabIndex=-1
+                keeps it out of keyboard tab order. The original setGroupOdAmount
+                state and save flow remain unchanged — only manual editing is
+                disabled. */}
+            <input type="number" min="0" value={groupOdAmount} readOnly tabIndex={-1}
+              className="w-full px-3 py-2 border rounded-lg bg-gray-50 text-gray-800 font-medium cursor-default focus:outline-none"
+              placeholder="Click a closed member above to populate" />
           </div>
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">
@@ -1362,6 +1457,23 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
       }).catch(() => {});
   };
 
+  // Loan-account-based center lookup — prefers a single accurate result over
+  // phone-based which can return centers for unrelated co-applicants/family.
+  const fetchIndivCentersForLoan = (loanNo) => {
+    const clean = String(loanNo || "").trim();
+    if (!clean) return;
+    fetch(`${API_BASE}/pool/lookup?loan=${encodeURIComponent(clean)}`)
+      .then(r => r.json())
+      .then(data => {
+        if (!data.found) return;
+        const uniqueCenters = [...new Set(data.results.map(r => r.centerName).filter(Boolean))];
+        if (uniqueCenters.length === 0) return;
+        Promise.all(uniqueCenters.map(cn =>
+          fetch(`${API_BASE}/pool/center?name=${encodeURIComponent(cn)}`).then(r => r.json())
+        )).then(results => setIndivCenters(results.filter(r => r.found)));
+      }).catch(() => {});
+  };
+
   const applyCustomer = (c) => {
     setCustomerName(c.name || "");
     setCustomerId(c.customerId || "");
@@ -1370,7 +1482,14 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
     const branchOk = c.branch && Array.isArray(branches) && branches.includes(c.branch);
     if (branchOk) setBranch(c.branch);
     if (c.aadhaar) { setAadhaar(c.aadhaar); setAadhaarEditable(false); }
-    if (c.phone) { setPhone(c.phone); fetchIndivCenters(c.phone); }
+    if (c.phone) setPhone(c.phone);
+    // Prefer loan-based center fetch (one accurate center) over phone-based
+    // (can pick up co-applicants' unrelated centers).
+    if (c.loanAccountNo) {
+      fetchIndivCentersForLoan(c.loanAccountNo);
+    } else if (c.phone) {
+      fetchIndivCenters(c.phone);
+    }
     const filled = new Set(["customerName", "customerId", "loanAccountNo"]);
     if (c.aadhaar) filled.add("aadhaar");
     if (branchOk) filled.add("branch");
@@ -1401,8 +1520,11 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
   const handlePhoneChange = (val) => {
     setPhone(val);
     clearTimeout(lookupTimerRef.current);
+    // doLookup → applyCustomer → fetchIndivCentersForLoan resolves the
+    // single correct center via the customer's loan account. We don't fire
+    // fetchIndivCenters here because shared phones (family / co-applicants)
+    // would pull in unrelated group centers.
     lookupTimerRef.current = setTimeout(() => doLookup("phone", val), 600);
-    if (val.replace(/\D/g, "").length >= 10) fetchIndivCenters(val);
   };
   const handleAadhaarInputChange = (val) => {
     setAadhaar(val);
@@ -1493,10 +1615,15 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
     // Auto-detect CSB: no Customer ID + hyphenated loan number (e.g. 0269-80394391-657201)
     const isCSBCustomer = !customerId.trim() && /\d+-\d+-\d+/.test(loanAccountNo.trim());
 
+    // Only match against OTHER Individual OD entries — a same-day Group OD
+    // payment by this customer is allowed and must not trigger the warning.
     const isDup = entries.some(e =>
-      e.loanAccountNo === loanAccountNo.trim() && e.date === date && e.branch === branch && e.odType === "Individual OD"
+      e.odType === "Individual OD" &&
+      e.loanAccountNo === loanAccountNo.trim() &&
+      e.date === date &&
+      e.branch === branch
     );
-    if (isDup && !confirm("A similar entry already exists for this customer today. Save anyway?")) return;
+    if (isDup && !confirm("A similar Individual OD entry already exists for this customer today. Save anyway?")) return;
 
     // Resolve the selected field staff's display name from the app user list.
     const selectedStaff = appUsers.find(u => u.id === collectorStaffId);
@@ -1835,12 +1962,16 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
           <div>
             <label className="flex items-center gap-1 text-sm font-medium text-gray-700 mb-1">
-              OD Amount Due * {autoFilledFields.has("amountDue") && <span className="text-indigo-600 text-xs font-normal whitespace-nowrap">● foreclosure</span>}
+              OD Amount Due *
+              <span className="ml-1 text-[10px] font-normal text-gray-400">(auto-calculated)</span>
+              {autoFilledFields.has("amountDue") && <span className="text-indigo-600 text-xs font-normal whitespace-nowrap">● foreclosure</span>}
             </label>
-            <input type="number" min="0" value={amountDue}
-              onChange={e => handleAutoFilledChange("amountDue", setAmountDue, e.target.value)}
-              className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500 ${autoFilledFields.has("amountDue") ? "bg-indigo-50 border-indigo-200" : ""}`}
-              placeholder="e.g. 10000" />
+            {/* Read-only / auto-populated from the customer's foreclosure value
+                or backend lookup. The setAmountDue() call paths still fire
+                programmatically — only manual editing is disabled. */}
+            <input type="number" min="0" value={amountDue} readOnly tabIndex={-1}
+              className={`w-full px-3 py-2 border rounded-lg cursor-default focus:outline-none ${autoFilledFields.has("amountDue") ? "bg-indigo-50 border-indigo-200 text-indigo-900 font-medium" : "bg-gray-50 text-gray-800 font-medium"}`}
+              placeholder="Will populate from customer lookup / foreclosure value" />
           </div>
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Payment Mode *</label>
