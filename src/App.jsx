@@ -426,6 +426,24 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
       }).catch(() => {});
   };
 
+  // Fallback: fetch centers using the loan account number. Needed for closed
+  // (foreclosure-only) customers, who have no mobile_number in the customers
+  // table and would otherwise skip the center fetch entirely.
+  const fetchCentersForLoan = (loanNo) => {
+    const clean = String(loanNo || "").trim();
+    if (!clean) return;
+    fetch(`${API_BASE}/pool/lookup?loan=${encodeURIComponent(clean)}`)
+      .then(r => r.json())
+      .then(data => {
+        if (!data.found) return;
+        const uniqueCenters = [...new Set(data.results.map(r => r.centerName).filter(Boolean))];
+        if (uniqueCenters.length === 0) return;
+        Promise.all(uniqueCenters.map(cn =>
+          fetch(`${API_BASE}/pool/center?name=${encodeURIComponent(cn)}`).then(r => r.json())
+        )).then(results => setCustomerCenters(results.filter(r => r.found)));
+      }).catch(() => {});
+  };
+
   const applyCustomer = (c) => {
     setCustomerName(c.name || "");
     setCustomerId(c.customerId || "");
@@ -439,7 +457,13 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
     setAutoFilledFields(filled);
     setCustomerMatches([]);
     setLookupStatus("found");
-    if (c.phone) fetchCentersForPhone(c.phone);
+    if (c.phone) {
+      fetchCentersForPhone(c.phone);
+    } else if (c.loanAccountNo) {
+      // Closed-loan customers from the Foreclosure Report have no phone in
+      // the customers table; resolve their center via the loan number instead.
+      fetchCentersForLoan(c.loanAccountNo);
+    }
   };
   // doLookup supports both numeric (phone/aadhaar) and text (customerId/loanAccountNo/name) keys.
   const doLookup = (type, value, opts = {}) => {
@@ -516,10 +540,11 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
   const individualGroupOdShare = numCust > 0 ? Math.round(groupOdDue / numCust) : 0;
   const waiver = isPtpFuture ? 0 : Math.max(0, individualGroupOdShare - memberAlreadyCollected - groupOdPaid);
 
-  // Max allowed Group Size = highest non-closed-member count across the centers
-  // we've loaded for this customer. 0 means "not known yet" (no cap enforced).
+  // Max allowed Group Size = total member count across the centers we've loaded
+  // for this customer. Group OD divisor is the FULL group size (closed +
+  // active + defaulters), so the cap mirrors that. 0 = not known yet.
   const maxGroupSize = customerCenters.reduce(
-    (max, cs) => Math.max(max, Number(cs.nonClosedCount) || Number(cs.count) || 0),
+    (max, cs) => Math.max(max, Number(cs.count) || 0),
     0
   );
   const groupSizeExceeded = maxGroupSize > 0 && numCust > maxGroupSize;
@@ -814,24 +839,61 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
         const adjustedActive = regularCount + settledTodayCount;
         const remainingPerMember = pendingMembers.length > 0 ? Math.round(remainingArrear / pendingMembers.length) : 0;
 
-        const MemberRow = ({ m, idx }) => (
+        // ── New Group OD click rules ──────────────────────────────────────────
+        // Closed members are the only Group OD contributors. Clicking a closed
+        // member fills the form with the redistributed share. SMA/NPA and
+        // active rows are not clickable for Group OD (they belong to Individual
+        // OD or are excluded entirely). Settled-today rows stay non-clickable
+        // because they've already been collected.
+        const totalDefaultDue = Number(cs.totalDefaultDue) || 0;
+        const perGroupMemberShare = Number(cs.perGroupMemberShare) || 0;
+        const groupSize = Number(cs.count) || 0;
+        const MemberRow = ({ m, idx }) => {
+          // Display rule: every member shows the same calculated Group OD share
+          // (= totalDefaultDue ÷ group size), purely as a computed display value.
+          // Click rule: only closed members can actually pay it (fill the form).
+          // Defaulters and active members see the share but the row is greyed
+          // out and not clickable.
+          const isContributor = m.isClosed && !m.isSettledToday;
+          const isExcluded = !m.isClosed && !m.isDelinquent && !m.isSettledToday; // active/regular
+          const titleMsg = isContributor
+            ? `Click to fill Group OD share (₹${perGroupMemberShare.toLocaleString("en-IN")})`
+            : m.isSettledToday
+              ? "Fully settled today"
+              : m.isDelinquent
+                ? "Defaulter — only closed members can record Group OD; use Individual OD for this member"
+                : isExcluded
+                  ? "Active/Regular member — only closed members can record Group OD; use Individual OD for this member"
+                  : "Loan closed";
+          const rowCls = isContributor
+            ? "cursor-pointer hover:bg-teal-50 bg-white"
+            : m.isSettledToday
+              ? "opacity-60 bg-gray-50"
+              : m.isDelinquent
+                ? "bg-red-50 opacity-90"
+                : isExcluded
+                  ? "opacity-50 bg-gray-50"
+                  : "opacity-60 bg-gray-50";
+        return (
           <tr key={m.loanNumber}
             onClick={() => {
-              if (m.isClosed || m.isSettledToday) return;
+              if (!isContributor) return;
+              if (perGroupMemberShare <= 0) return; // no defaulters or empty group → nothing to share
               setCustomerName(m.memberName);
               setCustomerId(m.customerNumber);
               setLoanAccountNo(m.loanNumber);
               setPhone(m.phone || "");
-              setNumberOfCustomers(String(nonClosedCount));
-              setGroupOdAmount(String(Math.round(cs.totalArrear)));
-              setMemberArrearOverride(Math.round(m.arrearAmountTillDate));
+              // Final rule: divisor = group size (all members), total = totalDefaultDue.
+              setNumberOfCustomers(String(groupSize));
+              setGroupOdAmount(String(Math.round(totalDefaultDue)));
+              setMemberArrearOverride(Math.round(perGroupMemberShare));
               setMemberAlreadyCollected(m.memberCollected || 0);
               setAutoFilledFields(new Set(["customerName", "customerId", "loanAccountNo"]));
               setLookupStatus("found");
               window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
             }}
-            className={`transition-colors ${m.isClosed || m.isSettledToday ? "opacity-60 bg-gray-50" : m.isPartiallyPaid ? "bg-yellow-50 cursor-pointer hover:bg-yellow-100" : "cursor-pointer hover:bg-teal-50"}`}
-            title={m.isClosed ? "Loan closed" : m.isSettledToday ? "Fully settled today" : m.isPartiallyPaid ? `Partial — ${formatINR(m.memberRemaining)} remaining` : "Click to fill form"}>
+            className={`transition-colors ${rowCls}`}
+            title={titleMsg}>
             <td className="px-3 py-2.5 text-gray-400">{idx}</td>
             <td className="px-3 py-2.5 font-semibold text-gray-800">
               {m.memberName}
@@ -849,6 +911,14 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
                   ? <span className="text-green-600 font-bold">Cleared</span>
                   : <span className="text-red-700">{formatINR(Math.round(m.arrearAmountTillDate))}</span>}
             </td>
+            <td className="px-3 py-2.5 text-right">
+              {/* Computed-only Group OD share — same value for every member in
+                  the group; equals totalDefaultDue ÷ group size. Greyed for
+                  non-contributors since only closed members can record it. */}
+              <span className={`font-semibold ${isContributor ? "text-teal-700" : "text-gray-400"}`}>
+                {perGroupMemberShare > 0 ? formatINR(Math.round(perGroupMemberShare)) : "—"}
+              </span>
+            </td>
             <td className="px-3 py-2.5 text-center">
               {m.isSettledToday
                 ? <span className="px-2 py-0.5 rounded-full text-xs font-bold bg-green-100 text-green-700">0d</span>
@@ -865,6 +935,7 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
             </td>
           </tr>
         );
+        };
 
         return (
           <div key={ci} className="bg-white rounded-xl shadow-sm border p-5 mb-4">
@@ -892,14 +963,27 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
                   );
                 })}
               </div>
-              <div className="grid grid-cols-2 gap-2 mb-4">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-4">
                 <div className="bg-gray-50 border border-gray-200 rounded-lg p-2.5 text-center">
-                  <p className="text-xs text-gray-500 mb-1">Closed</p>
-                  <p className="text-xl font-extrabold text-gray-500">{cs.closedCount > 0 ? cs.closedCount : "—"}</p>
+                  <p className="text-xs text-gray-500 mb-1">Closed (Contributors)</p>
+                  <p className="text-xl font-extrabold text-gray-700">{cs.closedCount > 0 ? cs.closedCount : "—"}</p>
                 </div>
                 <div className="bg-red-50 border border-red-200 rounded-lg p-2.5 text-center">
+                  <p className="text-xs text-gray-500 mb-1">Total Default Due (SMA/NPA)</p>
+                  <p className="text-lg font-extrabold text-red-700">{formatINR(Math.round(Number(cs.totalDefaultDue) || 0))}</p>
+                  <p className="text-[10px] text-gray-500 mt-0.5">{cs.defaulterCount || 0} defaulter{(cs.defaulterCount || 0) === 1 ? "" : "s"}</p>
+                </div>
+                <div className="bg-teal-50 border border-teal-200 rounded-lg p-2.5 text-center">
+                  <p className="text-xs text-gray-500 mb-1">Group OD per Member (Calculated)</p>
+                  <p className="text-lg font-extrabold text-teal-700">{formatINR(Math.round(Number(cs.perGroupMemberShare) || 0))}</p>
+                  <p className="text-[10px] text-gray-500 mt-0.5">= total ÷ {cs.count || 0} members</p>
+                  {cs.closedCount === 0 && (cs.defaulterCount || 0) > 0 && (
+                    <p className="text-[10px] text-orange-600 mt-0.5">No closed members — none can pay</p>
+                  )}
+                </div>
+                <div className="bg-orange-50 border border-orange-200 rounded-lg p-2.5 text-center">
                   <p className="text-xs text-gray-500 mb-1">Individual OD Share (Till Today)</p>
-                  <p className="text-lg font-extrabold text-red-700">{formatINR(perMemberShare)}</p>
+                  <p className="text-lg font-extrabold text-orange-700">{formatINR(perMemberShare)}</p>
                 </div>
               </div>
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
@@ -923,9 +1007,53 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
                   )}
                 </div>
               </div>
+              {/* ── Closed Members — Group OD contributors. Click to fill form. */}
+              {closedMembers.length > 0 && (
+                <div className="mb-3">
+                  <p className="text-xs font-semibold text-teal-700 uppercase tracking-wide mb-1">
+                    Closed Members — Group OD Contributors ({closedMembers.length})
+                  </p>
+                  <p className="text-[11px] text-teal-600 mb-2">
+                    {(cs.defaulterCount || 0) > 0 && cs.closedCount > 0
+                      ? `👆 Click a closed member to auto-fill ${formatINR(Math.round(Number(cs.perClosedMemberShare) || 0))} as their Group OD share.`
+                      : (cs.defaulterCount || 0) === 0
+                        ? "No SMA/NPA defaulters in this group — Group OD = 0."
+                        : "No closed members to redistribute the default to — Group OD = 0."}
+                  </p>
+                  <div className="overflow-x-auto rounded-lg border border-teal-200 mb-3">
+                    <SortableSection initialKey="memberName" initialDir="asc" render={sort => (
+                      <table className="w-full text-xs">
+                        <thead className="bg-teal-50">
+                          <tr>
+                            <th className="px-3 py-2 text-left font-semibold text-teal-700">#</th>
+                            <th className="px-3 py-2 text-left font-semibold text-teal-700">{sort.header("memberName", "Member Name")}</th>
+                            <th className="px-3 py-2 text-left font-semibold text-teal-700">{sort.header("loanNumber", "Loan No.")}</th>
+                            <th className="px-3 py-2 text-left font-semibold text-teal-700">{sort.header("customerNumber", "Customer ID")}</th>
+                            <th className="px-3 py-2 text-right font-semibold text-teal-700">{sort.header("arrearAmountTillDate", "Arrear (Till Today)")}</th>
+                            <th className="px-3 py-2 text-right font-semibold text-green-600">{sort.header("memberCollected", "Collected")}</th>
+                            <th className="px-3 py-2 text-right font-semibold text-orange-600">{sort.header("memberRemaining", "Remaining")}</th>
+                            <th className="px-3 py-2 text-right font-semibold text-teal-700" title="Total default arrears ÷ group size — runtime calculation, not stored">Group OD (Calc)</th>
+                            <th className="px-3 py-2 text-center font-semibold text-teal-700">{sort.header("effectiveDPD", "DPD")}</th>
+                            <th className="px-3 py-2 text-center font-semibold text-teal-700">{sort.header("derivedClass", "Status")}</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-teal-100">
+                          {sort.apply(closedMembers).map((m, i) => <MemberRow key={m.loanNumber} m={m} idx={i + 1} />)}
+                        </tbody>
+                      </table>
+                    )} />
+                  </div>
+                </div>
+              )}
+              {/* ── Other members — defaulters (SMA/NPA) + active. Not Group OD contributors. */}
               {pendingMembers.length > 0 && (
                 <>
-                  <p className="text-xs text-teal-600 mb-2 font-medium">👆 Click a member row to auto-fill their details into the form below</p>
+                  <p className="text-xs font-semibold text-gray-600 uppercase tracking-wide mb-1">
+                    Other Members ({pendingMembers.length}) — defaulters & active
+                  </p>
+                  <p className="text-[11px] text-gray-500 mb-2">
+                    SMA/NPA defaulters' arrears are redistributed to closed members above. Active/Regular members are excluded from Group OD; use Individual OD instead.
+                  </p>
                   <div className="overflow-x-auto rounded-lg border mb-3">
                     <SortableSection initialKey="memberName" initialDir="asc" render={sort => (
                       <table className="w-full text-xs">
@@ -938,6 +1066,7 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
                             <th className="px-3 py-2 text-right font-semibold text-gray-600">{sort.header("arrearAmountTillDate", "Arrear (Till Today)")}</th>
                             <th className="px-3 py-2 text-right font-semibold text-green-600">{sort.header("memberCollected", "Collected")}</th>
                             <th className="px-3 py-2 text-right font-semibold text-orange-600">{sort.header("memberRemaining", "Remaining")}</th>
+                            <th className="px-3 py-2 text-right font-semibold text-gray-600" title="Total default arrears ÷ group size — runtime calculation, not stored">Group OD (Calc)</th>
                             <th className="px-3 py-2 text-center font-semibold text-gray-600">{sort.header("effectiveDPD", "DPD")}</th>
                             <th className="px-3 py-2 text-center font-semibold text-gray-600">{sort.header("derivedClass", "Status")}</th>
                           </tr>
@@ -965,6 +1094,7 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
                             <th className="px-3 py-2 text-right font-semibold text-green-700">{sort.header("arrearAmountTillDate", "Arrear (Till Today)")}</th>
                             <th className="px-3 py-2 text-right font-semibold text-green-700">{sort.header("memberCollected", "Collected")}</th>
                             <th className="px-3 py-2 text-right font-semibold text-green-700">{sort.header("memberRemaining", "Remaining")}</th>
+                            <th className="px-3 py-2 text-right font-semibold text-green-700" title="Total default arrears ÷ group size — runtime calculation, not stored">Group OD (Calc)</th>
                             <th className="px-3 py-2 text-center font-semibold text-green-700">{sort.header("effectiveDPD", "DPD")}</th>
                             <th className="px-3 py-2 text-center font-semibold text-green-700">{sort.header("derivedClass", "Status")}</th>
                           </tr>
@@ -976,9 +1106,6 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
                     )} />
                   </div>
                 </div>
-              )}
-              {closedMembers.length > 0 && (
-                <p className="text-xs text-gray-400 text-center">{closedMembers.length} closed loan{closedMembers.length > 1 ? "s" : ""} not shown</p>
               )}
             </div>
           </div>
