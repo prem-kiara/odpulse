@@ -217,11 +217,9 @@ export default function ReportsAnalytics({ user }) {
   const [branchFilter, setBranchFilter] = useState("");
   const [productFilter, setProductFilter] = useState("");
   const [categoryFilter, setCategoryFilter] = useState(""); // "" | "group" | "individual"
-  const [appliedFrom, setAppliedFrom] = useState(fromDate);
-  const [appliedTo, setAppliedTo] = useState(toDate);
-  const [appliedBranch, setAppliedBranch] = useState("");
-  const [appliedProduct, setAppliedProduct] = useState("");
-  const [appliedCategory, setAppliedCategory] = useState("");
+  // Filters are reactive — every change triggers a debounced refetch (no
+  // Apply button). The 250ms debounce on the date input prevents spamming
+  // the API while the user is still typing characters into the date picker.
 
   // Data state
   const [data, setData] = useState(null);
@@ -249,26 +247,28 @@ export default function ReportsAnalytics({ user }) {
     else { setCustSortKey(key); setCustSortDir("desc"); }
   };
 
-  // Branch / product dropdown options — derived from the latest fetch.
-  // (Users see the full universe regardless of which one is currently filtered.)
+  // Branch dropdown options — derived from the initial unfiltered fetch.
+  // Static so the user can always switch between any branch.
   const [branchOptions, setBranchOptions] = useState([]);
-  const [productOptions, setProductOptions] = useState([]);
 
-  // ── fetch ──
-  // Re-fetches when the underlying filters OR the selected status view change.
-  // Server-side status filter ensures we get the FULL list of matching rows
-  // (not just the most recent N), so when "Closed" is clicked we see all
-  // closed customers, not the few that happened to be in the last 200.
+  // Product dropdown options — depend on the selected loan category, so a
+  // user picking "Group Loan" sees only group products. We cache the full
+  // list for each category once on mount so toggling category is instant.
+  const [productsByCategory, setProductsByCategory] = useState({ "": [], group: [], individual: [] });
+  const productOptions = productsByCategory[categoryFilter] || productsByCategory[""] || [];
+
+  // ── main data fetch ──
+  // Reactive: re-fires whenever any filter or the status view changes.
+  // 250 ms debounce so date inputs don't spam the API as the user types.
   const fetchData = useCallback(async () => {
     setLoading(true); setErrorMsg("");
     try {
       const p = new URLSearchParams();
-      if (appliedFrom) p.set("from", appliedFrom);
-      if (appliedTo)   p.set("to", appliedTo);
-      if (appliedBranch) p.set("branch", appliedBranch);
-      if (appliedProduct) p.set("product", appliedProduct);
-      if (appliedCategory) p.set("category", appliedCategory);
-      // When a status pill is the active view, ask the server for that status.
+      if (fromDate) p.set("from", fromDate);
+      if (toDate)   p.set("to", toDate);
+      if (branchFilter) p.set("branch", branchFilter);
+      if (productFilter) p.set("product", productFilter);
+      if (categoryFilter) p.set("category", categoryFilter);
       if (view === "active" || view === "closed" || view === "pending") {
         p.set("status", view);
       }
@@ -276,20 +276,50 @@ export default function ReportsAnalytics({ user }) {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
       setData(json);
-      // Capture full option lists on first unfiltered fetch.
-      if (!appliedBranch && !appliedProduct && !appliedCategory) {
-        setBranchOptions((json.byBranch || []).map(b => b.key).filter(Boolean));
-        setProductOptions((json.byProduct || []).map(b => b.key).filter(Boolean));
-      }
     } catch (e) {
       setErrorMsg(e.message || "Failed to load disbursement data");
       setData(null);
     } finally {
       setLoading(false);
     }
-  }, [appliedFrom, appliedTo, appliedBranch, appliedProduct, appliedCategory, view]);
+  }, [fromDate, toDate, branchFilter, productFilter, categoryFilter, view]);
 
-  useEffect(() => { fetchData(); }, [fetchData]);
+  useEffect(() => {
+    const t = setTimeout(() => fetchData(), 250);
+    return () => clearTimeout(t);
+  }, [fetchData]);
+
+  // ── one-time options fetch on mount ──
+  // Populates the Branch dropdown (full universe) and the per-category Product
+  // cache so the Product dropdown filters dynamically when the user toggles
+  // Loan Category. Three small fetches; runs once.
+  useEffect(() => {
+    let cancelled = false;
+    Promise.all([
+      fetch("/api/od/disbursements").then(r => r.json()).catch(() => ({ byBranch: [], byProduct: [] })),
+      fetch("/api/od/disbursements?category=group").then(r => r.json()).catch(() => ({ byProduct: [] })),
+      fetch("/api/od/disbursements?category=individual").then(r => r.json()).catch(() => ({ byProduct: [] })),
+    ]).then(([all, group, individual]) => {
+      if (cancelled) return;
+      setBranchOptions((all.byBranch || []).map(b => b.key).filter(Boolean));
+      setProductsByCategory({
+        "":           (all.byProduct        || []).map(p => p.key).filter(Boolean),
+        group:        (group.byProduct      || []).map(p => p.key).filter(Boolean),
+        individual:   (individual.byProduct || []).map(p => p.key).filter(Boolean),
+      });
+    });
+    return () => { cancelled = true; };
+  }, []);
+
+  // When the user switches Loan Category, clear the Product filter if the
+  // currently-selected product isn't valid for the new category.
+  useEffect(() => {
+    if (!productFilter) return;
+    const valid = productsByCategory[categoryFilter] || productsByCategory[""];
+    if (valid.length && !valid.includes(productFilter)) {
+      setProductFilter("");
+    }
+  }, [categoryFilter, productFilter, productsByCategory]);
 
   // Sync the table sort to whichever KPI/view is selected, so the data the
   // user sees matches the focus they picked. Users can still click any column
@@ -312,14 +342,7 @@ export default function ReportsAnalytics({ user }) {
     }
   }, [view]);
 
-  // ── apply / preset handlers ──
-  const handleApply = () => {
-    setAppliedFrom(fromDate);
-    setAppliedTo(toDate);
-    setAppliedBranch(branchFilter);
-    setAppliedProduct(productFilter);
-    setAppliedCategory(categoryFilter);
-  };
+  // Preset handlers — set the date directly, the debounced effect picks it up.
 
   const handlePresetThisMonth = () => { setFromDate(startOfMonthISO()); setToDate(todayISO()); };
   const handlePresetLast3Months = () => { setFromDate(monthsAgoISO(3)); setToDate(todayISO()); };
@@ -405,7 +428,7 @@ export default function ReportsAnalytics({ user }) {
         th{background:#f3f4f6;font-weight:600}
       </style></head><body>
       <h1>Disbursement Analytics</h1>
-      <div>Period: ${appliedFrom} → ${appliedTo}${appliedBranch ? ` · Branch: ${appliedBranch}` : ""}${appliedProduct ? ` · Product: ${appliedProduct}` : ""}${appliedCategory ? ` · Category: ${appliedCategory}` : ""} · Generated: ${new Date().toLocaleString()}</div>
+      <div>Period: ${fromDate} → ${toDate}${branchFilter ? ` · Branch: ${branchFilter}` : ""}${productFilter ? ` · Product: ${productFilter}` : ""}${categoryFilter ? ` · Category: ${categoryFilter}` : ""} · Generated: ${new Date().toLocaleString()}</div>
       <h2>Summary</h2>
       <table><tr>
         <th>Total Disbursements</th><td>${formatNum(summary.count)}</td>
@@ -463,9 +486,9 @@ export default function ReportsAnalytics({ user }) {
         </button>
       </div>
 
-      {/* 2. Filter Toolbar */}
+      {/* 2. Filter Toolbar — reactive (no Apply button). Every change auto-refreshes. */}
       <div className="bg-gray-50 border rounded-xl px-4 py-3 shadow-sm">
-        <div className="grid grid-cols-1 md:grid-cols-6 gap-3 items-end">
+        <div className="grid grid-cols-1 md:grid-cols-5 gap-3 items-end">
           <div>
             <label className="text-[11px] text-gray-500 mb-1 block flex items-center gap-1">
               <Calendar size={11} /> Disbursement From
@@ -513,14 +536,8 @@ export default function ReportsAnalytics({ user }) {
               ))}
             </div>
           </div>
-          <div>
-            <button onClick={handleApply}
-              className="w-full inline-flex items-center justify-center gap-1.5 px-4 py-2 bg-teal-600 text-white text-sm rounded-lg hover:bg-teal-700">
-              <Filter size={14} /> Apply
-            </button>
-          </div>
         </div>
-        <div className="flex flex-wrap gap-1.5 mt-3">
+        <div className="flex flex-wrap gap-1.5 mt-3 items-center">
           <span className="text-[11px] text-gray-500 mr-1">Quick range:</span>
           <button onClick={handlePresetThisMonth}
             className="text-[11px] px-2.5 py-1 bg-white border rounded-md hover:bg-gray-100 text-gray-700">This Month</button>
