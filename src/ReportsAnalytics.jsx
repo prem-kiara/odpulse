@@ -1,25 +1,32 @@
-// Reports & Analytics — top-level filter toolbar + selectable Loan Products
-// table that drives summary cards and performance charts. Import button is
-// wired to /api/od/pool/upload (same endpoint as OD Upload) so we never
-// open a second write path into the database.
+// Reports & Analytics — Disbursement Analytics view.
 //
-// Layout (top to bottom):
-//   1. Header: title left, Refresh right
-//   2. Filter toolbar (NOT inside any card) — From / To / Apply + presets
-//   3. "Select Loan Products" table — searchable, sortable, checkbox-select
-//   4. Summary cards (4) — Total Demand / Collected / Remaining / Efficiency
-//   5. Performance Metrics — branch chart + product chart (driven by selection)
-//   6. Reports — Import / Export
+// Wired to /api/od/disbursements which aggregates disbursements from the
+// existing customers master (populated by the OD Upload Pool/Foreclosure
+// pipelines). Filters: date range on disbursement_date, branch, product,
+// loan category (Group / Individual).
+//
+// This page does NOT have its own upload — uploads are handled exclusively
+// in the OD Upload section. This page is read-only analytics + export.
+//
+// Layout:
+//   1. Header + Refresh
+//   2. Filter toolbar — From / To / Branch / Product / Category + presets
+//   3. KPI cards — Total Disbursements / Total Amount / Avg Ticket / Customer Count
+//   4. Status split — Active / Closed / Pending
+//   5. Trend chart — monthly disbursement volume + amount
+//   6. Branch-wise + Product-wise + Category-wise breakdowns
+//   7. Recent Disbursements table (top 200, searchable + sortable)
+//   8. Reports — Export only (PDF / CSV)
 
 import React, { useState, useMemo, useEffect, useCallback } from "react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
-  PieChart, Pie, Cell, Legend,
+  PieChart, Pie, Cell, Legend, LineChart, Line,
 } from "recharts";
 import {
-  Activity, Calendar, Download, Upload, FileText, FileSpreadsheet, FileDown,
-  TrendingUp, Wallet, Receipt, PiggyBank, Filter, Info, Search,
-  ChevronUp, ChevronDown, RefreshCw, CheckSquare, Square,
+  Activity, Calendar, Download, FileText, FileSpreadsheet, FileDown,
+  TrendingUp, Wallet, Receipt, Users, Filter, Info, Search,
+  ChevronUp, ChevronDown, RefreshCw, Building2, Package,
 } from "lucide-react";
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -29,6 +36,7 @@ const formatINR = (n) => {
   if (Math.abs(v) >= 1e5) return `₹${(v / 1e5).toFixed(2)} L`;
   return `₹${v.toLocaleString("en-IN")}`;
 };
+const formatNum = (n) => (Number(n) || 0).toLocaleString("en-IN");
 
 const todayISO = () => new Date().toISOString().slice(0, 10);
 const monthsAgoISO = (n) => {
@@ -59,16 +67,30 @@ const downloadCSV = (rows, filename) => {
 };
 
 // ─── reusable bits ──────────────────────────────────────────────────────────
-function SummaryCard({ icon: Icon, label, value, accent = "teal", hint }) {
+function SummaryCard({ icon: Icon, label, value, accent = "teal", hint, onClick, active }) {
   const accentMap = {
     teal: "bg-teal-50 text-teal-700",
     indigo: "bg-indigo-50 text-indigo-700",
     amber: "bg-amber-50 text-amber-700",
     emerald: "bg-emerald-50 text-emerald-700",
     rose: "bg-rose-50 text-rose-700",
+    violet: "bg-violet-50 text-violet-700",
   };
-  return (
-    <div className="bg-white border rounded-xl p-4 hover:shadow-md transition-shadow">
+  const ringMap = {
+    teal: "ring-teal-500",
+    indigo: "ring-indigo-500",
+    amber: "ring-amber-500",
+    emerald: "ring-emerald-500",
+    rose: "ring-rose-500",
+    violet: "ring-violet-500",
+  };
+  const clickable = typeof onClick === "function";
+  const cls =
+    "bg-white border rounded-xl p-4 transition-shadow text-left w-full" +
+    (clickable ? " cursor-pointer hover:shadow-md" : " hover:shadow-md") +
+    (active ? ` ring-2 ${ringMap[accent] || ringMap.teal} shadow-md` : "");
+  const inner = (
+    <>
       <div className="flex items-center justify-between mb-2">
         <span className="text-xs font-medium text-gray-500 uppercase tracking-wide">{label}</span>
         <div className={`p-2 rounded-lg ${accentMap[accent] || accentMap.teal}`}>
@@ -81,8 +103,11 @@ function SummaryCard({ icon: Icon, label, value, accent = "teal", hint }) {
           <Info size={10} /> {hint}
         </div>
       )}
-    </div>
+    </>
   );
+  return clickable
+    ? <button type="button" onClick={onClick} className={cls}>{inner}</button>
+    : <div className={cls}>{inner}</div>;
 }
 
 function SectionCard({ title, subtitle, children, action }) {
@@ -121,202 +146,190 @@ function SortHeader({ children, sortKey, currentKey, currentDir, onSort, align =
   );
 }
 
-// ─── dummy data ─────────────────────────────────────────────────────────────
-const DUMMY_PRODUCTS = [
-  { id: "P001", name: "30K_FN_26_26",  type: "Group",      disbursed: 18500000, demand: 4500000, collected: 3825000 },
-  { id: "P002", name: "50K_FN_24_24",  type: "Group",      disbursed: 12400000, demand: 3800000, collected: 2964000 },
-  { id: "P003", name: "MSME_LAP",      type: "MSME",       disbursed:  8500000, demand: 2200000, collected: 1540000 },
-  { id: "P004", name: "PERSONAL_18M",  type: "Personal",   disbursed:  3200000, demand:  950000, collected:  720000 },
-  { id: "P005", name: "GROUP_GOLD",    type: "Group",      disbursed:  7600000, demand: 1800000, collected: 1530000 },
-  { id: "P006", name: "INDIV_STD_36",  type: "Individual", disbursed:  5400000, demand: 1300000, collected:  980000 },
-  { id: "P007", name: "INDIV_PREM_24", type: "Individual", disbursed:  4800000, demand: 1100000, collected:  858000 },
-  { id: "P008", name: "MSME_OD",       type: "MSME",       disbursed:  6700000, demand: 1700000, collected: 1156000 },
-  { id: "P009", name: "GROUP_75K_36",  type: "Group",      disbursed:  9200000, demand: 2100000, collected: 1764000 },
-  { id: "P010", name: "PERSONAL_24M",  type: "Personal",   disbursed:  2800000, demand:  820000, collected:  574000 },
-];
-
-const DUMMY_BRANCH_PERFORMANCE = [
-  { branch: "Periyakulam",   factor: 1.0 },
-  { branch: "Theni",         factor: 0.85 },
-  { branch: "Madurai",       factor: 1.15 },
-  { branch: "Dindigul",      factor: 0.65 },
-  { branch: "Cumbum",        factor: 0.75 },
-  { branch: "Bodinayakanur", factor: 0.5 },
-];
-
 const PIE_COLORS = ["#0d9488", "#6366f1", "#f59e0b", "#ef4444", "#10b981", "#8b5cf6", "#ec4899", "#14b8a6", "#f43f5e", "#84cc16"];
 
 // ─── main component ─────────────────────────────────────────────────────────
 export default function ReportsAnalytics({ user }) {
-  // ── filter (toolbar) state ──
+  // Filter state — applied separately so users can edit without firing fetches
   const [fromDate, setFromDate] = useState(monthsAgoISO(6));
   const [toDate, setToDate] = useState(todayISO());
+  const [branchFilter, setBranchFilter] = useState("");
+  const [productFilter, setProductFilter] = useState("");
+  const [categoryFilter, setCategoryFilter] = useState(""); // "" | "group" | "individual"
   const [appliedFrom, setAppliedFrom] = useState(fromDate);
   const [appliedTo, setAppliedTo] = useState(toDate);
+  const [appliedBranch, setAppliedBranch] = useState("");
+  const [appliedProduct, setAppliedProduct] = useState("");
+  const [appliedCategory, setAppliedCategory] = useState("");
 
-  // ── products table state ──
+  // Data state
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [errorMsg, setErrorMsg] = useState("");
+
+  // Recent-disbursements table state
   const [search, setSearch] = useState("");
-  const [sortKey, setSortKey] = useState("name");
-  const [sortDir, setSortDir] = useState("asc");
-  const [selectedIds, setSelectedIds] = useState(() => new Set());
+  const [sortKey, setSortKey] = useState("disbursement_date_iso");
+  const [sortDir, setSortDir] = useState("desc");
 
-  // ── refresh / loading ──
-  const [refreshing, setRefreshing] = useState(false);
+  // Selected KPI view — controls which focused detail section is shown below
+  // the KPI cards. "overview" = full layout (trend + branch + product +
+  // category + table). Any other value swaps in a focused view for that KPI.
+  // count | amount | avgTicket | customers | dates | branch | product | active | closed | pending
+  const [view, setView] = useState("overview");
+  const setKpiView = (v) => setView(prev => prev === v ? "overview" : v);
 
-  // ── import state ──
-  const [importMsg, setImportMsg] = useState("");
-  const [importStatus, setImportStatus] = useState("idle"); // idle | uploading | success | error
-  const [snapshotDate, setSnapshotDate] = useState(todayISO());
+  // Independent sort state for the Unique Customers focused view, so toggling
+  // it doesn't disturb the recent-disbursements table sort.
+  const [custSortKey, setCustSortKey] = useState("total");
+  const [custSortDir, setCustSortDir] = useState("desc");
+  const handleCustSort = (key) => {
+    if (custSortKey === key) setCustSortDir(d => d === "asc" ? "desc" : "asc");
+    else { setCustSortKey(key); setCustSortDir("desc"); }
+  };
+
+  // Branch / product dropdown options — derived from the latest fetch.
+  // (Users see the full universe regardless of which one is currently filtered.)
+  const [branchOptions, setBranchOptions] = useState([]);
+  const [productOptions, setProductOptions] = useState([]);
+
+  // ── fetch ──
+  // Re-fetches when the underlying filters OR the selected status view change.
+  // Server-side status filter ensures we get the FULL list of matching rows
+  // (not just the most recent N), so when "Closed" is clicked we see all
+  // closed customers, not the few that happened to be in the last 200.
+  const fetchData = useCallback(async () => {
+    setLoading(true); setErrorMsg("");
+    try {
+      const p = new URLSearchParams();
+      if (appliedFrom) p.set("from", appliedFrom);
+      if (appliedTo)   p.set("to", appliedTo);
+      if (appliedBranch) p.set("branch", appliedBranch);
+      if (appliedProduct) p.set("product", appliedProduct);
+      if (appliedCategory) p.set("category", appliedCategory);
+      // When a status pill is the active view, ask the server for that status.
+      if (view === "active" || view === "closed" || view === "pending") {
+        p.set("status", view);
+      }
+      const res = await fetch(`/api/od/disbursements?${p.toString()}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      setData(json);
+      // Capture full option lists on first unfiltered fetch.
+      if (!appliedBranch && !appliedProduct && !appliedCategory) {
+        setBranchOptions((json.byBranch || []).map(b => b.key).filter(Boolean));
+        setProductOptions((json.byProduct || []).map(b => b.key).filter(Boolean));
+      }
+    } catch (e) {
+      setErrorMsg(e.message || "Failed to load disbursement data");
+      setData(null);
+    } finally {
+      setLoading(false);
+    }
+  }, [appliedFrom, appliedTo, appliedBranch, appliedProduct, appliedCategory, view]);
+
+  useEffect(() => { fetchData(); }, [fetchData]);
+
+  // Sync the table sort to whichever KPI/view is selected, so the data the
+  // user sees matches the focus they picked. Users can still click any column
+  // header to override.
+  useEffect(() => {
+    switch (view) {
+      case "amount":
+      case "avgTicket":
+        setSortKey("loan_amount"); setSortDir("desc"); break;
+      case "branch":
+        setSortKey("branch"); setSortDir("asc"); break;
+      case "product":
+        setSortKey("product_name"); setSortDir("asc"); break;
+      case "dates":
+        setSortKey("disbursement_date_iso"); setSortDir("desc"); break;
+      case "count":
+      case "overview":
+      default:
+        setSortKey("disbursement_date_iso"); setSortDir("desc"); break;
+    }
+  }, [view]);
 
   // ── apply / preset handlers ──
   const handleApply = () => {
-    setRefreshing(true);
     setAppliedFrom(fromDate);
     setAppliedTo(toDate);
-    // simulated load — swap for real fetch
-    setTimeout(() => setRefreshing(false), 350);
+    setAppliedBranch(branchFilter);
+    setAppliedProduct(productFilter);
+    setAppliedCategory(categoryFilter);
   };
 
-  const handlePresetThisMonth = () => {
-    setFromDate(startOfMonthISO());
-    setToDate(todayISO());
-  };
-  const handlePresetLast3Months = () => {
-    setFromDate(monthsAgoISO(3));
-    setToDate(todayISO());
-  };
-  const handlePresetThisYear = () => {
-    setFromDate(startOfYearISO());
-    setToDate(todayISO());
-  };
+  const handlePresetThisMonth = () => { setFromDate(startOfMonthISO()); setToDate(todayISO()); };
+  const handlePresetLast3Months = () => { setFromDate(monthsAgoISO(3)); setToDate(todayISO()); };
+  const handlePresetThisYear = () => { setFromDate(startOfYearISO()); setToDate(todayISO()); };
 
-  // ── product table derivations ──
-  const filteredProducts = useMemo(() => {
+  // ── derived ──
+  const summary = data?.summary || { count: 0, totalAmount: 0, avgTicket: 0, customerCount: 0, active: 0, closed: 0, pending: 0 };
+  const byBranch = data?.byBranch || [];
+  const byProduct = data?.byProduct || [];
+  const byCategory = data?.byCategory || [];
+  const byMonth = data?.byMonth || [];
+  const recent = data?.recent || [];
+
+  const filteredRecent = useMemo(() => {
     const q = search.trim().toLowerCase();
-    let rows = DUMMY_PRODUCTS;
-    if (q) {
-      rows = rows.filter(
-        (r) =>
-          r.name.toLowerCase().includes(q) ||
-          r.type.toLowerCase().includes(q)
-      );
-    }
-    return rows;
-  }, [search]);
-
-  const sortedProducts = useMemo(() => {
-    const dir = sortDir === "asc" ? 1 : -1;
-    const rows = [...filteredProducts];
-    rows.sort((a, b) => {
-      // Derived columns
-      const aVal = sortKey === "remaining" ? a.demand - a.collected : a[sortKey];
-      const bVal = sortKey === "remaining" ? b.demand - b.collected : b[sortKey];
-      if (typeof aVal === "number" && typeof bVal === "number") return (aVal - bVal) * dir;
-      return String(aVal).localeCompare(String(bVal)) * dir;
+    // Status filter — only when one of the status pills is selected.
+    const statusFilter = view === "active" ? "Active"
+                       : view === "closed" ? "Closed"
+                       : view === "pending" ? "Pending"
+                       : null;
+    let arr = recent.filter(r => {
+      if (statusFilter && r.status !== statusFilter) return false;
+      if (q) {
+        return (r.customer_name || "").toLowerCase().includes(q) ||
+               (r.loan_account_no || "").toLowerCase().includes(q) ||
+               (r.customer_number || "").toLowerCase().includes(q) ||
+               (r.branch || "").toLowerCase().includes(q) ||
+               (r.product_name || "").toLowerCase().includes(q);
+      }
+      return true;
     });
-    return rows;
-  }, [filteredProducts, sortKey, sortDir]);
+    arr.sort((a, b) => {
+      const av = a[sortKey], bv = b[sortKey];
+      const an = Number(av), bn = Number(bv);
+      const numeric = Number.isFinite(an) && Number.isFinite(bn) && av !== "" && bv !== "";
+      const cmp = numeric ? an - bn : String(av ?? "").localeCompare(String(bv ?? ""));
+      return sortDir === "asc" ? cmp : -cmp;
+    });
+    return arr;
+  }, [recent, search, sortKey, sortDir, view]);
 
   const handleSort = (key) => {
-    if (sortKey === key) {
-      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
-    } else {
-      setSortKey(key);
-      setSortDir("asc");
-    }
+    if (sortKey === key) setSortDir(d => d === "asc" ? "desc" : "asc");
+    else { setSortKey(key); setSortDir("desc"); }
   };
-
-  // Selection state — selectedIds is the source of truth.
-  // visibleAllSelected = true iff every currently filtered/sorted row is selected.
-  const visibleIds = useMemo(() => sortedProducts.map((r) => r.id), [sortedProducts]);
-  const visibleAllSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id));
-  const visibleSomeSelected = visibleIds.some((id) => selectedIds.has(id)) && !visibleAllSelected;
-
-  const handleToggleRow = (id) => {
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      next.has(id) ? next.delete(id) : next.add(id);
-      return next;
-    });
-  };
-  const handleToggleAllVisible = () => {
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      if (visibleAllSelected) {
-        // un-select every visible row
-        for (const id of visibleIds) next.delete(id);
-      } else {
-        // select every visible row
-        for (const id of visibleIds) next.add(id);
-      }
-      return next;
-    });
-  };
-  const handleClearSelection = () => setSelectedIds(new Set());
-
-  // Effective rows that drive summary cards + charts. Empty selection means
-  // "no explicit filter" → use everything currently visible (post-search).
-  const effectiveRows = useMemo(() => {
-    if (selectedIds.size === 0) return sortedProducts;
-    return sortedProducts.filter((r) => selectedIds.has(r.id));
-  }, [sortedProducts, selectedIds]);
-
-  // ── summary totals ──
-  const totals = useMemo(() => {
-    const totalDemand    = effectiveRows.reduce((s, r) => s + r.demand, 0);
-    const totalCollected = effectiveRows.reduce((s, r) => s + r.collected, 0);
-    const totalDisbursed = effectiveRows.reduce((s, r) => s + r.disbursed, 0);
-    const remaining      = totalDemand - totalCollected;
-    const efficiency     = totalDemand > 0 ? (totalCollected / totalDemand) * 100 : 0;
-    return { totalDemand, totalCollected, totalDisbursed, remaining, efficiency };
-  }, [effectiveRows]);
-
-  // ── charts ──
-  // Branch performance scales the totals across mock branch factors.
-  const branchData = useMemo(
-    () =>
-      DUMMY_BRANCH_PERFORMANCE.map((b) => {
-        const demand = Math.round(totals.totalDemand * (b.factor / 5));
-        const collected = Math.round(totals.totalCollected * (b.factor / 5));
-        return {
-          branch: b.branch,
-          demand,
-          collected,
-          efficiency: demand > 0 ? Math.round((collected / demand) * 1000) / 10 : 0,
-        };
-      }),
-    [totals.totalDemand, totals.totalCollected]
-  );
-
-  const productChartData = useMemo(
-    () => effectiveRows.map((r) => ({ name: r.name, value: r.demand })),
-    [effectiveRows]
-  );
 
   // ── exports ──
   const exportRowsForCSV = () =>
-    effectiveRows.map((r) => ({
-      Product: r.name,
-      Type: r.type,
-      Disbursement: r.disbursed,
-      Demand: r.demand,
-      Collected: r.collected,
-      Remaining: r.demand - r.collected,
+    filteredRecent.map((r) => ({
+      LoanAccount: r.loan_account_no || "",
+      CustomerID: r.customer_number || "",
+      CustomerName: r.customer_name || "",
+      Branch: r.branch || "",
+      Product: r.product_name || "",
+      Category: r.loan_category || "",
+      DisbursementDate: r.disbursement_date_iso || "",
+      LoanAmount: r.loan_amount || 0,
+      Status: r.status || "",
     }));
 
-  const handleExportCSV = () => downloadCSV(exportRowsForCSV(), `reports-products-${todayISO()}.csv`);
-  const handleExportExcel = () => downloadCSV(exportRowsForCSV(), `reports-products-${todayISO()}.xls`);
+  const handleExportCSV = () => downloadCSV(exportRowsForCSV(), `disbursements-${todayISO()}.csv`);
+  const handleExportExcel = () => downloadCSV(exportRowsForCSV(), `disbursements-${todayISO()}.xls`);
   const handleExportPDF = () => {
     const w = window.open("", "_blank", "width=900,height=700");
     if (!w) return;
-    const rowsHtml = effectiveRows
-      .map(
-        (r) =>
-          `<tr><td>${r.name}</td><td>${r.type}</td><td>${formatINR(r.disbursed)}</td><td>${formatINR(r.demand)}</td><td>${formatINR(r.collected)}</td><td>${formatINR(r.demand - r.collected)}</td></tr>`
-      )
-      .join("");
+    const rowsHtml = filteredRecent
+      .map(r =>
+        `<tr><td>${r.disbursement_date_iso || ""}</td><td>${r.customer_name || ""}</td><td>${r.loan_account_no || ""}</td><td>${r.branch || ""}</td><td>${r.product_name || ""}</td><td>${r.loan_category || ""}</td><td>${formatINR(r.loan_amount)}</td><td>${r.status || ""}</td></tr>`
+      ).join("");
     w.document.write(`
-      <!doctype html><html><head><title>Reports — ${todayISO()}</title>
+      <!doctype html><html><head><title>Disbursement Report — ${todayISO()}</title>
       <style>
         body{font-family:system-ui,sans-serif;padding:24px;color:#111}
         h1{margin:0 0 4px;font-size:20px}
@@ -325,18 +338,23 @@ export default function ReportsAnalytics({ user }) {
         th,td{border:1px solid #d1d5db;padding:6px 10px;text-align:left}
         th{background:#f3f4f6;font-weight:600}
       </style></head><body>
-      <h1>Reports &amp; Analytics</h1>
-      <div>Period: ${appliedFrom} → ${appliedTo} · Selected: ${selectedIds.size || "all"} products · Generated: ${new Date().toLocaleString()}</div>
-      <h2>Financial Summary</h2>
+      <h1>Disbursement Analytics</h1>
+      <div>Period: ${appliedFrom} → ${appliedTo}${appliedBranch ? ` · Branch: ${appliedBranch}` : ""}${appliedProduct ? ` · Product: ${appliedProduct}` : ""}${appliedCategory ? ` · Category: ${appliedCategory}` : ""} · Generated: ${new Date().toLocaleString()}</div>
+      <h2>Summary</h2>
       <table><tr>
-        <th>Total Demand</th><td>${formatINR(totals.totalDemand)}</td>
-        <th>Total Collected</th><td>${formatINR(totals.totalCollected)}</td>
-        <th>Remaining</th><td>${formatINR(totals.remaining)}</td>
-        <th>Efficiency</th><td>${totals.efficiency.toFixed(1)}%</td>
+        <th>Total Disbursements</th><td>${formatNum(summary.count)}</td>
+        <th>Total Amount</th><td>${formatINR(summary.totalAmount)}</td>
+        <th>Avg Ticket</th><td>${formatINR(summary.avgTicket)}</td>
+        <th>Customers</th><td>${formatNum(summary.customerCount)}</td>
+      </tr><tr>
+        <th>Active</th><td>${formatNum(summary.active)}</td>
+        <th>Closed</th><td>${formatNum(summary.closed)}</td>
+        <th>Pending</th><td>${formatNum(summary.pending)}</td>
+        <th></th><td></td>
       </tr></table>
-      <h2>Selected Loan Products</h2>
+      <h2>Disbursements (showing ${filteredRecent.length})</h2>
       <table>
-        <thead><tr><th>Product</th><th>Type</th><th>Disbursement</th><th>Demand</th><th>Collected</th><th>Remaining</th></tr></thead>
+        <thead><tr><th>Date</th><th>Customer</th><th>Loan A/C</th><th>Branch</th><th>Product</th><th>Category</th><th>Amount</th><th>Status</th></tr></thead>
         <tbody>${rowsHtml}</tbody>
       </table>
       <script>window.onload=()=>window.print()</script>
@@ -345,442 +363,437 @@ export default function ReportsAnalytics({ user }) {
     w.document.close();
   };
 
-  // ── import (wired to real /api/od/pool/upload — no second write path) ──
-  const handleImport = async (e) => {
-    const file = e.target.files?.[0];
-    e.target.value = "";
-    if (!file) return;
+  // ── trend chart series (count + amount per month) ──
+  const trendData = useMemo(
+    () => byMonth.map(m => ({ month: m.key, count: m.count, total: Math.round(m.total) })),
+    [byMonth]
+  );
 
-    setImportStatus("uploading");
-    setImportMsg(`Uploading "${file.name}" (${(file.size / 1024 / 1024).toFixed(2)} MB) for snapshot ${snapshotDate}…`);
-
-    try {
-      const fd = new FormData();
-      fd.append("file", file);
-      fd.append("snapshotDate", snapshotDate);
-
-      const res = await fetch("/api/od/pool/upload", {
-        method: "POST",
-        headers: {
-          "x-od-user": user?.id || "",
-          "x-od-role": user?.role || "",
-        },
-        body: fd,
-      });
-
-      const json = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        const reason = json?.error || `HTTP ${res.status}`;
-        setImportStatus("error");
-        setImportMsg(`Import failed: ${reason}`);
-        return;
-      }
-
-      setImportStatus("success");
-      setImportMsg(
-        `Imported ${json.rowCount?.toLocaleString?.() ?? json.rowCount ?? "?"} rows for ${json.snapshotDate || snapshotDate}` +
-        (json.newBranches ? ` (${json.newBranches} new branches)` : "")
-      );
-    } catch (err) {
-      setImportStatus("error");
-      setImportMsg(`Import failed: ${err.message || err}`);
-    }
-  };
+  // ── product pie chart ──
+  const productPie = useMemo(
+    () => byProduct.slice(0, 10).map(p => ({ name: p.key, value: p.total, count: p.count })),
+    [byProduct]
+  );
 
   // ────────────────────────────────────────────────────────────────────────
   return (
     <div className="space-y-5">
-      {/* 1. Header — title left, Refresh right */}
+      {/* 1. Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <div className="p-2 bg-teal-50 rounded-lg text-teal-700"><Activity size={20} /></div>
           <div>
             <h1 className="text-xl font-bold text-gray-900">Reports &amp; Analytics</h1>
-            <p className="text-xs text-gray-500">Loan portfolio insights, performance metrics, import &amp; export</p>
+            <p className="text-xs text-gray-500">Disbursement analytics from the Pool Reports uploaded via OD Upload</p>
           </div>
         </div>
         <button
-          onClick={handleApply}
-          disabled={refreshing}
+          onClick={fetchData}
+          disabled={loading}
           className="inline-flex items-center gap-1.5 text-xs bg-teal-600 text-white px-3 py-2 rounded-lg hover:bg-teal-700 disabled:opacity-50"
         >
-          <RefreshCw size={12} className={refreshing ? "animate-spin" : ""} />
-          {refreshing ? "Refreshing…" : "Refresh"}
+          <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
+          {loading ? "Loading…" : "Refresh"}
         </button>
       </div>
 
-      {/* 2. Filter Toolbar — top control panel, NOT inside a card */}
+      {/* 2. Filter Toolbar */}
       <div className="bg-gray-50 border rounded-xl px-4 py-3 shadow-sm">
-        <div className="flex flex-col md:flex-row md:items-end gap-3">
-          {/* From */}
-          <div className="flex-1 min-w-[160px]">
+        <div className="grid grid-cols-1 md:grid-cols-6 gap-3 items-end">
+          <div>
             <label className="text-[11px] text-gray-500 mb-1 block flex items-center gap-1">
               <Calendar size={11} /> Disbursement From
             </label>
-            <input
-              type="date"
-              value={fromDate}
-              onChange={(e) => setFromDate(e.target.value)}
-              className="w-full border rounded-lg px-3 py-1.5 text-sm bg-white"
-            />
+            <input type="date" value={fromDate} onChange={e => setFromDate(e.target.value)}
+              className="w-full border rounded-lg px-3 py-1.5 text-sm bg-white" />
           </div>
-          {/* To */}
-          <div className="flex-1 min-w-[160px]">
+          <div>
             <label className="text-[11px] text-gray-500 mb-1 block flex items-center gap-1">
               <Calendar size={11} /> Disbursement To
             </label>
-            <input
-              type="date"
-              value={toDate}
-              onChange={(e) => setToDate(e.target.value)}
-              className="w-full border rounded-lg px-3 py-1.5 text-sm bg-white"
-            />
+            <input type="date" value={toDate} onChange={e => setToDate(e.target.value)}
+              className="w-full border rounded-lg px-3 py-1.5 text-sm bg-white" />
           </div>
-          {/* Apply */}
           <div>
-            <button
-              onClick={handleApply}
-              className="inline-flex items-center gap-1.5 px-4 py-2 bg-teal-600 text-white text-sm rounded-lg hover:bg-teal-700"
-            >
-              <Filter size={14} /> Apply Filters
-            </button>
+            <label className="text-[11px] text-gray-500 mb-1 block flex items-center gap-1">
+              <Building2 size={11} /> Branch
+            </label>
+            <select value={branchFilter} onChange={e => setBranchFilter(e.target.value)}
+              className="w-full border rounded-lg px-3 py-1.5 text-sm bg-white">
+              <option value="">All branches</option>
+              {branchOptions.map(b => <option key={b} value={b}>{b}</option>)}
+            </select>
           </div>
-          {/* Presets */}
-          <div className="flex flex-wrap gap-1.5 md:ml-auto">
-            <button
-              onClick={handlePresetThisMonth}
-              className="text-[11px] px-2.5 py-1.5 bg-white border rounded-md hover:bg-gray-100 text-gray-700"
-            >
-              This Month
-            </button>
-            <button
-              onClick={handlePresetLast3Months}
-              className="text-[11px] px-2.5 py-1.5 bg-white border rounded-md hover:bg-gray-100 text-gray-700"
-            >
-              Last 3 Months
-            </button>
-            <button
-              onClick={handlePresetThisYear}
-              className="text-[11px] px-2.5 py-1.5 bg-white border rounded-md hover:bg-gray-100 text-gray-700"
-            >
-              This Year
+          <div>
+            <label className="text-[11px] text-gray-500 mb-1 block flex items-center gap-1">
+              <Package size={11} /> Product
+            </label>
+            <select value={productFilter} onChange={e => setProductFilter(e.target.value)}
+              className="w-full border rounded-lg px-3 py-1.5 text-sm bg-white">
+              <option value="">All products</option>
+              {productOptions.map(p => <option key={p} value={p}>{p}</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="text-[11px] text-gray-500 mb-1 block">Category</label>
+            <div className="flex rounded-lg border overflow-hidden text-xs">
+              {[["", "All"], ["group", "Group"], ["individual", "Individual"]].map(([k, label]) => (
+                <button
+                  key={k || "all"}
+                  onClick={() => setCategoryFilter(k)}
+                  className={`flex-1 px-2 py-1.5 ${categoryFilter === k ? "bg-teal-600 text-white" : "bg-white text-gray-700 hover:bg-gray-100"}`}>
+                  {label}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div>
+            <button onClick={handleApply}
+              className="w-full inline-flex items-center justify-center gap-1.5 px-4 py-2 bg-teal-600 text-white text-sm rounded-lg hover:bg-teal-700">
+              <Filter size={14} /> Apply
             </button>
           </div>
         </div>
-        <div className="mt-2 text-[11px] text-gray-500">
-          Active period: <b className="text-gray-700">{appliedFrom}</b> → <b className="text-gray-700">{appliedTo}</b>
-          {selectedIds.size > 0 && (
-            <> · <b className="text-teal-700">{selectedIds.size}</b> product{selectedIds.size === 1 ? "" : "s"} selected</>
-          )}
+        <div className="flex flex-wrap gap-1.5 mt-3">
+          <span className="text-[11px] text-gray-500 mr-1">Quick range:</span>
+          <button onClick={handlePresetThisMonth}
+            className="text-[11px] px-2.5 py-1 bg-white border rounded-md hover:bg-gray-100 text-gray-700">This Month</button>
+          <button onClick={handlePresetLast3Months}
+            className="text-[11px] px-2.5 py-1 bg-white border rounded-md hover:bg-gray-100 text-gray-700">Last 3 Months</button>
+          <button onClick={handlePresetThisYear}
+            className="text-[11px] px-2.5 py-1 bg-white border rounded-md hover:bg-gray-100 text-gray-700">This Year</button>
         </div>
+        {errorMsg && (
+          <div className="mt-2 text-[11px] text-rose-700 bg-rose-50 px-2 py-1 rounded">{errorMsg}</div>
+        )}
       </div>
 
-      {/* 3. Loan Products Table */}
+      {/* 3. KPI cards — clickable, switch the focused detail view below */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+        <SummaryCard icon={Activity} label="Total Disbursements" value={formatNum(summary.count)}
+          accent="teal" hint="Click to see all disbursement records"
+          onClick={() => setKpiView("count")} active={view === "count"} />
+        <SummaryCard icon={Wallet} label="Total Amount" value={formatINR(summary.totalAmount)}
+          accent="indigo" hint="Click to see amount breakdown"
+          onClick={() => setKpiView("amount")} active={view === "amount"} />
+        <SummaryCard icon={TrendingUp} label="Avg Ticket Size" value={formatINR(summary.avgTicket)}
+          accent="emerald" hint="Click to see ticket-size distribution"
+          onClick={() => setKpiView("avgTicket")} active={view === "avgTicket"} />
+        <SummaryCard icon={Users} label="Unique Customers" value={formatNum(summary.customerCount)}
+          accent="amber" hint="Click to see customer-grouped list"
+          onClick={() => setKpiView("customers")} active={view === "customers"} />
+      </div>
+
+      {/* View-switcher strip — additional non-KPI views */}
+      <div className="flex flex-wrap gap-1.5 items-center">
+        <span className="text-[11px] text-gray-500 mr-1">View:</span>
+        {[
+          ["overview", "Overview"],
+          ["count", "All Records"],
+          ["dates", "By Date"],
+          ["branch", "By Branch"],
+          ["product", "By Product"],
+          ["amount", "By Amount"],
+          ["avgTicket", "Avg Ticket"],
+          ["customers", "By Customer"],
+          ["active", "Active"],
+          ["closed", "Closed"],
+          ["pending", "Pending"],
+        ].map(([k, label]) => (
+          <button key={k} onClick={() => setView(k)}
+            className={`text-[11px] px-2.5 py-1 border rounded-md ${view === k ? "bg-teal-600 text-white border-teal-700" : "bg-white text-gray-700 hover:bg-gray-100"}`}>
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {/* 4. Status split — clickable. Visible on Overview AND on the
+          active / closed / pending focused views (so user can re-toggle). */}
+      {(view === "overview" || view === "active" || view === "closed" || view === "pending") && (
+        <div className="grid grid-cols-3 gap-3">
+          <button type="button" onClick={() => setKpiView("active")}
+            className={`bg-emerald-50 border rounded-xl p-3 text-center cursor-pointer hover:shadow-md transition-shadow ${view === "active" ? "border-emerald-500 ring-2 ring-emerald-500 shadow-md" : "border-emerald-200"}`}>
+            <p className="text-[11px] text-emerald-700 uppercase tracking-wide">Active</p>
+            <p className="text-2xl font-extrabold text-emerald-700">{formatNum(summary.active)}</p>
+            <p className="text-[10px] text-gray-500">Has pool snapshot, not closed</p>
+          </button>
+          <button type="button" onClick={() => setKpiView("closed")}
+            className={`bg-gray-100 border rounded-xl p-3 text-center cursor-pointer hover:shadow-md transition-shadow ${view === "closed" ? "border-gray-500 ring-2 ring-gray-500 shadow-md" : "border-gray-300"}`}>
+            <p className="text-[11px] text-gray-700 uppercase tracking-wide">Closed</p>
+            <p className="text-2xl font-extrabold text-gray-700">{formatNum(summary.closed)}</p>
+            <p className="text-[10px] text-gray-500">In foreclosure_snapshots</p>
+          </button>
+          <button type="button" onClick={() => setKpiView("pending")}
+            className={`bg-amber-50 border rounded-xl p-3 text-center cursor-pointer hover:shadow-md transition-shadow ${view === "pending" ? "border-amber-500 ring-2 ring-amber-500 shadow-md" : "border-amber-200"}`}>
+            <p className="text-[11px] text-amber-700 uppercase tracking-wide">Pending / No-Snapshot</p>
+            <p className="text-2xl font-extrabold text-amber-700">{formatNum(summary.pending)}</p>
+            <p className="text-[10px] text-gray-500">Customer master only</p>
+          </button>
+        </div>
+      )}
+
+      {/* Focused view — Avg Ticket distribution stats */}
+      {view === "avgTicket" && (
+        <SectionCard title="Average Ticket Size — calculation & distribution" subtitle={`${formatINR(summary.avgTicket)} = ${formatINR(summary.totalAmount)} ÷ ${formatNum(summary.count)} disbursements`}>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+            <div className="bg-gray-50 border rounded-lg p-3">
+              <p className="text-[11px] text-gray-500">Min</p>
+              <p className="text-sm font-bold">{formatINR(Math.min(...recent.map(r => r.loan_amount).filter(v => v > 0)))}</p>
+            </div>
+            <div className="bg-gray-50 border rounded-lg p-3">
+              <p className="text-[11px] text-gray-500">Max</p>
+              <p className="text-sm font-bold">{formatINR(Math.max(0, ...recent.map(r => r.loan_amount)))}</p>
+            </div>
+            <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-3">
+              <p className="text-[11px] text-emerald-700">Average</p>
+              <p className="text-sm font-bold text-emerald-700">{formatINR(summary.avgTicket)}</p>
+            </div>
+            <div className="bg-indigo-50 border border-indigo-200 rounded-lg p-3">
+              <p className="text-[11px] text-indigo-700">Sample size</p>
+              <p className="text-sm font-bold text-indigo-700">{formatNum(summary.count)}</p>
+            </div>
+          </div>
+          <p className="text-[11px] text-gray-500">Sample size = total disbursements matching the current filters. The recent-disbursements table below shows individual ticket sizes — click a column header to sort.</p>
+        </SectionCard>
+      )}
+
+      {/* Focused view — Customer-grouped list (sortable by any column, both
+          ascending and descending). Uses an independent sort state so it
+          doesn't interfere with the recent-disbursements table below. */}
+      {view === "customers" && (() => {
+        // Group recent disbursements by customer_number (build once per render).
+        const grouped = new Map();
+        for (const r of recent) {
+          const k = r.customer_number || r.customer_name || "-";
+          const cur = grouped.get(k) || { id: k, name: r.customer_name || "", branch: r.branch || "", loans: 0, total: 0 };
+          cur.loans += 1;
+          cur.total += Number(r.loan_amount) || 0;
+          grouped.set(k, cur);
+        }
+        const arr = [...grouped.values()].sort((a, b) => {
+          const av = a[custSortKey], bv = b[custSortKey];
+          const an = Number(av), bn = Number(bv);
+          const numeric = Number.isFinite(an) && Number.isFinite(bn) && av !== "" && bv !== "";
+          const cmp = numeric ? an - bn : String(av ?? "").localeCompare(String(bv ?? ""));
+          return custSortDir === "asc" ? cmp : -cmp;
+        });
+        return (
+          <SectionCard title="Unique Customers" subtitle={`${formatNum(summary.customerCount)} distinct customer IDs across the filtered disbursements`}>
+            <div className="overflow-x-auto rounded-lg border max-h-[500px] overflow-y-auto">
+              <table className="w-full text-xs">
+                <thead className="bg-gray-50 sticky top-0">
+                  <tr>
+                    <SortHeader sortKey="id" currentKey={custSortKey} currentDir={custSortDir} onSort={handleCustSort}>Customer ID</SortHeader>
+                    <SortHeader sortKey="name" currentKey={custSortKey} currentDir={custSortDir} onSort={handleCustSort}>Customer Name</SortHeader>
+                    <SortHeader sortKey="branch" currentKey={custSortKey} currentDir={custSortDir} onSort={handleCustSort}>Branch</SortHeader>
+                    <SortHeader sortKey="loans" currentKey={custSortKey} currentDir={custSortDir} onSort={handleCustSort} align="right">Loans</SortHeader>
+                    <SortHeader sortKey="total" currentKey={custSortKey} currentDir={custSortDir} onSort={handleCustSort} align="right">Total Disbursed</SortHeader>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  {arr.length === 0 ? (
+                    <tr><td colSpan={5} className="px-3 py-6 text-center text-gray-400">No customers in current filter.</td></tr>
+                  ) : arr.map(c => (
+                    <tr key={c.id} className="hover:bg-gray-50">
+                      <td className="px-3 py-2 font-mono text-gray-500">{c.id}</td>
+                      <td className="px-3 py-2 font-medium text-gray-800">{c.name || "—"}</td>
+                      <td className="px-3 py-2 text-gray-700">{c.branch || "—"}</td>
+                      <td className="px-3 py-2 text-right">{c.loans}</td>
+                      <td className="px-3 py-2 text-right font-semibold">{formatINR(c.total)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="text-[11px] text-gray-500 mt-2">
+              Showing {arr.length} unique customers · Click any column header to sort ascending/descending.
+            </div>
+          </SectionCard>
+        );
+      })()}
+
+      {/* 5. Trend chart — overview + dates view */}
+      {(view === "overview" || view === "dates") && (
+      <SectionCard title="Disbursement Trend" subtitle="Monthly disbursement volume and total amount">
+        {trendData.length === 0 ? (
+          <div className="text-gray-400 text-sm py-6 text-center">No disbursements in this range.</div>
+        ) : (
+          <ResponsiveContainer width="100%" height={260}>
+            <LineChart data={trendData}>
+              <CartesianGrid strokeDasharray="3 3" />
+              <XAxis dataKey="month" fontSize={11} />
+              <YAxis yAxisId="left" fontSize={11} tickFormatter={v => formatNum(v)} />
+              <YAxis yAxisId="right" orientation="right" fontSize={11} tickFormatter={v => Math.round(v / 100000) + "L"} />
+              <Tooltip formatter={(value, name) => name === "total" ? formatINR(value) : formatNum(value)} />
+              <Legend wrapperStyle={{ fontSize: 12 }} />
+              <Line yAxisId="left" type="monotone" dataKey="count" stroke="#0d9488" strokeWidth={2} name="Count" />
+              <Line yAxisId="right" type="monotone" dataKey="total" stroke="#6366f1" strokeWidth={2} name="Amount" />
+            </LineChart>
+          </ResponsiveContainer>
+        )}
+      </SectionCard>
+      )}
+
+      {/* 6. Branch + Product breakdowns — overview shows both side-by-side;
+          focused branch/product views show just the relevant chart full-width. */}
+      {(view === "overview" || view === "branch" || view === "product") && (
+      <div className={view === "overview" ? "grid grid-cols-1 lg:grid-cols-2 gap-4" : "grid grid-cols-1 gap-4"}>
+        {(view === "overview" || view === "branch") && (
+        <SectionCard title="Branch-wise Disbursements" subtitle="Top 30 branches by total disbursed amount">
+          {byBranch.length === 0 ? (
+            <div className="text-gray-400 text-sm py-6 text-center">No data.</div>
+          ) : (
+            <ResponsiveContainer width="100%" height={260}>
+              <BarChart data={byBranch.slice(0, 15)}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="key" fontSize={11} interval={0} angle={-30} textAnchor="end" height={60} />
+                <YAxis fontSize={11} tickFormatter={v => Math.round(v / 100000) + "L"} />
+                <Tooltip formatter={v => formatINR(v)} />
+                <Bar dataKey="total" fill="#0d9488" name="Disbursed" />
+              </BarChart>
+            </ResponsiveContainer>
+          )}
+        </SectionCard>
+        )}
+        {(view === "overview" || view === "product") && (
+        <SectionCard title="Product-wise Disbursements" subtitle="Top 10 products by amount">
+          {productPie.length === 0 ? (
+            <div className="text-gray-400 text-sm py-6 text-center">No data.</div>
+          ) : (
+            <ResponsiveContainer width="100%" height={260}>
+              <PieChart>
+                <Pie data={productPie} cx="50%" cy="50%" innerRadius={45} outerRadius={85}
+                  dataKey="value" label={(e) => e.name}>
+                  {productPie.map((p, i) => <Cell key={p.name} fill={PIE_COLORS[i % PIE_COLORS.length]} />)}
+                </Pie>
+                <Tooltip formatter={(v, n, e) => [`${formatINR(v)} (${formatNum(e.payload.count)} loans)`, e.payload.name]} />
+              </PieChart>
+            </ResponsiveContainer>
+          )}
+        </SectionCard>
+        )}
+      </div>
+      )}
+
+      {/* 7. Category split — overview only */}
+      {view === "overview" && (
+      <SectionCard title="Loan Category Split" subtitle="Group Loan vs Individual Loan disbursements">
+        {byCategory.length === 0 ? (
+          <div className="text-gray-400 text-sm py-6 text-center">No data.</div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <ResponsiveContainer width="100%" height={200}>
+              <BarChart data={byCategory} layout="vertical">
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis type="number" fontSize={11} tickFormatter={v => Math.round(v / 100000) + "L"} />
+                <YAxis type="category" dataKey="key" fontSize={12} width={100} />
+                <Tooltip formatter={v => formatINR(v)} />
+                <Bar dataKey="total" fill="#6366f1" />
+              </BarChart>
+            </ResponsiveContainer>
+            <div className="space-y-2">
+              {byCategory.map((c) => (
+                <div key={c.key} className="flex items-center justify-between bg-white border rounded-lg p-3">
+                  <span className="font-medium text-gray-800">{c.key}</span>
+                  <div className="text-right">
+                    <div className="font-bold text-gray-900">{formatINR(c.total)}</div>
+                    <div className="text-[11px] text-gray-500">{formatNum(c.count)} loans</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </SectionCard>
+      )}
+
+      {/* 8. Recent disbursements table */}
       <SectionCard
-        title="Select Loan Products"
-        subtitle="Tick rows to filter the dashboard. Empty selection = all visible products."
+        title={view === "active" ? "Active Disbursements"
+             : view === "closed" ? "Closed Disbursements"
+             : view === "pending" ? "Pending / No-Snapshot Disbursements"
+             : view === "customers" ? "Recent Disbursements (per-customer view shown above)"
+             : view === "amount" ? "Disbursements (sorted by amount)"
+             : "Recent Disbursements"}
+        subtitle={`Showing ${filteredRecent.length} of ${recent.length} disbursements${view === "active" || view === "closed" || view === "pending" ? ` filtered to ${view}` : ""}`}
         action={
-          <div className="flex items-center gap-2">
-            {selectedIds.size > 0 && (
-              <button
-                onClick={handleClearSelection}
-                className="text-[11px] text-gray-500 hover:text-gray-800"
-              >
-                Clear ({selectedIds.size})
-              </button>
-            )}
-            <button
-              onClick={handleExportCSV}
-              title="Export selected (or all visible) rows as CSV"
-              className="text-xs text-teal-700 flex items-center gap-1 hover:underline"
-            >
-              <Download size={12} /> CSV
-            </button>
+          <div className="relative">
+            <Search size={12} className="absolute left-2 top-2 text-gray-400" />
+            <input value={search} onChange={e => setSearch(e.target.value)}
+              placeholder="Search name / loan / branch…"
+              className="border rounded-md pl-7 pr-2 py-1 text-xs w-56" />
           </div>
         }
       >
-        {/* Search */}
-        <div className="mb-3 relative max-w-sm">
-          <Search size={14} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-gray-400" />
-          <input
-            type="text"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder="Search by product name or loan type…"
-            className="w-full border rounded-lg pl-8 pr-3 py-2 text-sm"
-          />
-        </div>
-
-        {/* Scrollable table with sticky header */}
-        <div className="overflow-x-auto border rounded-lg max-h-[420px] overflow-y-auto">
-          <table className="w-full text-sm">
-            <thead className="bg-gray-50 sticky top-0 z-10 shadow-sm">
+        <div className="overflow-x-auto rounded-lg border">
+          <table className="w-full text-xs">
+            <thead className="bg-gray-50">
               <tr>
-                <th className="px-3 py-2 w-10">
-                  <button
-                    type="button"
-                    onClick={handleToggleAllVisible}
-                    className="flex items-center"
-                    title={visibleAllSelected ? "Deselect all" : "Select all"}
-                  >
-                    {visibleAllSelected ? (
-                      <CheckSquare size={16} className="text-teal-600" />
-                    ) : visibleSomeSelected ? (
-                      <CheckSquare size={16} className="text-teal-300" />
-                    ) : (
-                      <Square size={16} className="text-gray-400" />
-                    )}
-                  </button>
-                </th>
-                <SortHeader sortKey="name"       currentKey={sortKey} currentDir={sortDir} onSort={handleSort}>Loan Product</SortHeader>
-                <SortHeader sortKey="type"       currentKey={sortKey} currentDir={sortDir} onSort={handleSort}>Loan Type</SortHeader>
-                <SortHeader sortKey="disbursed"  currentKey={sortKey} currentDir={sortDir} onSort={handleSort} align="right">Total Disbursement</SortHeader>
-                <SortHeader sortKey="demand"     currentKey={sortKey} currentDir={sortDir} onSort={handleSort} align="right">Total Demand</SortHeader>
-                <SortHeader sortKey="collected"  currentKey={sortKey} currentDir={sortDir} onSort={handleSort} align="right">Total Collected</SortHeader>
-                <SortHeader sortKey="remaining"  currentKey={sortKey} currentDir={sortDir} onSort={handleSort} align="right">Remaining Balance</SortHeader>
+                <SortHeader sortKey="disbursement_date_iso" currentKey={sortKey} currentDir={sortDir} onSort={handleSort}>Date</SortHeader>
+                <SortHeader sortKey="customer_name" currentKey={sortKey} currentDir={sortDir} onSort={handleSort}>Customer</SortHeader>
+                <SortHeader sortKey="loan_account_no" currentKey={sortKey} currentDir={sortDir} onSort={handleSort}>Loan A/C</SortHeader>
+                <SortHeader sortKey="branch" currentKey={sortKey} currentDir={sortDir} onSort={handleSort}>Branch</SortHeader>
+                <SortHeader sortKey="product_name" currentKey={sortKey} currentDir={sortDir} onSort={handleSort}>Product</SortHeader>
+                <SortHeader sortKey="loan_category" currentKey={sortKey} currentDir={sortDir} onSort={handleSort}>Category</SortHeader>
+                <SortHeader sortKey="loan_amount" currentKey={sortKey} currentDir={sortDir} onSort={handleSort} align="right">Amount</SortHeader>
+                <SortHeader sortKey="status" currentKey={sortKey} currentDir={sortDir} onSort={handleSort}>Status</SortHeader>
               </tr>
             </thead>
-            <tbody>
-              {sortedProducts.length === 0 ? (
-                <tr>
-                  <td colSpan={7} className="px-3 py-8 text-center text-gray-400">
-                    No products match the search.
-                  </td>
-                </tr>
+            <tbody className="divide-y divide-gray-100">
+              {filteredRecent.length === 0 ? (
+                <tr><td colSpan={8} className="px-3 py-6 text-center text-gray-400">No disbursements match the current filters.</td></tr>
               ) : (
-                sortedProducts.map((r, i) => {
-                  const selected = selectedIds.has(r.id);
-                  const remaining = r.demand - r.collected;
-                  return (
-                    <tr
-                      key={r.id}
-                      onClick={() => handleToggleRow(r.id)}
-                      className={`border-t cursor-pointer transition-colors ${
-                        selected
-                          ? "bg-teal-50 hover:bg-teal-100"
-                          : i % 2 === 0
-                          ? "bg-white hover:bg-gray-50"
-                          : "bg-gray-50/60 hover:bg-gray-100"
-                      }`}
-                    >
-                      <td className="px-3 py-2" onClick={(e) => e.stopPropagation()}>
-                        <button
-                          type="button"
-                          onClick={() => handleToggleRow(r.id)}
-                          className="flex items-center"
-                          aria-label={selected ? "Deselect row" : "Select row"}
-                        >
-                          {selected ? (
-                            <CheckSquare size={16} className="text-teal-600" />
-                          ) : (
-                            <Square size={16} className="text-gray-400" />
-                          )}
-                        </button>
-                      </td>
-                      <td className="px-3 py-2 font-medium text-gray-800">{r.name}</td>
-                      <td className="px-3 py-2">
-                        <span className={`text-[11px] px-2 py-0.5 rounded ${
-                          r.type === "Group"      ? "bg-teal-100 text-teal-700" :
-                          r.type === "Individual" ? "bg-indigo-100 text-indigo-700" :
-                          r.type === "MSME"       ? "bg-amber-100 text-amber-700" :
-                          r.type === "Personal"   ? "bg-rose-100 text-rose-700" :
-                                                    "bg-gray-100 text-gray-700"
-                        }`}>{r.type}</span>
-                      </td>
-                      <td className="px-3 py-2 text-right">{formatINR(r.disbursed)}</td>
-                      <td className="px-3 py-2 text-right">{formatINR(r.demand)}</td>
-                      <td className="px-3 py-2 text-right">{formatINR(r.collected)}</td>
-                      <td className="px-3 py-2 text-right">{formatINR(remaining)}</td>
-                    </tr>
-                  );
-                })
+                filteredRecent.map((r) => (
+                  <tr key={r.loan_account_no} className="hover:bg-gray-50">
+                    <td className="px-3 py-2 text-gray-700">{r.disbursement_date_iso || "—"}</td>
+                    <td className="px-3 py-2 font-medium text-gray-800">{r.customer_name || "—"}</td>
+                    <td className="px-3 py-2 font-mono text-gray-500">{r.loan_account_no}</td>
+                    <td className="px-3 py-2 text-gray-700">{r.branch || "—"}</td>
+                    <td className="px-3 py-2 text-gray-700">{r.product_name || "—"}</td>
+                    <td className="px-3 py-2">
+                      <span className={`text-[10px] px-1.5 py-0.5 rounded ${
+                        /GROUP/i.test(r.loan_category || "") ? "bg-teal-100 text-teal-700"
+                        : /INDIVIDUAL/i.test(r.loan_category || "") ? "bg-indigo-100 text-indigo-700"
+                        : "bg-gray-100 text-gray-700"
+                      }`}>{r.loan_category || "—"}</span>
+                    </td>
+                    <td className="px-3 py-2 text-right font-semibold">{formatINR(r.loan_amount)}</td>
+                    <td className="px-3 py-2">
+                      <span className={`text-[10px] px-1.5 py-0.5 rounded ${
+                        r.status === "Closed" ? "bg-gray-200 text-gray-700"
+                        : r.status === "Active" ? "bg-emerald-100 text-emerald-700"
+                        : "bg-amber-100 text-amber-700"
+                      }`}>{r.status}</span>
+                    </td>
+                  </tr>
+                ))
               )}
             </tbody>
           </table>
         </div>
         <div className="text-[11px] text-gray-500 mt-2">
-          Showing {sortedProducts.length} of {DUMMY_PRODUCTS.length} products
+          Showing {filteredRecent.length} of {recent.length} disbursements
           {search && <> · filtered by "<b>{search}</b>"</>}
         </div>
       </SectionCard>
 
-      {/* 4. Summary Cards (below table) — driven by selection */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
-        <SummaryCard
-          icon={Wallet}
-          label="Total Demand"
-          value={formatINR(totals.totalDemand)}
-          accent="indigo"
-          hint="Sum of demand across selected products in period"
-        />
-        <SummaryCard
-          icon={Receipt}
-          label="Total Collected"
-          value={formatINR(totals.totalCollected)}
-          accent="emerald"
-          hint="Sum of collections across selected products"
-        />
-        <SummaryCard
-          icon={PiggyBank}
-          label="Remaining Balance"
-          value={formatINR(totals.remaining)}
-          accent="amber"
-          hint="Demand minus collected"
-        />
-        <SummaryCard
-          icon={TrendingUp}
-          label="Collection Efficiency"
-          value={`${totals.efficiency.toFixed(1)}%`}
-          accent="teal"
-          hint="Collected ÷ Demand"
-        />
-      </div>
-
-      {/* 5. Performance Metrics — react to selection */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <SectionCard title="Branch-wise Performance" subtitle="Demand vs Collected, scaled by selection">
-          {effectiveRows.length === 0 ? (
-            <div className="text-gray-400 text-sm py-6 text-center">No data for current selection.</div>
-          ) : (
-            <ResponsiveContainer width="100%" height={260}>
-              <BarChart data={branchData}>
-                <CartesianGrid strokeDasharray="3 3" />
-                <XAxis dataKey="branch" fontSize={11} />
-                <YAxis fontSize={11} tickFormatter={(v) => Math.round(v / 100000) + "L"} />
-                <Tooltip formatter={(v) => formatINR(v)} />
-                <Legend wrapperStyle={{ fontSize: 12 }} />
-                <Bar dataKey="demand" fill="#6366f1" name="Demand" />
-                <Bar dataKey="collected" fill="#0d9488" name="Collected" />
-              </BarChart>
-            </ResponsiveContainer>
-          )}
-        </SectionCard>
-
-        <SectionCard title="Product-wise Performance" subtitle="Demand contribution by selected product">
-          {productChartData.length === 0 ? (
-            <div className="text-gray-400 text-sm py-6 text-center">No data for current selection.</div>
-          ) : (
-            <ResponsiveContainer width="100%" height={260}>
-              <PieChart>
-                <Pie
-                  data={productChartData}
-                  cx="50%"
-                  cy="50%"
-                  innerRadius={45}
-                  outerRadius={85}
-                  dataKey="value"
-                  label={(e) => e.name}
-                >
-                  {productChartData.map((p, i) => (
-                    <Cell key={p.name} fill={PIE_COLORS[i % PIE_COLORS.length]} />
-                  ))}
-                </Pie>
-                <Tooltip formatter={(v) => formatINR(v)} />
-              </PieChart>
-            </ResponsiveContainer>
-          )}
-        </SectionCard>
-      </div>
-
-      {/* 6. Reports — Import / Export */}
-      <SectionCard title="Reports" subtitle="Import a Compressed Pool Report or export the current view">
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {/* Import — wired to /api/od/pool/upload */}
-          <div className="border-2 border-dashed border-gray-200 rounded-lg p-4">
-            <div className="flex items-center gap-2 mb-2">
-              <Upload size={16} className="text-teal-600" />
-              <h4 className="font-semibold text-gray-800 text-sm">Import Reports</h4>
-            </div>
-            <p className="text-xs text-gray-500 mb-3">
-              Upload a Compressed Pool Report (.csv). Routed through the same
-              ingest pipeline used in OD Upload — existing data is never
-              overwritten or deleted.
-            </p>
-
-            <div className="mb-3">
-              <label className="text-[11px] text-gray-500 block mb-1">Snapshot Date</label>
-              <input
-                type="date"
-                value={snapshotDate}
-                onChange={(e) => setSnapshotDate(e.target.value)}
-                disabled={importStatus === "uploading"}
-                className="border rounded-lg px-2.5 py-1.5 text-sm w-full max-w-[180px]"
-              />
-            </div>
-
-            <label
-              className={`inline-flex items-center gap-2 px-3 py-2 text-xs rounded-lg ${
-                importStatus === "uploading"
-                  ? "bg-gray-300 text-white cursor-not-allowed"
-                  : "bg-teal-600 text-white hover:bg-teal-700 cursor-pointer"
-              }`}
-            >
-              <Upload size={12} />
-              {importStatus === "uploading" ? "Uploading…" : "Choose File"}
-              <input
-                type="file"
-                accept=".csv,.txt"
-                onChange={handleImport}
-                disabled={importStatus === "uploading"}
-                className="hidden"
-              />
-            </label>
-
-            {importMsg && (
-              <div
-                className={`mt-3 text-[11px] px-2 py-1.5 rounded ${
-                  importStatus === "success"
-                    ? "text-emerald-800 bg-emerald-50"
-                    : importStatus === "error"
-                    ? "text-rose-800 bg-rose-50"
-                    : "text-amber-800 bg-amber-50"
-                }`}
-              >
-                {importMsg}
-              </div>
-            )}
-          </div>
-
-          {/* Export */}
-          <div className="border-2 border-dashed border-gray-200 rounded-lg p-4">
-            <div className="flex items-center gap-2 mb-2">
-              <Download size={16} className="text-indigo-600" />
-              <h4 className="font-semibold text-gray-800 text-sm">Export Reports</h4>
-            </div>
-            <p className="text-xs text-gray-500 mb-3">
-              Download {selectedIds.size > 0 ? `${selectedIds.size} selected product${selectedIds.size === 1 ? "" : "s"}` : "all visible products"} in your preferred format.
-            </p>
-            <div className="flex flex-wrap gap-2">
-              <button
-                onClick={handleExportCSV}
-                title="Comma-separated values"
-                className="inline-flex items-center gap-1.5 px-3 py-2 bg-emerald-600 text-white text-xs rounded-lg hover:bg-emerald-700"
-              >
-                <FileText size={12} /> CSV
-              </button>
-              <button
-                onClick={handleExportExcel}
-                title="Excel spreadsheet"
-                className="inline-flex items-center gap-1.5 px-3 py-2 bg-teal-600 text-white text-xs rounded-lg hover:bg-teal-700"
-              >
-                <FileSpreadsheet size={12} /> Excel
-              </button>
-              <button
-                onClick={handleExportPDF}
-                title="Print preview as PDF"
-                className="inline-flex items-center gap-1.5 px-3 py-2 bg-rose-600 text-white text-xs rounded-lg hover:bg-rose-700"
-              >
-                <FileDown size={12} /> PDF
-              </button>
-            </div>
-          </div>
+      {/* 9. Reports — Export only (no upload here; OD Upload is the single write path) */}
+      <SectionCard title="Reports" subtitle="Export the current view. Upload happens exclusively in the OD Upload section.">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+          <button onClick={handleExportPDF}
+            className="flex items-center justify-center gap-2 px-3 py-2 bg-rose-600 text-white text-sm rounded-lg hover:bg-rose-700">
+            <FileDown size={14} /> Export PDF
+          </button>
+          <button onClick={handleExportCSV}
+            className="flex items-center justify-center gap-2 px-3 py-2 bg-teal-600 text-white text-sm rounded-lg hover:bg-teal-700">
+            <Download size={14} /> Export CSV
+          </button>
+          <button onClick={handleExportExcel}
+            className="flex items-center justify-center gap-2 px-3 py-2 bg-emerald-600 text-white text-sm rounded-lg hover:bg-emerald-700">
+            <FileSpreadsheet size={14} /> Export Excel
+          </button>
         </div>
       </SectionCard>
-
-      {/* Footer note */}
-      <div className="text-[11px] text-gray-400 text-center pt-2">
-        Reports &amp; Analytics is read-only for analytical views. Imports route through the existing OD Upload ingest pipeline.
-      </div>
     </div>
   );
 }
