@@ -450,4 +450,33 @@ safeAddColumn("customers", "loan_category", "TEXT");
 // Index for fast Group/Individual filtering in OD Insights.
 try { db.exec(`CREATE INDEX IF NOT EXISTS idx_customers_loan_category ON customers(loan_category)`); } catch {}
 
+// ─── Idempotent backfill: classify NULL/empty loan_category rows ───────────
+// Customers ingested before the loan_category column existed (legacy rows)
+// or via the Foreclosure Report (which doesn't carry a category column) end
+// up with NULL. Mirror the runtime fallback in _customerSubqueryForCategory():
+//   center_name OR group_name present  →  'Group Loan'
+//   neither present                    →  'Individual Loan'
+// Idempotent: after first run, the WHERE clauses match nothing.
+try {
+  const r1 = db.prepare(
+    `UPDATE customers SET loan_category = 'Group Loan'
+     WHERE (loan_category IS NULL OR loan_category = '')
+       AND (
+         (group_name IS NOT NULL AND group_name <> '')
+         OR (center_name IS NOT NULL AND center_name <> '')
+       )`
+  ).run();
+  const r2 = db.prepare(
+    `UPDATE customers SET loan_category = 'Individual Loan'
+     WHERE loan_category IS NULL OR loan_category = ''`
+  ).run();
+  if (r1.changes || r2.changes) {
+    console.log(
+      `[db] loan_category backfill: ${r1.changes} → Group Loan, ${r2.changes} → Individual Loan`
+    );
+  }
+} catch (err) {
+  console.warn("[db] loan_category backfill skipped:", err.message);
+}
+
 module.exports = db;

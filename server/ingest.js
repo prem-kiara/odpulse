@@ -217,7 +217,16 @@ function ingestPool(fileContent, opts) {
         product_name: str(r["Product Name"]),
         // "Category of Loan" from the Pool Report — values like "Group Loan" /
         // "Individual Loan". Drives the OD Insights Group vs Individual tab split.
-        loan_category: str(r["Category of Loan"]),
+        // Fallback: when the Pool export doesn't include this column (older
+        // exports), derive from Center Name / Group Name presence so we never
+        // store an empty value.
+        loan_category: (() => {
+          const explicit = str(r["Category of Loan"]);
+          if (explicit) return explicit;
+          const ctr = str(r["Center Name"]);
+          const grp = str(r["Group Name"]);
+          return (ctr || grp) ? "Group Loan" : "Individual Loan";
+        })(),
         product_interest_rate: num(r["Product Interest Rate(%)"]),
         loan_amount: num(r["Loan Amount"]),
         disbursement_date: str(r["Disbursement Date"]),
@@ -366,13 +375,17 @@ function ingestForeclosure(fileContent, opts) {
 
   // Same upsert pattern as ingestPool — keeps `customers` as the single
   // source of truth for autofill across active + closed loans.
+  // loan_category is set ONLY on INSERT (new row) using the heuristic; on
+  // CONFLICT we deliberately don't touch it so an authoritative value already
+  // written by ingestPool ("Category of Loan" column) isn't clobbered by our
+  // fallback guess.
   const upsertCustomer = db.prepare(`
     INSERT INTO customers (loan_account_no, customer_number, customer_name, branch,
       center_name, product_name, loan_amount, disbursement_date, last_installment_date,
-      officer_name, officer_code, updated_at)
+      officer_name, officer_code, loan_category, updated_at)
     VALUES (@loan_account_no, @customer_number, @customer_name, @branch,
       @center_name, @product_name, @loan_amount, @disbursement_date, @last_installment_date,
-      @officer_name, @officer_code, @updated_at)
+      @officer_name, @officer_code, @loan_category, @updated_at)
     ON CONFLICT(loan_account_no) DO UPDATE SET
       customer_number=excluded.customer_number,
       customer_name=excluded.customer_name,
@@ -433,18 +446,22 @@ function ingestForeclosure(fileContent, opts) {
       // we actually have from the foreclosure CSV. The pool report fills the
       // richer fields (mobile, aadhaar, address, etc.) when the same loan was
       // ever active.
+      const fcCenter = fcStr(r["CENTER"]);
       upsertCustomer.run({
         loan_account_no: loan,
         customer_number: fcStr(r["CUSTOMER NUMBER"]),
         customer_name: fcStr(r["CUSTOMER"]),
         branch,
-        center_name: fcStr(r["CENTER"]),
+        center_name: fcCenter,
         product_name: fcStr(r["PRODUCT NAME"]),
         loan_amount: fcNum(r["LOAN AMOUNT"]),
         disbursement_date: fcStr(r["DISBURSEMENT DATE"]),
         last_installment_date: fcStr(r["MATURITY DATE"]),
         officer_name: fcStr(r["EMPLOYEE NAME"]),
         officer_code: fcStr(r["EMPLOYEE NUMBER"]),
+        // Heuristic only used on INSERT (new row). Foreclosure CSV has no
+        // explicit category column, so derive from CENTER presence.
+        loan_category: fcCenter ? "Group Loan" : "Individual Loan",
         updated_at: now,
       });
 

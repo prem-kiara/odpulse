@@ -1525,8 +1525,9 @@ export function CollectionDashboard({ user, entries, branches }) {
       {tab === "daily"      && <DailyCollectionsView category={category} branches={branches} openDrill={openDrill} />}
       {tab === "risk"       && <RiskTriageView category={category} openDrill={openDrill} />}
 
-      {/* Shared drilldown drawer */}
-      <DrilldownDrawer slice={drill} onClose={closeDrill} />
+      {/* Shared drilldown drawer — pass the outer Group/Individual category so
+          the drilldown query is scoped to the same loan category as the parent. */}
+      <DrilldownDrawer slice={drill} category={category} onClose={closeDrill} />
     </div>
   );
 }
@@ -1567,7 +1568,7 @@ function KpiCard({ icon, label, value, sub, color, onClick }) {
 // and loads a unified summary + customer list + receipts + trend via
 // /api/od/drilldown. Safe to render at any time — when `slice` is null it
 // renders nothing.
-function DrilldownDrawer({ slice, onClose }) {
+function DrilldownDrawer({ slice, category, onClose }) {
   const [loading, setLoading] = useState(false);
   const [data, setData] = useState(null);
   const [tab, setTab] = useState("customers");
@@ -1575,7 +1576,9 @@ function DrilldownDrawer({ slice, onClose }) {
   const [sortKey, setSortKey] = useState("total_overdue");
   const [sortDir, setSortDir] = useState("desc");
 
-  // Fetch whenever slice changes
+  // Fetch whenever slice OR category changes. Category is the outer
+  // Group-vs-Individual filter from OD Insights; without it, the drill-down
+  // would return rows from both categories regardless of which tab is selected.
   useEffect(() => {
     if (!slice) return;
     setLoading(true); setData(null); setQuery(""); setTab("customers");
@@ -1586,12 +1589,14 @@ function DrilldownDrawer({ slice, onClose }) {
     for (const k of ["npaOnly", "deathOnly", "nonContact"]) {
       if (slice[k]) p.set(k, "1");
     }
+    // Outer category filter — sourced from the parent, not the slice.
+    if (category) p.set("category", category);
     fetch(`${API_BASE}/od/drilldown?${p.toString()}`)
       .then(r => r.json())
       .then(j => setData(j))
       .catch(() => setData(null))
       .finally(() => setLoading(false));
-  }, [slice]);
+  }, [slice, category]);
 
   // Escape to close
   useEffect(() => {
