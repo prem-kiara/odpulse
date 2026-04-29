@@ -790,10 +790,27 @@ function loanCategoryFilter(category) {
   return (loan) => matchSet.has(String(loan || "").trim());
 }
 
+// Resolve a requested ?date= to the latest snapshot_date <= it. If date is not
+// supplied, returns the global MAX. If date is supplied but no snapshot exists
+// on or before it, returns null. This makes UI date pickers tolerant — picking
+// any "To" date falls back to the most recent ingested snapshot up to that day.
+function resolveSnapshotDate(table, requestedDate) {
+  // Whitelist tables we control to avoid SQL injection.
+  const ALLOWED = { pool_snapshots: 1, accrued_snapshots: 1, od_overdue: 1, foreclosure_snapshots: 1 };
+  if (!ALLOWED[table]) return null;
+  if (requestedDate) {
+    const row = db.prepare(
+      `SELECT MAX(snapshot_date) AS d FROM ${table} WHERE snapshot_date <= ?`
+    ).get(String(requestedDate));
+    return row?.d || null;
+  }
+  const row = db.prepare(`SELECT MAX(snapshot_date) AS d FROM ${table}`).get();
+  return row?.d || null;
+}
+
 // GET /api/od/metrics/dpd-buckets?date=&branch=
 app.get("/api/od/metrics/dpd-buckets", (req, res) => {
-  const date = req.query.date ||
-    db.prepare(`SELECT MAX(snapshot_date) AS d FROM pool_snapshots`).get()?.d;
+  const date = resolveSnapshotDate("pool_snapshots", req.query.date);
   if (!date) return res.json({ snapshotDate: null, buckets: [] });
   const branch = String(req.query.branch || "");
   const category = String(req.query.category || "");
@@ -844,8 +861,7 @@ app.get("/api/od/metrics/od-trend", (req, res) => {
 
 // GET /api/od/metrics/branch-concentration?date=
 app.get("/api/od/metrics/branch-concentration", (req, res) => {
-  const date = req.query.date ||
-    db.prepare(`SELECT MAX(snapshot_date) AS d FROM pool_snapshots`).get()?.d;
+  const date = resolveSnapshotDate("pool_snapshots", req.query.date);
   if (!date) return res.json({ snapshotDate: null, branches: [] });
   const category = String(req.query.category || "");
   let sql = `SELECT branch,
@@ -1872,12 +1888,34 @@ app.get("/api/od/drilldown", (req, res) => {
   // ── od_overdue filter (bucket / NPA / death / installments / months stranded) ──
   // When any overdue-report filter is given we pull the matching loan list from
   // od_overdue and intersect with the customer list from client_period.
+  //
+  // Bucket-name normalization: the dpd-buckets chart labels its slices using
+  // overdue-days ranges ('0-Current', '1-30', '31-60', '61-90', '91-180',
+  // '180+', or the prefixed 'DPD-…' variants), but od_overdue.dpd_classification
+  // stores RBI-style labels ('Current', 'SMA-0', 'SMA-1', 'SMA-2', 'NPA').
+  // Map between the two so a click on the DPD chart actually populates the
+  // drill-down customer list.
+  const BUCKET_TO_CLASS = {
+    "0-Current": ["Current"], "DPD-0": ["Current"], "DPD-0-Current": ["Current"], "Current": ["Current"],
+    "1-30":      ["SMA-0"],   "DPD-1-30":  ["SMA-0"], "SMA-0":   ["SMA-0"],
+    "31-60":     ["SMA-1"],   "DPD-31-60": ["SMA-1"], "SMA-1":   ["SMA-1"],
+    "61-90":     ["SMA-2"],   "DPD-61-90": ["SMA-2"], "SMA-2":   ["SMA-2"],
+    "91-180":    ["NPA"],     "DPD-91-180":["NPA"],   "NPA":     ["NPA"],
+    "180+":      ["NPA"],     "DPD-180+":  ["NPA"],
+  };
   let bucketAccounts = null;
   const useOvFilter = (bucket || npaOnly || deathOnly || minInstallmentsDue > 0 || minMonthsStranded > 0);
   if (useOvFilter && snap) {
     const ovWhere = ["snapshot_date = ?"];
     const ovArgs = [snap];
-    if (bucket)      { ovWhere.push("dpd_classification = ?"); ovArgs.push(bucket); }
+    if (bucket) {
+      // Map "DPD-91-180" → ["NPA"], etc. Unknown buckets fall through to a
+      // literal classification match so legacy callers still work.
+      const classes = BUCKET_TO_CLASS[bucket] || [bucket];
+      const placeholders = classes.map(() => "?").join(",");
+      ovWhere.push(`dpd_classification IN (${placeholders})`);
+      ovArgs.push(...classes);
+    }
     if (npaOnly)     { ovWhere.push("first_npa_date IS NOT NULL AND first_npa_date <> ''"); }
     if (deathOnly)   { ovWhere.push("(death_flagged_date IS NOT NULL AND death_flagged_date <> '' OR COALESCE(death_case_remark,'') <> '')"); }
     if (minInstallmentsDue > 0) { ovWhere.push("installments_due >= ?"); ovArgs.push(minInstallmentsDue); }
@@ -2027,6 +2065,185 @@ app.get("/api/od/upload-history", (req, res) => {
     uploads, latestPool, latestAccrued, latestOverdue, latestClientPeriod,
     totalCustomers, totalCollections, retentionDays: RETENTION_DAYS,
   });
+});
+
+// ─── Disbursement Analytics ────────────────────────────────────────────────
+// GET /api/od/disbursements?from=&to=&branch=&product=&category=
+//
+// Aggregates loan disbursements from the customers master, joined with the
+// latest pool/foreclosure snapshots to derive Active/Closed status. Returns
+// summary KPIs, branch-/product-/category-level totals, monthly trend, and
+// the most-recent N disbursements as a table feed.
+//
+// Filters:
+//   from, to    — ISO YYYY-MM-DD inclusive range on disbursement_date
+//   branch      — exact match (case-insensitive)
+//   product     — exact match (case-insensitive)
+//   category    — 'group' | 'individual' (matches loan_category)
+//
+// Notes:
+//   * disbursement_date is stored as a raw string from Finflux — we accept
+//     both ISO ("YYYY-MM-DD...") and DD-MMM-YYYY ("26-Apr-2022") shapes.
+//   * Read-only endpoint — no DB writes.
+app.get("/api/od/disbursements", (req, res) => {
+  try {
+    const from = String(req.query.from || "").trim();        // YYYY-MM-DD
+    const to = String(req.query.to || "").trim();            // YYYY-MM-DD
+    const branch = String(req.query.branch || "").trim().toLowerCase();
+    const product = String(req.query.product || "").trim().toLowerCase();
+    const category = String(req.query.category || "").trim().toLowerCase();
+    const status = String(req.query.status || "").trim().toLowerCase(); // '' | active | closed | pending
+    const limit = Math.min(50000, Math.max(100, parseInt(req.query.limit || "10000", 10)));
+
+    const MONTHS = { jan: "01", feb: "02", mar: "03", apr: "04", may: "05", jun: "06",
+                     jul: "07", aug: "08", sep: "09", oct: "10", nov: "11", dec: "12" };
+    function parseDate(s) {
+      if (!s) return null;
+      const t = String(s).trim();
+      if (!t) return null;
+      // ISO YYYY-MM-DD or YYYY/MM/DD prefix
+      const iso = t.match(/^(\d{4})[-/](\d{2})[-/](\d{2})/);
+      if (iso) return `${iso[1]}-${iso[2]}-${iso[3]}`;
+      // DD-MMM-YYYY (e.g. "26-Apr-2022", "1-Jan-1970")
+      const dmy = t.match(/^(\d{1,2})[-\s]([A-Za-z]{3})[-\s](\d{4})$/);
+      if (dmy) {
+        const mm = MONTHS[dmy[2].toLowerCase()];
+        if (mm) return `${dmy[3]}-${mm}-${String(dmy[1]).padStart(2, "0")}`;
+      }
+      // DD/MM/YYYY
+      const dmy2 = t.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+      if (dmy2) {
+        return `${dmy2[3]}-${String(dmy2[2]).padStart(2,"0")}-${String(dmy2[1]).padStart(2,"0")}`;
+      }
+      return null;
+    }
+
+    // Pull the raw rows once, then aggregate in JS. With ~85k customer rows
+    // this runs in <100 ms.
+    const rows = db.prepare(`
+      SELECT
+        c.loan_account_no, c.customer_number, c.customer_name,
+        c.branch, c.product_name, c.loan_category,
+        c.disbursement_date, c.loan_amount,
+        EXISTS(SELECT 1 FROM foreclosure_snapshots f WHERE f.loan_account_no = c.loan_account_no) AS is_closed,
+        EXISTS(SELECT 1 FROM pool_snapshots p WHERE p.loan_account_no = c.loan_account_no) AS is_active
+      FROM customers c
+      WHERE COALESCE(c.disbursement_date, '') <> ''
+    `).all();
+
+    // Aggregators
+    const branchAgg = new Map();    // key: branch
+    const productAgg = new Map();   // key: product_name
+    const categoryAgg = new Map();  // key: 'Group Loan' | 'Individual Loan' | 'Unknown'
+    const monthAgg = new Map();     // key: 'YYYY-MM'
+    let totalCount = 0;
+    let totalAmount = 0;
+    const customerSet = new Set();
+    let activeCount = 0;
+    let closedCount = 0;
+    let pendingCount = 0;
+    const recent = []; // most recent disbursements for the table view
+
+    function bump(map, k, amount) {
+      if (!k) k = "(unspecified)";
+      const cur = map.get(k) || { key: k, count: 0, total: 0 };
+      cur.count += 1;
+      cur.total += amount;
+      map.set(k, cur);
+    }
+
+    for (const r of rows) {
+      // Date filter
+      const iso = parseDate(r.disbursement_date);
+      if (!iso) continue;
+      if (from && iso < from) continue;
+      if (to && iso > to) continue;
+
+      // Branch / product filter
+      if (branch && (r.branch || "").toLowerCase() !== branch) continue;
+      if (product && (r.product_name || "").toLowerCase() !== product) continue;
+
+      // Category filter
+      const catRaw = (r.loan_category || "").toUpperCase();
+      const isGroup = catRaw.includes("GROUP");
+      const isIndividual = catRaw.includes("INDIVIDUAL");
+      if (category === "group" && !isGroup) continue;
+      if (category === "individual" && !isIndividual) continue;
+
+      const amount = Number(r.loan_amount) || 0;
+      const ym = iso.slice(0, 7);
+      const catLabel = isGroup ? "Group Loan" : isIndividual ? "Individual Loan" : "Unknown";
+
+      bump(branchAgg, r.branch || "", amount);
+      bump(productAgg, r.product_name || "", amount);
+      bump(categoryAgg, catLabel, amount);
+      bump(monthAgg, ym, amount);
+
+      totalCount += 1;
+      totalAmount += amount;
+      if (r.customer_number) customerSet.add(r.customer_number);
+
+      // Status (foreclosed-wins)
+      const rowStatus = r.is_closed ? "Closed" : r.is_active ? "Active" : "Pending";
+      if (r.is_closed) closedCount += 1;
+      else if (r.is_active) activeCount += 1;
+      else pendingCount += 1;
+
+      // Status filter — applied AFTER counting so summary numbers stay correct.
+      if (status === "active" && rowStatus !== "Active") continue;
+      if (status === "closed" && rowStatus !== "Closed") continue;
+      if (status === "pending" && rowStatus !== "Pending") continue;
+
+      if (recent.length < limit) {
+        recent.push({
+          loan_account_no: r.loan_account_no,
+          customer_number: r.customer_number,
+          customer_name: r.customer_name,
+          branch: r.branch,
+          product_name: r.product_name,
+          loan_category: r.loan_category,
+          disbursement_date_iso: iso,
+          loan_amount: amount,
+          status: rowStatus,
+        });
+      }
+    }
+
+    // Sort recent desc by date
+    recent.sort((a, b) => (a.disbursement_date_iso < b.disbursement_date_iso ? 1 : -1));
+
+    const avgTicket = totalCount > 0 ? Math.round((totalAmount / totalCount) * 100) / 100 : 0;
+
+    function toSorted(map, opts = {}) {
+      const arr = [...map.values()];
+      arr.sort((a, b) => b.total - a.total);
+      return opts.limit ? arr.slice(0, opts.limit) : arr;
+    }
+
+    // byMonth sorted ascending by month key for trend
+    const byMonth = [...monthAgg.values()].sort((a, b) => a.key.localeCompare(b.key));
+
+    res.json({
+      summary: {
+        count: totalCount,
+        totalAmount: Math.round(totalAmount * 100) / 100,
+        avgTicket,
+        customerCount: customerSet.size,
+        active: activeCount,
+        closed: closedCount,
+        pending: pendingCount,
+      },
+      byBranch: toSorted(branchAgg, { limit: 30 }),
+      byProduct: toSorted(productAgg, { limit: 30 }),
+      byCategory: [...categoryAgg.values()].sort((a, b) => b.total - a.total),
+      byMonth,
+      recent,
+      filters: { from, to, branch, product, category, status, limit },
+    });
+  } catch (err) {
+    console.error("[disbursements]", err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // POST /api/od/retention/run — manual retention trigger (admin)
