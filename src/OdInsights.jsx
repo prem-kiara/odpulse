@@ -200,24 +200,36 @@ export function CustomerInfoPanel({ loanAccountNo, customerId, compact = false, 
 
   if (!data) return null;
 
-  const { customer, pool, accrued, principalOutstanding, accruedInterest, unpaidInterest, foreclosureValue, poolSnapshotDate, accruedSnapshotDate } = data;
+  const { customer, pool, accrued, foreclosure, isClosed, loanStatus, principalOutstanding, accruedInterest, unpaidInterest, foreclosureValue, poolSnapshotDate, accruedSnapshotDate, foreclosureSnapshotDate } = data;
+
+  // Closed loans get a grey-toned panel; active loans keep the teal gradient.
+  const panelCls = isClosed
+    ? "mt-3 bg-gradient-to-br from-gray-50 to-gray-100 border border-gray-300 rounded-xl p-4 space-y-3"
+    : "mt-3 bg-gradient-to-br from-teal-50 to-cyan-50 border border-teal-200 rounded-xl p-4 space-y-3";
 
   return (
-    <div className="mt-3 bg-gradient-to-br from-teal-50 to-cyan-50 border border-teal-200 rounded-xl p-4 space-y-3">
+    <div className={panelCls}>
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <Database size={14} className="text-teal-700" />
-          <span className="text-xs font-semibold text-teal-800 uppercase tracking-wide">
-            Live OD Snapshot
+          <Database size={14} className={isClosed ? "text-gray-600" : "text-teal-700"} />
+          <span className={`text-xs font-semibold uppercase tracking-wide ${isClosed ? "text-gray-700" : "text-teal-800"}`}>
+            {isClosed ? "Closed Loan Record" : "Live OD Snapshot"}
           </span>
+          {isClosed && (
+            <span className="text-[10px] font-bold text-gray-700 bg-gray-200 px-1.5 py-0.5 rounded">CLOSED</span>
+          )}
         </div>
         <span className="text-[11px] text-gray-500">
-          Pool: {poolSnapshotDate ? formatDateDMY(poolSnapshotDate) : "—"} · Accrued: {accruedSnapshotDate ? formatDateDMY(accruedSnapshotDate) : "—"}
+          {isClosed
+            ? `Closed on: ${foreclosure?.closed_date || "—"}${foreclosureSnapshotDate ? ` · Snapshot: ${formatDateDMY(foreclosureSnapshotDate)}` : ""}`
+            : `Pool: ${poolSnapshotDate ? formatDateDMY(poolSnapshotDate) : "—"} · Accrued: ${accruedSnapshotDate ? formatDateDMY(accruedSnapshotDate) : "—"}`}
         </span>
       </div>
 
-      {/* 4 core values — can be hidden by caller if shown elsewhere as form fields */}
-      {!hideValueBoxes && (
+      {/* 4 core values — can be hidden by caller if shown elsewhere as form fields.
+          Closed loans get closure-relevant numbers instead of misleading zero
+          outstandings. */}
+      {!hideValueBoxes && !isClosed && (
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
           <div className="bg-white rounded-lg p-3 border border-teal-100">
             <div className="text-[10px] uppercase tracking-wide text-gray-500">Principal Outstanding</div>
@@ -234,6 +246,26 @@ export function CustomerInfoPanel({ loanAccountNo, customerId, compact = false, 
           <div className="bg-teal-600 rounded-lg p-3 border border-teal-700 shadow-sm">
             <div className="text-[10px] uppercase tracking-wide text-teal-100">Foreclosure Value</div>
             <div className="text-base font-bold text-white mt-0.5">{formatINR(foreclosureValue)}</div>
+          </div>
+        </div>
+      )}
+      {!hideValueBoxes && isClosed && (
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+          <div className="bg-white rounded-lg p-3 border border-gray-200">
+            <div className="text-[10px] uppercase tracking-wide text-gray-500">Closing Principal</div>
+            <div className="text-sm font-semibold text-gray-900 mt-0.5">{formatINR(foreclosure?.closing_principal)}</div>
+          </div>
+          <div className="bg-white rounded-lg p-3 border border-gray-200">
+            <div className="text-[10px] uppercase tracking-wide text-gray-500">Total Interest Collected</div>
+            <div className="text-sm font-semibold text-gray-900 mt-0.5">{formatINR(foreclosure?.total_interest_collected)}</div>
+          </div>
+          <div className="bg-white rounded-lg p-3 border border-gray-200">
+            <div className="text-[10px] uppercase tracking-wide text-gray-500">Penalty Collected</div>
+            <div className="text-sm font-semibold text-gray-900 mt-0.5">{formatINR(foreclosure?.penalty_collected)}</div>
+          </div>
+          <div className="bg-gray-700 rounded-lg p-3 border border-gray-800 shadow-sm">
+            <div className="text-[10px] uppercase tracking-wide text-gray-300">Closure Type</div>
+            <div className="text-sm font-bold text-white mt-0.5">{foreclosure?.closure_type || foreclosure?.closure_reason || "—"}</div>
           </div>
         </div>
       )}
@@ -300,30 +332,51 @@ export function CustomerInfoPanel({ loanAccountNo, customerId, compact = false, 
             {otherLoans.map(l => {
               const effDPD = Math.max(Number(l.customerDPD) || 0, Number(l.overdueDays) || 0);
               const isCurrent = l.loanAccountNo === loanAccountNo;
-              const dpdClass = effDPD > 90 ? "bg-red-100 text-red-700"
+              const isClosed = !!l.isClosed;
+              // For closed loans, override the green-pill behaviour (which
+              // would misleadingly show "0d" healthy) with a CLOSED badge.
+              const statusPillClass = isClosed
+                ? "bg-gray-200 text-gray-700"
+                : effDPD > 90 ? "bg-red-100 text-red-700"
                 : effDPD > 60 ? "bg-orange-100 text-orange-700"
                 : effDPD > 30 ? "bg-amber-100 text-amber-700"
                 : effDPD > 0  ? "bg-yellow-100 text-yellow-700"
                 : "bg-green-100 text-green-700";
+              const statusPillLabel = isClosed ? "CLOSED" : `${effDPD}d`;
               return (
                 <div key={l.loanAccountNo}
                   onClick={() => setSelectedLoan(l)}
-                  className={`p-2.5 rounded-lg border cursor-pointer transition-colors ${isCurrent ? "border-teal-500 bg-teal-50 ring-1 ring-teal-300" : "border-gray-200 bg-white hover:bg-teal-50 hover:border-teal-300"}`}>
+                  className={`p-2.5 rounded-lg border cursor-pointer transition-colors ${isClosed ? "border-gray-300 bg-gray-50 hover:bg-gray-100" : isCurrent ? "border-teal-500 bg-teal-50 ring-1 ring-teal-300" : "border-gray-200 bg-white hover:bg-teal-50 hover:border-teal-300"}`}>
                   <div className="flex items-center justify-between gap-3 flex-wrap">
                     <div className="flex items-center gap-2 flex-wrap">
-                      <span className="font-mono text-sm font-semibold text-gray-800">{l.loanAccountNo}</span>
-                      {isCurrent && <span className="text-[10px] font-bold text-teal-700 bg-teal-100 px-1.5 py-0.5 rounded">CURRENT</span>}
+                      <span className={`font-mono text-sm font-semibold ${isClosed ? "text-gray-500 line-through" : "text-gray-800"}`}>{l.loanAccountNo}</span>
+                      {isClosed && (
+                        <span className="text-[10px] font-bold text-gray-700 bg-gray-200 px-1.5 py-0.5 rounded">CLOSED</span>
+                      )}
+                      {!isClosed && isCurrent && (
+                        <span className="text-[10px] font-bold text-teal-700 bg-teal-100 px-1.5 py-0.5 rounded">CURRENT</span>
+                      )}
                       {l.branch && <span className="text-xs text-gray-500">· {l.branch}</span>}
                       {l.centerName && <span className="text-xs text-gray-500">· {l.centerName}</span>}
                     </div>
-                    <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${dpdClass}`}>{effDPD}d</span>
+                    <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${statusPillClass}`}>{statusPillLabel}</span>
                   </div>
-                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-2 text-xs">
-                    <div><span className="text-gray-500">Outstanding:</span> <span className="font-medium text-gray-800">{formatINR(l.principalOutstanding)}</span></div>
-                    <div><span className="text-gray-500">Unpaid Int:</span> <span className="font-medium text-gray-800">{formatINR(l.interestOverdue)}</span></div>
-                    <div><span className="text-gray-500">Accrued:</span> <span className="font-medium text-gray-800">{formatINR(l.accruedInterest)}</span></div>
-                    <div><span className="text-gray-500">Foreclosure:</span> <span className="font-bold text-teal-700">{formatINR(l.foreclosureValue)}</span></div>
-                  </div>
+                  {isClosed ? (
+                    /* Closed loan — show closure facts instead of misleading zero outstandings. */
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-2 text-xs">
+                      <div><span className="text-gray-500">Closed:</span> <span className="font-medium text-gray-800">{l.closedDate || "—"}</span></div>
+                      <div><span className="text-gray-500">Type:</span> <span className="font-medium text-gray-800">{l.closureType || "—"}</span></div>
+                      <div><span className="text-gray-500">Closing Pr.:</span> <span className="font-medium text-gray-800">{formatINR(l.closingPrincipal)}</span></div>
+                      <div><span className="text-gray-500">Int. Collected:</span> <span className="font-medium text-gray-800">{formatINR(l.totalInterestCollected)}</span></div>
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-2 text-xs">
+                      <div><span className="text-gray-500">Outstanding:</span> <span className="font-medium text-gray-800">{formatINR(l.principalOutstanding)}</span></div>
+                      <div><span className="text-gray-500">Unpaid Int:</span> <span className="font-medium text-gray-800">{formatINR(l.interestOverdue)}</span></div>
+                      <div><span className="text-gray-500">Accrued:</span> <span className="font-medium text-gray-800">{formatINR(l.accruedInterest)}</span></div>
+                      <div><span className="text-gray-500">Foreclosure:</span> <span className="font-bold text-teal-700">{formatINR(l.foreclosureValue)}</span></div>
+                    </div>
+                  )}
                 </div>
               );
             })}
@@ -353,33 +406,49 @@ export function CustomerInfoPanel({ loanAccountNo, customerId, compact = false, 
                 <div><span className="text-gray-500">Disbursed:</span> <span className="font-medium">{selectedLoan.disbursementDate ? formatDateDMY(selectedLoan.disbursementDate) : "—"}</span></div>
                 <div><span className="text-gray-500">Last Paid:</span> <span className="font-medium">{selectedLoan.lastPaymentDate ? formatDateDMY(selectedLoan.lastPaymentDate) : "—"}</span></div>
               </div>
-              <div className="p-3 bg-teal-50 rounded-lg border border-teal-200">
-                <div className="text-xs font-semibold text-teal-800 uppercase mb-2">OD Breakdown</div>
-                <div className="grid grid-cols-2 gap-3">
-                  <div><span className="text-gray-500">Principal Outstanding:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.principalOutstanding)}</div></div>
-                  <div><span className="text-gray-500">Interest Outstanding:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.interestOutstanding)}</div></div>
-                  <div><span className="text-gray-500">Principal Overdue:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.principalOverdue)}</div></div>
-                  <div><span className="text-gray-500">Interest Overdue:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.interestOverdue)}</div></div>
-                  <div><span className="text-gray-500">Current OD:</span><div className="font-bold text-red-700">{formatINR(selectedLoan.currentOD)}</div></div>
-                  <div><span className="text-gray-500">Accrued Interest:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.accruedInterest)}</div></div>
+              {selectedLoan.isClosed ? (
+                <div className="p-3 bg-gray-100 rounded-lg border border-gray-300">
+                  <div className="text-xs font-semibold text-gray-700 uppercase mb-2">Closure Details</div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div><span className="text-gray-500">Closed Date:</span><div className="font-bold text-gray-900">{selectedLoan.closedDate || "—"}</div></div>
+                    <div><span className="text-gray-500">Closure Type:</span><div className="font-bold text-gray-900">{selectedLoan.closureType || "—"}</div></div>
+                    <div><span className="text-gray-500">Closure Reason:</span><div className="font-bold text-gray-900">{selectedLoan.closureReason || "—"}</div></div>
+                    <div><span className="text-gray-500">Maturity Date:</span><div className="font-bold text-gray-900">{selectedLoan.maturityDate || "—"}</div></div>
+                    <div><span className="text-gray-500">Closing Principal:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.closingPrincipal)}</div></div>
+                    <div><span className="text-gray-500">Interest Collected:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.interestCollected)}</div></div>
+                    <div><span className="text-gray-500">Total Int. Collected:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.totalInterestCollected)}</div></div>
+                    <div><span className="text-gray-500">Penalty Collected:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.penaltyCollected)}</div></div>
+                  </div>
                 </div>
-                <div className="mt-3 p-2 bg-white rounded border border-teal-300">
-                  <span className="text-xs text-gray-600">Foreclosure Value:</span>
-                  <div className="text-xl font-bold text-teal-700">{formatINR(selectedLoan.foreclosureValue)}</div>
+              ) : (
+                <div className="p-3 bg-teal-50 rounded-lg border border-teal-200">
+                  <div className="text-xs font-semibold text-teal-800 uppercase mb-2">OD Breakdown</div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div><span className="text-gray-500">Principal Outstanding:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.principalOutstanding)}</div></div>
+                    <div><span className="text-gray-500">Interest Outstanding:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.interestOutstanding)}</div></div>
+                    <div><span className="text-gray-500">Principal Overdue:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.principalOverdue)}</div></div>
+                    <div><span className="text-gray-500">Interest Overdue:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.interestOverdue)}</div></div>
+                    <div><span className="text-gray-500">Current OD:</span><div className="font-bold text-red-700">{formatINR(selectedLoan.currentOD)}</div></div>
+                    <div><span className="text-gray-500">Accrued Interest:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.accruedInterest)}</div></div>
+                  </div>
+                  <div className="mt-3 p-2 bg-white rounded border border-teal-300">
+                    <span className="text-xs text-gray-600">Foreclosure Value:</span>
+                    <div className="text-xl font-bold text-teal-700">{formatINR(selectedLoan.foreclosureValue)}</div>
+                  </div>
                 </div>
-              </div>
+              )}
               <div className="grid grid-cols-3 gap-2 text-xs">
                 <div className="p-2 bg-gray-50 rounded">
                   <span className="text-gray-500">DPD:</span>
-                  <div className="font-bold">{Math.max(Number(selectedLoan.customerDPD) || 0, Number(selectedLoan.overdueDays) || 0)} days</div>
+                  <div className="font-bold">{selectedLoan.isClosed ? "—" : `${Math.max(Number(selectedLoan.customerDPD) || 0, Number(selectedLoan.overdueDays) || 0)} days`}</div>
                 </div>
                 <div className="p-2 bg-gray-50 rounded">
                   <span className="text-gray-500">Status:</span>
-                  <div className="font-bold">{selectedLoan.loanStatus || "Active"}</div>
+                  <div className={`font-bold ${selectedLoan.isClosed ? "text-gray-700" : ""}`}>{selectedLoan.isClosed ? "Closed" : (selectedLoan.loanStatus || "Active")}</div>
                 </div>
                 <div className="p-2 bg-gray-50 rounded">
                   <span className="text-gray-500">DPD Class:</span>
-                  <div className="font-bold">{selectedLoan.dpdClassification || "—"}</div>
+                  <div className="font-bold">{selectedLoan.isClosed ? "—" : (selectedLoan.dpdClassification || "—")}</div>
                 </div>
               </div>
             </div>
