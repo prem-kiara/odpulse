@@ -290,6 +290,57 @@ app.get("/api/customers/lookup", (req, res) => {
     console.error("[customers/lookup] SQLite lookup failed:", e.message);
   }
 
+  // ── CSB Bank fallback ─────────────────────────────────────────────────
+  // CSB customers (hyphenated loan numbers like 0269-80394391-657201) are
+  // NOT in the customers table — they don't come from Pool/Foreclosure
+  // reports. Their data only exists in entries.json (where collection
+  // officers previously recorded payments). Search there as a fallback
+  // so autofill works for these customers too.
+  try {
+    const isCSBLoan = loanAccountNo && /^\d+-\d+-\d+/.test(String(loanAccountNo).trim());
+    const matchKey = (loanAccountNo || customerId || phone || aadhaar || name || "").toString().trim();
+    if (matchKey && customers.length === 0) {
+      const allEntries = loadJSON("entries.json", []);
+      // Score-based matching — pick the most recent entry that matches.
+      const matches = allEntries.filter(e => {
+        if (loanAccountNo) return (e.loanAccountNo || "").trim() === String(loanAccountNo).trim();
+        if (customerId)    return (e.customerId || "").trim() === String(customerId).trim();
+        if (phone)         return String(e.phone || "").replace(/\D/g, "") === String(phone).replace(/\D/g, "");
+        if (aadhaar)       return String(e.aadhaar || "").replace(/\D/g, "") === String(aadhaar).replace(/\D/g, "");
+        if (name)          return (e.customerName || "").toLowerCase().includes(String(name).toLowerCase());
+        return false;
+      });
+      // Group by loanAccountNo, take most recent entry per loan
+      const byLoan = new Map();
+      for (const e of matches) {
+        const loan = (e.loanAccountNo || "").trim();
+        if (!loan) continue;
+        const prev = byLoan.get(loan);
+        if (!prev || (e.date || "") > (prev.date || "")) byLoan.set(loan, e);
+      }
+      for (const e of byLoan.values()) {
+        customers.push({
+          name: e.customerName || "",
+          customerId: e.customerId || "",
+          loanAccountNo: e.loanAccountNo || "",
+          aadhaar: e.aadhaar || "",
+          phone: e.phone || "",
+          branch: e.branch || "",
+          isCSBCustomer: !!e.isCSBCustomer || isCSBLoan,
+          source: "entries", // marks the result as coming from entries.json (not pool/foreclosure)
+          lastEntry: {
+            date: e.date,
+            amountDue: e.amountDue,
+            paidAmount: e.paidAmount,
+            odType: e.odType,
+          },
+        });
+      }
+    }
+  } catch (e) {
+    console.error("[customers/lookup] entries.json fallback failed:", e.message);
+  }
+
   res.json({ found: customers.length > 0, customers });
 });
 
