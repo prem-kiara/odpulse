@@ -9,6 +9,7 @@ const iconv = require("iconv-lite");
 
 const db = require("./db");
 const { ingestPool, ingestAccrued, ingestOverdue, ingestCollections, ingestClientPeriod, ingestForeclosure, purgeOldSnapshots, rollupMonthlySnapshots } = require("./ingest");
+const { createBackupZip, saveBackupLocally, listLocalBackups, restoreFromBuffer } = require("./backup");
 
 const app = express();
 const PORT = 3001;
@@ -2876,6 +2877,97 @@ app.get("/api/pool/search", (req, res) => {
   }
 });
 
+// ── Backup & Restore ─────────────────────────────────────────────────────────
+
+const backupUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 500 * 1024 * 1024 } });
+
+// GET /api/admin/backup/download — stream a fresh backup ZIP to the browser
+app.get("/api/admin/backup/download", (req, res) => {
+  try {
+    const { zip, tag, metadata } = createBackupZip();
+    // Also save a local copy automatically
+    try { saveBackupLocally(zip, tag); } catch (_) {}
+    const buf = zip.toBuffer();
+    const filename = `odpulse-backup-${tag}.zip`;
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    res.setHeader("Content-Length", buf.length);
+    res.setHeader("X-Backup-Files", metadata.fileCount);
+    res.send(buf);
+    console.log(`[Backup] Manual download: ${filename} (${(buf.length / 1048576).toFixed(2)} MB)`);
+  } catch (e) {
+    console.error("[Backup] Download error:", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// GET /api/admin/backup/list — list locally saved backups
+app.get("/api/admin/backup/list", (req, res) => {
+  try {
+    res.json({ ok: true, backups: listLocalBackups() });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// GET /api/admin/backup/download/:filename — download a specific saved backup
+app.get("/api/admin/backup/download/:filename", (req, res) => {
+  try {
+    const { filename } = req.params;
+    if (!filename.startsWith("odpulse-backup-") || !filename.endsWith(".zip"))
+      return res.status(400).json({ ok: false, error: "Invalid filename" });
+    const filepath = require("path").join(__dirname, "backups", filename);
+    if (!require("fs").existsSync(filepath))
+      return res.status(404).json({ ok: false, error: "Backup not found" });
+    res.download(filepath, filename);
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// DELETE /api/admin/backup/:filename — delete a saved backup
+app.delete("/api/admin/backup/:filename", (req, res) => {
+  try {
+    const { filename } = req.params;
+    if (!filename.startsWith("odpulse-backup-") || !filename.endsWith(".zip"))
+      return res.status(400).json({ ok: false, error: "Invalid filename" });
+    const filepath = require("path").join(__dirname, "backups", filename);
+    if (require("fs").existsSync(filepath)) require("fs").unlinkSync(filepath);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /api/admin/backup/restore — upload a ZIP and restore
+app.post("/api/admin/backup/restore", backupUpload.single("backup"), (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ ok: false, error: "No file uploaded" });
+    const { metadata, restored, errors } = restoreFromBuffer(req.file.buffer);
+    console.log(`[Backup] Restore completed — ${restored.length} files restored`);
+    if (errors.length) console.warn("[Backup] Restore errors:", errors);
+    res.json({ ok: true, metadata, restored, errors,
+      message: errors.length
+        ? `Restored ${restored.length} files with ${errors.length} error(s). Please restart the server.`
+        : `Successfully restored ${restored.length} files. Please restart the server to apply database changes.`
+    });
+  } catch (e) {
+    console.error("[Backup] Restore error:", e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /api/admin/backup/save-now — create and save a local backup immediately
+app.post("/api/admin/backup/save-now", (req, res) => {
+  try {
+    const { zip, tag, metadata } = createBackupZip();
+    const filename = saveBackupLocally(zip, tag);
+    res.json({ ok: true, filename, metadata });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── Generic CRUD (wildcard — must be LAST) ──
 
 // GET /api/:collection
@@ -3098,6 +3190,17 @@ cron.schedule("0 3 * * *", () => {
   }
   const r = purgeOldSnapshots(RETENTION_DAYS);
   console.log(`[RETENTION] Purged snapshots older than ${RETENTION_DAYS} days:`, r);
+});
+
+// ─── Schedule: Auto-backup at 2:00 AM daily ──────────────────────────────────
+cron.schedule("0 2 * * *", () => {
+  try {
+    const { zip, tag } = createBackupZip();
+    const filename = saveBackupLocally(zip, tag);
+    console.log(`[Backup] Auto-backup saved: ${filename}`);
+  } catch (e) {
+    console.error("[Backup] Auto-backup failed:", e.message);
+  }
 });
 
 // Also run on server start (catches up after restarts)
