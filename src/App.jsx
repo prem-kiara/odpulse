@@ -411,8 +411,6 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
   const [memberArrearOverride, setMemberArrearOverride] = useState(0);
   const [memberAlreadyCollected, setMemberAlreadyCollected] = useState(0);
   const lookupTimerRef = useRef(null);
-  // Monotonic id so a slow earlier response can't overwrite a faster later one.
-  const lookupReqRef = useRef(0);
 
   const fetchCentersForPhone = (phoneNum) => {
     const clean = phoneNum.replace(/\D/g, "");
@@ -450,16 +448,12 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
     setCustomerName(c.name || "");
     setCustomerId(c.customerId || "");
     setLoanAccountNo(c.loanAccountNo || "");
-    // Only auto-fill branch if it matches an existing option in the dropdown.
-    // Pool-Report values like "Pollachi-VM" may not be in branches.json yet,
-    // and silently setting an invalid value makes the select render blank.
-    const branchOk = c.branch && Array.isArray(branches) && branches.includes(c.branch);
-    if (branchOk) setBranch(c.branch);
+    if (c.branch) setBranch(c.branch);
     if (c.aadhaar) { setAadhaar(c.aadhaar); setAadhaarEditable(false); }
     if (c.phone) setPhone(c.phone);
     const filled = new Set(["customerName", "customerId", "loanAccountNo"]);
     if (c.aadhaar) filled.add("aadhaar");
-    if (branchOk) filled.add("branch");
+    if (c.branch) filled.add("branch");
     setAutoFilledFields(filled);
     setCustomerMatches([]);
     setLookupStatus("found");
@@ -483,17 +477,15 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
     const query = numeric ? raw.replace(/\D/g, "") : raw;
     if (query.length < minLen) { setLookupStatus(""); setCustomerMatches([]); return; }
     setLookupStatus("searching");
-    const myReq = ++lookupReqRef.current;
     fetch(`${API_BASE}/customers/lookup?${type}=${encodeURIComponent(query)}`)
       .then(r => r.json())
       .then(data => {
-        if (myReq !== lookupReqRef.current) return; // stale response, ignore
         if (data.found) {
           if (data.customers.length === 1) { applyCustomer(data.customers[0]); }
           else { setCustomerMatches(data.customers); setLookupStatus("multiple"); }
         } else { setCustomerMatches([]); setLookupStatus("notfound"); }
       })
-      .catch(() => { if (myReq === lookupReqRef.current) setLookupStatus(""); });
+      .catch(() => setLookupStatus(""));
   };
   const handlePhoneChange = (val) => {
     setPhone(val);
@@ -1440,8 +1432,6 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
   const [odSnap, setOdSnap] = useState(null); // auto-populated OD snapshot from CustomerInfoPanel
   const [indivCenters, setIndivCenters] = useState([]);
   const lookupTimerRef = useRef(null);
-  // Monotonic id so a slow earlier response can't overwrite a faster later one.
-  const lookupReqRef = useRef(0);
 
   const fetchIndivCenters = (phoneNum) => {
     const clean = String(phoneNum).replace(/\D/g, "");
@@ -1478,9 +1468,7 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
     setCustomerName(c.name || "");
     setCustomerId(c.customerId || "");
     setLoanAccountNo(c.loanAccountNo || "");
-    // See EntryForm.applyCustomer — branch is only auto-set when it matches an existing option.
-    const branchOk = c.branch && Array.isArray(branches) && branches.includes(c.branch);
-    if (branchOk) setBranch(c.branch);
+    if (c.branch) setBranch(c.branch);
     if (c.aadhaar) { setAadhaar(c.aadhaar); setAadhaarEditable(false); }
     if (c.phone) setPhone(c.phone);
     // Prefer loan-based center fetch (one accurate center) over phone-based
@@ -1492,7 +1480,7 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
     }
     const filled = new Set(["customerName", "customerId", "loanAccountNo"]);
     if (c.aadhaar) filled.add("aadhaar");
-    if (branchOk) filled.add("branch");
+    if (c.branch) filled.add("branch");
     setAutoFilledFields(filled);
     setCustomerMatches([]);
     setLookupStatus("found");
@@ -1505,17 +1493,15 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
     const query = numeric ? raw.replace(/\D/g, "") : raw;
     if (query.length < minLen) { setLookupStatus(""); setCustomerMatches([]); return; }
     setLookupStatus("searching");
-    const myReq = ++lookupReqRef.current;
     fetch(`${API_BASE}/customers/lookup?${type}=${encodeURIComponent(query)}`)
       .then(r => r.json())
       .then(data => {
-        if (myReq !== lookupReqRef.current) return; // stale response, ignore
         if (data.found) {
           if (data.customers.length === 1) { applyCustomer(data.customers[0]); }
           else { setCustomerMatches(data.customers); setLookupStatus("multiple"); }
         } else { setCustomerMatches([]); setLookupStatus("notfound"); }
       })
-      .catch(() => { if (myReq === lookupReqRef.current) setLookupStatus(""); });
+      .catch(() => setLookupStatus(""));
   };
   const handlePhoneChange = (val) => {
     setPhone(val);
@@ -2454,19 +2440,16 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
                   { key: "date", label: "Date", align: "left" },
                   { key: "branch", label: "Branch", align: "left" },
                   { key: "customer", label: "Customer", align: "left" },
+                  { key: "groupod", label: "Group OD", align: "right" },
                 ].map(col => (
                   <th key={col.key} className={`text-${col.align} px-4 py-3 font-semibold text-gray-600 cursor-pointer hover:text-teal-700 select-none`}
                     onClick={() => { if (sortField === col.key) setSortDir(sortDir === "desc" ? "asc" : "desc"); else { setSortField(col.key); setSortDir("desc"); } }}>
                     {col.label} {sortField === col.key ? (sortDir === "desc" ? "↓" : "↑") : ""}
                   </th>
                 ))}
-                {/* Group OD-only columns: Group OD amount, Group Size, Customer Share */}
+                {/* Group OD-only columns: Group Size and Customer Share */}
                 {odTypeFilter !== "Individual OD" && (
                   <>
-                    <th className="text-right px-4 py-3 font-semibold text-gray-600 cursor-pointer hover:text-teal-700 select-none"
-                      onClick={() => { if (sortField === "groupod") setSortDir(sortDir === "desc" ? "asc" : "desc"); else { setSortField("groupod"); setSortDir("desc"); } }}>
-                      Group OD {sortField === "groupod" ? (sortDir === "desc" ? "↓" : "↑") : ""}
-                    </th>
                     <th className="text-right px-4 py-3 font-semibold text-gray-600 cursor-pointer hover:text-teal-700 select-none"
                       onClick={() => { if (sortField === "groupsize") setSortDir(sortDir === "desc" ? "asc" : "desc"); else { setSortField("groupsize"); setSortDir("desc"); } }}>
                       Group Size {sortField === "groupsize" ? (sortDir === "desc" ? "↓" : "↑") : ""}
@@ -2512,7 +2495,7 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
             </thead>
             <tbody>
               {visibleEntries.length === 0 ? (
-                <tr><td colSpan={odTypeFilter === "Individual OD" ? 8 : 13} className="text-center py-12 text-gray-400">No records found</td></tr>
+                <tr><td colSpan={odTypeFilter === "Individual OD" ? 9 : 13} className="text-center py-12 text-gray-400">No records found</td></tr>
               ) : visibleEntries.map(e => {
                 const paid = getPaid(e);
                 return (
@@ -2527,10 +2510,10 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
                       <div className="font-medium">{e.customerName}</div>
                       <div className="text-xs text-gray-400">{e.customerId} | {e.loanAccountNo}</div>
                     </td>
-                    {/* Group OD-only: Group OD amount, Group Size, Customer Share */}
+                    <td className="px-4 py-3 text-right font-medium">{formatINR(e.groupOdAmount)}</td>
+                    {/* Group OD-only: Group Size and Customer Share */}
                     {odTypeFilter !== "Individual OD" && (
                       <>
-                        <td className="px-4 py-3 text-right font-medium">{formatINR(e.groupOdAmount)}</td>
                         <td className="px-4 py-3 text-right">{e.numberOfCustomers || "—"}</td>
                         <td className="px-4 py-3 text-right">{formatINR(e.customerShare || (e.numberOfCustomers > 0 ? Math.round((e.groupOdAmount || 0) / e.numberOfCustomers) : 0))}</td>
                       </>
@@ -2611,7 +2594,7 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
                   </tr>
                   {expandedId === e.id && (
                     <tr className="bg-gray-50">
-                      <td colSpan={odTypeFilter === "Individual OD" ? 8 : 13} className="px-6 py-4 space-y-3">
+                      <td colSpan={odTypeFilter === "Individual OD" ? 9 : 13} className="px-6 py-4 space-y-3">
                         {/* OD pool/accrued live view */}
                         <CustomerInfoPanel loanAccountNo={e.loanAccountNo} customerId={e.customerId} />
                         {/* OD breakdown — Group or Individual */}
@@ -3984,7 +3967,7 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
     <div>
       <h2 className="text-xl font-bold text-gray-900 mb-4 flex items-center gap-2"><Settings size={22} className="text-teal-600" /> Admin Panel</h2>
       <div className="flex flex-wrap gap-2 mb-6">
-        {[{ key: "users", icon: Users, label: "Users" }, { key: "branches", icon: GitBranch, label: "Branches" }, { key: "bulk", icon: Upload, label: "Bulk Upload" }, { key: "backup", icon: Database, label: "Backup & Restore" }, { key: "settings", icon: Settings, label: "Settings" }].map(t => (
+        {[{ key: "users", icon: Users, label: "Users" }, { key: "branches", icon: GitBranch, label: "Branches" }, { key: "bulk", icon: Upload, label: "Bulk Upload" }, { key: "settings", icon: Settings, label: "Settings" }].map(t => (
           <button key={t.key} onClick={() => setTab(t.key)}
             className={`flex items-center gap-1.5 px-4 py-2 rounded-lg text-sm font-medium transition-colors ${tab === t.key ? "bg-teal-600 text-white" : "bg-white text-gray-600 border hover:bg-gray-50"}`}>
             <t.icon size={16} /> {t.label}
@@ -4373,237 +4356,6 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
           </div>
         </div>
       )}
-
-      {tab === "backup" && <BackupPanel />}
-    </div>
-  );
-}
-
-// ─── Backup & Restore Panel ─────────────────────────────────────────────────
-function BackupPanel() {
-  const [backupList, setBackupList]     = useState([]);
-  const [loadingList, setLoadingList]   = useState(true);
-  const [downloading, setDownloading]   = useState(false);
-  const [saving, setSaving]             = useState(false);
-  const [restoring, setRestoring]       = useState(false);
-  const [restoreResult, setRestoreResult] = useState(null);
-  const [deleting, setDeleting]         = useState(null);
-  const fileInputRef                    = useRef(null);
-
-  const loadList = () => {
-    setLoadingList(true);
-    fetch(`${API_BASE}/admin/backup/list`)
-      .then(r => r.json())
-      .then(d => { setBackupList(d.backups || []); setLoadingList(false); })
-      .catch(() => setLoadingList(false));
-  };
-
-  useEffect(() => { loadList(); }, []);
-
-  const handleDownload = async () => {
-    setDownloading(true);
-    try {
-      const res = await fetch(`${API_BASE}/admin/backup/download`);
-      if (!res.ok) throw new Error("Server error");
-      const blob = await res.blob();
-      const cd   = res.headers.get("Content-Disposition") || "";
-      const name = (cd.match(/filename="(.+)"/) || [])[1] || `odpulse-backup-${Date.now()}.zip`;
-      const url  = URL.createObjectURL(blob);
-      const a    = document.createElement("a");
-      a.href = url; a.download = name; a.click();
-      URL.revokeObjectURL(url);
-      setTimeout(loadList, 1500);
-    } catch (e) {
-      alert("Backup download failed: " + e.message);
-    }
-    setDownloading(false);
-  };
-
-  const handleSaveNow = async () => {
-    setSaving(true);
-    try {
-      const res = await fetch(`${API_BASE}/admin/backup/save-now`, { method: "POST" });
-      const d   = await res.json();
-      if (!d.ok) throw new Error(d.error);
-      alert(`Backup saved on server: ${d.filename}`);
-      loadList();
-    } catch (e) {
-      alert("Save failed: " + e.message);
-    }
-    setSaving(false);
-  };
-
-  const handleDownloadSaved = (filename) => {
-    const a = document.createElement("a");
-    a.href = `${API_BASE}/admin/backup/download/${encodeURIComponent(filename)}`;
-    a.download = filename; a.click();
-  };
-
-  const handleDelete = async (filename) => {
-    if (!window.confirm(`Delete backup "${filename}"? This cannot be undone.`)) return;
-    setDeleting(filename);
-    try {
-      await fetch(`${API_BASE}/admin/backup/${encodeURIComponent(filename)}`, { method: "DELETE" });
-      loadList();
-    } catch (e) {
-      alert("Delete failed: " + e.message);
-    }
-    setDeleting(null);
-  };
-
-  const handleRestoreFile = async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    if (!file.name.endsWith(".zip")) { alert("Please select a valid .zip backup file."); return; }
-    if (!window.confirm(
-      `⚠️ RESTORE BACKUP\n\nFile: ${file.name}\n\nThis will REPLACE all current data (entries, users, database) with the backup contents.\n\nA restart of the server will be required after restore.\n\nAre you absolutely sure?`
-    )) { e.target.value = ""; return; }
-
-    setRestoring(true);
-    setRestoreResult(null);
-    try {
-      const fd  = new FormData();
-      fd.append("backup", file);
-      const res = await fetch(`${API_BASE}/admin/backup/restore`, { method: "POST", body: fd });
-      const d   = await res.json();
-      setRestoreResult(d);
-    } catch (err) {
-      setRestoreResult({ ok: false, error: err.message });
-    }
-    setRestoring(false);
-    e.target.value = "";
-  };
-
-  const fmtDate = (iso) => {
-    if (!iso) return "—";
-    const d = new Date(iso);
-    return d.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" }) +
-      " " + d.toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" });
-  };
-
-  return (
-    <div className="space-y-4">
-      {/* Header */}
-      <div className="bg-white rounded-xl border p-5">
-        <h3 className="font-semibold text-gray-800 mb-1 flex items-center gap-2"><Database size={18} className="text-teal-600" /> Backup & Restore</h3>
-        <p className="text-xs text-gray-500 mb-4">
-          Full system backup includes all entries, users, database records, branches, configuration, and uploaded files.
-          Backups are automatically saved on the server every night at 2:00 AM.
-        </p>
-
-        {/* Action buttons */}
-        <div className="flex flex-wrap gap-3">
-          <button onClick={handleDownload} disabled={downloading}
-            className="flex items-center gap-2 px-4 py-2.5 bg-teal-600 text-white rounded-lg hover:bg-teal-700 disabled:opacity-60 transition-colors text-sm font-medium">
-            <Download size={16} />
-            {downloading ? "Creating backup…" : "Download Full Backup"}
-          </button>
-          <button onClick={handleSaveNow} disabled={saving}
-            className="flex items-center gap-2 px-4 py-2.5 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 disabled:opacity-60 transition-colors text-sm font-medium">
-            <Save size={16} />
-            {saving ? "Saving…" : "Save Backup on Server"}
-          </button>
-          <button onClick={() => fileInputRef.current?.click()} disabled={restoring}
-            className="flex items-center gap-2 px-4 py-2.5 bg-orange-600 text-white rounded-lg hover:bg-orange-700 disabled:opacity-60 transition-colors text-sm font-medium">
-            <Upload size={16} />
-            {restoring ? "Restoring…" : "Upload & Restore Backup"}
-          </button>
-          <input ref={fileInputRef} type="file" accept=".zip" className="hidden" onChange={handleRestoreFile} />
-        </div>
-      </div>
-
-      {/* Restore result */}
-      {restoreResult && (
-        <div className={`rounded-xl border p-5 ${restoreResult.ok ? "bg-green-50 border-green-200" : "bg-red-50 border-red-200"}`}>
-          <h4 className={`font-semibold mb-2 flex items-center gap-2 ${restoreResult.ok ? "text-green-700" : "text-red-700"}`}>
-            {restoreResult.ok ? <CheckCircle size={18} /> : <AlertTriangle size={18} />}
-            {restoreResult.ok ? "Restore Successful" : "Restore Failed"}
-          </h4>
-          <p className="text-sm text-gray-700 mb-2">{restoreResult.message || restoreResult.error}</p>
-          {restoreResult.ok && (
-            <>
-              <p className="text-xs text-gray-500 mb-1">Backup created: {fmtDate(restoreResult.metadata?.createdAt)}</p>
-              <p className="text-xs text-gray-500 mb-2">{restoreResult.restored?.length} files restored</p>
-              <div className="bg-amber-50 border border-amber-200 rounded-lg p-3">
-                <p className="text-xs font-semibold text-amber-700">⚠️ Action required: Restart the server</p>
-                <p className="text-xs text-amber-600 mt-0.5">Run <code className="bg-amber-100 px-1 rounded">pm2 restart odpulse-api</code> on the server to apply the restored database.</p>
-              </div>
-              {restoreResult.errors?.length > 0 && (
-                <div className="mt-2">
-                  <p className="text-xs text-red-600 font-semibold">Errors ({restoreResult.errors.length}):</p>
-                  {restoreResult.errors.map((e, i) => <p key={i} className="text-xs text-red-500">{e}</p>)}
-                </div>
-              )}
-            </>
-          )}
-        </div>
-      )}
-
-      {/* What's included */}
-      <div className="bg-white rounded-xl border p-5">
-        <h4 className="font-semibold text-gray-700 mb-3 text-sm">What's included in each backup</h4>
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs text-gray-600">
-          {[
-            ["🗄️ SQLite Database", "All customer records, pool snapshots, accrued interest data"],
-            ["📋 Entries (entries.json)", "All OD collection records — Group OD & Individual OD"],
-            ["👥 Users (users.json)", "Staff accounts, roles, branches, passwords"],
-            ["🏢 Branches (branches.json)", "All branch names and configuration"],
-            ["⚙️ Config (config.json)", "System settings, access control"],
-            ["🔔 Notifications (notifications.json)", "PTP reminders and alert history"],
-            ["📁 Uploaded Files", "All Excel reports uploaded to the system"],
-          ].map(([title, desc]) => (
-            <div key={title} className="flex gap-2 p-2 bg-gray-50 rounded-lg">
-              <span className="text-base leading-tight">{title.split(" ")[0]}</span>
-              <div>
-                <p className="font-medium text-gray-700">{title.split(" ").slice(1).join(" ")}</p>
-                <p className="text-gray-500">{desc}</p>
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
-
-      {/* Saved backups list */}
-      <div className="bg-white rounded-xl border p-5">
-        <div className="flex items-center justify-between mb-3">
-          <h4 className="font-semibold text-gray-700 text-sm flex items-center gap-2">
-            <Clock size={16} className="text-gray-400" /> Saved Backups on Server
-          </h4>
-          <button onClick={loadList} className="text-xs text-teal-600 hover:underline">Refresh</button>
-        </div>
-        {loadingList ? (
-          <p className="text-xs text-gray-400">Loading…</p>
-        ) : backupList.length === 0 ? (
-          <p className="text-xs text-gray-400">No backups saved yet. Click "Save Backup on Server" or wait for the nightly auto-backup at 2:00 AM.</p>
-        ) : (
-          <div className="space-y-2">
-            {backupList.map(b => (
-              <div key={b.filename} className="flex items-center justify-between gap-3 p-3 bg-gray-50 rounded-lg border">
-                <div className="min-w-0">
-                  <p className="text-xs font-medium text-gray-700 truncate">{b.filename}</p>
-                  <p className="text-xs text-gray-400">{fmtDate(b.createdAt)} · {b.sizeHuman}</p>
-                </div>
-                <div className="flex gap-2 flex-shrink-0">
-                  <button onClick={() => handleDownloadSaved(b.filename)}
-                    className="flex items-center gap-1 px-2.5 py-1.5 bg-teal-100 text-teal-700 rounded-lg text-xs hover:bg-teal-200 transition-colors">
-                    <Download size={12} /> Download
-                  </button>
-                  <button onClick={() => handleDelete(b.filename)} disabled={deleting === b.filename}
-                    className="flex items-center gap-1 px-2.5 py-1.5 bg-red-100 text-red-600 rounded-lg text-xs hover:bg-red-200 transition-colors disabled:opacity-50">
-                    <X size={12} /> {deleting === b.filename ? "…" : "Delete"}
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-
-      {/* Schedule info */}
-      <div className="bg-blue-50 border border-blue-200 rounded-xl p-4">
-        <p className="text-xs font-semibold text-blue-700 mb-1">⏰ Automatic Schedule</p>
-        <p className="text-xs text-blue-600">The server automatically creates a backup every night at <strong>2:00 AM</strong> and keeps the last <strong>15 backups</strong>. You can also create a manual backup any time using the buttons above.</p>
-      </div>
     </div>
   );
 }
@@ -4837,9 +4589,7 @@ export default function App() {
     { key: "ind_records", icon: FileText, label: "Individual OD" },
     ...(canViewInsights ? [{ key: "od_insights", icon: TrendingUp, label: "OD Insights" }] : []),
     ...(canUploadOD ? [{ key: "od_upload", icon: Upload, label: "OD Upload" }] : []),
-    // Admin-only until ReportsAnalytics is wired to real backend data
-    // (currently driven by DUMMY_PRODUCTS / DUMMY_BRANCH_PERFORMANCE).
-    ...(isAdmin ? [{ key: "reports_analytics", icon: Activity, label: "Reports & Analytics" }] : []),
+    { key: "reports_analytics", icon: Activity, label: "Reports & Analytics" },
     { key: "notifications", icon: Bell, label: "Notifications", badge: unreadNotificationsCount > 0 ? unreadNotificationsCount : null },
     ...(isAdmin ? [{ key: "admin", icon: Shield, label: "Admin" }] : []),
   ];
@@ -4923,7 +4673,7 @@ export default function App() {
           {page === "ind_records" && <RecordsTable user={user} entries={entries} setEntries={setEntries} config={config} branches={branches} notifications={notifications} setNotifications={setNotifications} odTypeFilter="Individual OD" />}
           {page === "od_insights" && canViewInsights && <CollectionDashboard user={user} entries={entries} branches={branches} />}
           {page === "od_upload" && canUploadOD && <DataUploadPage user={user} canUpload={canUploadOD} />}
-          {page === "reports_analytics" && isAdmin && <ReportsAnalytics user={user} />}
+          {page === "reports_analytics" && <ReportsAnalytics user={user} />}
           {page === "notifications" && <NotificationsPage user={user} users={users} notifications={notifications} setNotifications={setNotifications} />}
           {page === "admin" && user.role === "admin" && <AdminPanel users={users} setUsers={setUsers} branches={branches} setBranches={setBranches} config={config} setConfig={setConfig} entries={entries} setEntries={setEntries} notifications={notifications} setNotifications={setNotifications} />}
         </main>
