@@ -30,3 +30,11 @@ failed-entries-to-fix.xlsx
 .env
 .env.*
 !.env.example
+
+# debug / accidental commits guard (added 2026-04-30)
+.fuse_hidden*
+*.head
+test_write.txt
+/check.mjs
+/check_all.mjs
+server/check_*.mjs
