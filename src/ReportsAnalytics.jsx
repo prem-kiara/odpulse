@@ -305,7 +305,10 @@ export default function ReportsAnalytics({ user }) {
     }));
 
   const handleExportCSV = () => downloadCSV(exportRowsForCSV(), `reports-products-${todayISO()}.csv`);
-  const handleExportExcel = () => downloadCSV(exportRowsForCSV(), `reports-products-${todayISO()}.xls`);
+  // Note: this is a CSV under the hood — Excel opens it natively. We dropped the .xls
+  // extension because writing CSV to a .xls file makes Excel show a format-mismatch warning
+  // on open. To make this a real .xlsx export, add SheetJS and rebuild this function.
+  const handleExportExcel = () => downloadCSV(exportRowsForCSV(), `reports-products-${todayISO()}.csv`);
   const handleExportPDF = () => {
     const w = window.open("", "_blank", "width=900,height=700");
     if (!w) return;

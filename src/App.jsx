@@ -411,6 +411,8 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
   const [memberArrearOverride, setMemberArrearOverride] = useState(0);
   const [memberAlreadyCollected, setMemberAlreadyCollected] = useState(0);
   const lookupTimerRef = useRef(null);
+  // Monotonic id so a slow earlier response can't overwrite a faster later one.
+  const lookupReqRef = useRef(0);
 
   const fetchCentersForPhone = (phoneNum) => {
     const clean = phoneNum.replace(/\D/g, "");
@@ -430,12 +432,16 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
     setCustomerName(c.name || "");
     setCustomerId(c.customerId || "");
     setLoanAccountNo(c.loanAccountNo || "");
-    if (c.branch) setBranch(c.branch);
+    // Only auto-fill branch if it matches an existing option in the dropdown.
+    // Pool-Report values like "Pollachi-VM" may not be in branches.json yet,
+    // and silently setting an invalid value makes the select render blank.
+    const branchOk = c.branch && Array.isArray(branches) && branches.includes(c.branch);
+    if (branchOk) setBranch(c.branch);
     if (c.aadhaar) { setAadhaar(c.aadhaar); setAadhaarEditable(false); }
     if (c.phone) setPhone(c.phone);
     const filled = new Set(["customerName", "customerId", "loanAccountNo"]);
     if (c.aadhaar) filled.add("aadhaar");
-    if (c.branch) filled.add("branch");
+    if (branchOk) filled.add("branch");
     setAutoFilledFields(filled);
     setCustomerMatches([]);
     setLookupStatus("found");
@@ -449,15 +455,17 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
     const query = numeric ? raw.replace(/\D/g, "") : raw;
     if (query.length < minLen) { setLookupStatus(""); setCustomerMatches([]); return; }
     setLookupStatus("searching");
+    const myReq = ++lookupReqRef.current;
     fetch(`${API_BASE}/customers/lookup?${type}=${encodeURIComponent(query)}`)
       .then(r => r.json())
       .then(data => {
+        if (myReq !== lookupReqRef.current) return; // stale response, ignore
         if (data.found) {
           if (data.customers.length === 1) { applyCustomer(data.customers[0]); }
           else { setCustomerMatches(data.customers); setLookupStatus("multiple"); }
         } else { setCustomerMatches([]); setLookupStatus("notfound"); }
       })
-      .catch(() => setLookupStatus(""));
+      .catch(() => { if (myReq === lookupReqRef.current) setLookupStatus(""); });
   };
   const handlePhoneChange = (val) => {
     setPhone(val);
@@ -1210,6 +1218,8 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
   const [odSnap, setOdSnap] = useState(null); // auto-populated OD snapshot from CustomerInfoPanel
   const [indivCenters, setIndivCenters] = useState([]);
   const lookupTimerRef = useRef(null);
+  // Monotonic id so a slow earlier response can't overwrite a faster later one.
+  const lookupReqRef = useRef(0);
 
   const fetchIndivCenters = (phoneNum) => {
     const clean = String(phoneNum).replace(/\D/g, "");
@@ -1229,12 +1239,14 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
     setCustomerName(c.name || "");
     setCustomerId(c.customerId || "");
     setLoanAccountNo(c.loanAccountNo || "");
-    if (c.branch) setBranch(c.branch);
+    // See EntryForm.applyCustomer — branch is only auto-set when it matches an existing option.
+    const branchOk = c.branch && Array.isArray(branches) && branches.includes(c.branch);
+    if (branchOk) setBranch(c.branch);
     if (c.aadhaar) { setAadhaar(c.aadhaar); setAadhaarEditable(false); }
     if (c.phone) { setPhone(c.phone); fetchIndivCenters(c.phone); }
     const filled = new Set(["customerName", "customerId", "loanAccountNo"]);
     if (c.aadhaar) filled.add("aadhaar");
-    if (c.branch) filled.add("branch");
+    if (branchOk) filled.add("branch");
     setAutoFilledFields(filled);
     setCustomerMatches([]);
     setLookupStatus("found");
@@ -1247,15 +1259,17 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
     const query = numeric ? raw.replace(/\D/g, "") : raw;
     if (query.length < minLen) { setLookupStatus(""); setCustomerMatches([]); return; }
     setLookupStatus("searching");
+    const myReq = ++lookupReqRef.current;
     fetch(`${API_BASE}/customers/lookup?${type}=${encodeURIComponent(query)}`)
       .then(r => r.json())
       .then(data => {
+        if (myReq !== lookupReqRef.current) return; // stale response, ignore
         if (data.found) {
           if (data.customers.length === 1) { applyCustomer(data.customers[0]); }
           else { setCustomerMatches(data.customers); setLookupStatus("multiple"); }
         } else { setCustomerMatches([]); setLookupStatus("notfound"); }
       })
-      .catch(() => setLookupStatus(""));
+      .catch(() => { if (myReq === lookupReqRef.current) setLookupStatus(""); });
   };
   const handlePhoneChange = (val) => {
     setPhone(val);
@@ -2182,16 +2196,19 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
                   { key: "date", label: "Date", align: "left" },
                   { key: "branch", label: "Branch", align: "left" },
                   { key: "customer", label: "Customer", align: "left" },
-                  { key: "groupod", label: "Group OD", align: "right" },
                 ].map(col => (
                   <th key={col.key} className={`text-${col.align} px-4 py-3 font-semibold text-gray-600 cursor-pointer hover:text-teal-700 select-none`}
                     onClick={() => { if (sortField === col.key) setSortDir(sortDir === "desc" ? "asc" : "desc"); else { setSortField(col.key); setSortDir("desc"); } }}>
                     {col.label} {sortField === col.key ? (sortDir === "desc" ? "↓" : "↑") : ""}
                   </th>
                 ))}
-                {/* Group OD-only columns: Group Size and Customer Share */}
+                {/* Group OD-only columns: Group OD amount, Group Size, Customer Share */}
                 {odTypeFilter !== "Individual OD" && (
                   <>
+                    <th className="text-right px-4 py-3 font-semibold text-gray-600 cursor-pointer hover:text-teal-700 select-none"
+                      onClick={() => { if (sortField === "groupod") setSortDir(sortDir === "desc" ? "asc" : "desc"); else { setSortField("groupod"); setSortDir("desc"); } }}>
+                      Group OD {sortField === "groupod" ? (sortDir === "desc" ? "↓" : "↑") : ""}
+                    </th>
                     <th className="text-right px-4 py-3 font-semibold text-gray-600 cursor-pointer hover:text-teal-700 select-none"
                       onClick={() => { if (sortField === "groupsize") setSortDir(sortDir === "desc" ? "asc" : "desc"); else { setSortField("groupsize"); setSortDir("desc"); } }}>
                       Group Size {sortField === "groupsize" ? (sortDir === "desc" ? "↓" : "↑") : ""}
@@ -2237,7 +2254,7 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
             </thead>
             <tbody>
               {visibleEntries.length === 0 ? (
-                <tr><td colSpan={odTypeFilter === "Individual OD" ? 9 : 13} className="text-center py-12 text-gray-400">No records found</td></tr>
+                <tr><td colSpan={odTypeFilter === "Individual OD" ? 8 : 13} className="text-center py-12 text-gray-400">No records found</td></tr>
               ) : visibleEntries.map(e => {
                 const paid = getPaid(e);
                 return (
@@ -2252,10 +2269,10 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
                       <div className="font-medium">{e.customerName}</div>
                       <div className="text-xs text-gray-400">{e.customerId} | {e.loanAccountNo}</div>
                     </td>
-                    <td className="px-4 py-3 text-right font-medium">{formatINR(e.groupOdAmount)}</td>
-                    {/* Group OD-only: Group Size and Customer Share */}
+                    {/* Group OD-only: Group OD amount, Group Size, Customer Share */}
                     {odTypeFilter !== "Individual OD" && (
                       <>
+                        <td className="px-4 py-3 text-right font-medium">{formatINR(e.groupOdAmount)}</td>
                         <td className="px-4 py-3 text-right">{e.numberOfCustomers || "—"}</td>
                         <td className="px-4 py-3 text-right">{formatINR(e.customerShare || (e.numberOfCustomers > 0 ? Math.round((e.groupOdAmount || 0) / e.numberOfCustomers) : 0))}</td>
                       </>
@@ -2336,7 +2353,7 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
                   </tr>
                   {expandedId === e.id && (
                     <tr className="bg-gray-50">
-                      <td colSpan={odTypeFilter === "Individual OD" ? 9 : 13} className="px-6 py-4 space-y-3">
+                      <td colSpan={odTypeFilter === "Individual OD" ? 8 : 13} className="px-6 py-4 space-y-3">
                         {/* OD pool/accrued live view */}
                         <CustomerInfoPanel loanAccountNo={e.loanAccountNo} customerId={e.customerId} />
                         {/* OD breakdown — Group or Individual */}
@@ -4331,7 +4348,9 @@ export default function App() {
     { key: "ind_records", icon: FileText, label: "Individual OD" },
     ...(canViewInsights ? [{ key: "od_insights", icon: TrendingUp, label: "OD Insights" }] : []),
     ...(canUploadOD ? [{ key: "od_upload", icon: Upload, label: "OD Upload" }] : []),
-    { key: "reports_analytics", icon: Activity, label: "Reports & Analytics" },
+    // Admin-only until ReportsAnalytics is wired to real backend data
+    // (currently driven by DUMMY_PRODUCTS / DUMMY_BRANCH_PERFORMANCE).
+    ...(isAdmin ? [{ key: "reports_analytics", icon: Activity, label: "Reports & Analytics" }] : []),
     { key: "notifications", icon: Bell, label: "Notifications", badge: unreadNotificationsCount > 0 ? unreadNotificationsCount : null },
     ...(isAdmin ? [{ key: "admin", icon: Shield, label: "Admin" }] : []),
   ];
@@ -4415,7 +4434,7 @@ export default function App() {
           {page === "ind_records" && <RecordsTable user={user} entries={entries} setEntries={setEntries} config={config} branches={branches} notifications={notifications} setNotifications={setNotifications} odTypeFilter="Individual OD" />}
           {page === "od_insights" && canViewInsights && <CollectionDashboard user={user} entries={entries} branches={branches} />}
           {page === "od_upload" && canUploadOD && <DataUploadPage user={user} canUpload={canUploadOD} />}
-          {page === "reports_analytics" && <ReportsAnalytics user={user} />}
+          {page === "reports_analytics" && isAdmin && <ReportsAnalytics user={user} />}
           {page === "notifications" && <NotificationsPage user={user} users={users} notifications={notifications} setNotifications={setNotifications} />}
           {page === "admin" && user.role === "admin" && <AdminPanel users={users} setUsers={setUsers} branches={branches} setBranches={setBranches} config={config} setConfig={setConfig} entries={entries} setEntries={setEntries} notifications={notifications} setNotifications={setNotifications} />}
         </main>
