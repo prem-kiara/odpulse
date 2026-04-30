@@ -20,6 +20,7 @@ import {
   enqueueUpload, listQueue, deleteFromQueue, drainQueue, isBackendUp,
 } from "./uploadQueue";
 import { SortableSection } from "./tableSort.jsx";
+import { usePagination, PaginationBar } from "./Pagination";
 
 const API_BASE = "/api";
 const COLORS = ["#0f766e", "#06b6d4", "#8b5cf6", "#f59e0b", "#ef4444", "#10b981", "#ec4899", "#6366f1", "#14b8a6", "#f97316"];
@@ -200,24 +201,36 @@ export function CustomerInfoPanel({ loanAccountNo, customerId, compact = false, 
 
   if (!data) return null;
 
-  const { customer, pool, accrued, principalOutstanding, accruedInterest, unpaidInterest, foreclosureValue, poolSnapshotDate, accruedSnapshotDate } = data;
+  const { customer, pool, accrued, foreclosure, isClosed, loanStatus, principalOutstanding, accruedInterest, unpaidInterest, foreclosureValue, poolSnapshotDate, accruedSnapshotDate, foreclosureSnapshotDate } = data;
+
+  // Closed loans get a grey-toned panel; active loans keep the teal gradient.
+  const panelCls = isClosed
+    ? "mt-3 bg-gradient-to-br from-gray-50 to-gray-100 border border-gray-300 rounded-xl p-4 space-y-3"
+    : "mt-3 bg-gradient-to-br from-teal-50 to-cyan-50 border border-teal-200 rounded-xl p-4 space-y-3";
 
   return (
-    <div className="mt-3 bg-gradient-to-br from-teal-50 to-cyan-50 border border-teal-200 rounded-xl p-4 space-y-3">
+    <div className={panelCls}>
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <Database size={14} className="text-teal-700" />
-          <span className="text-xs font-semibold text-teal-800 uppercase tracking-wide">
-            Live OD Snapshot
+          <Database size={14} className={isClosed ? "text-gray-600" : "text-teal-700"} />
+          <span className={`text-xs font-semibold uppercase tracking-wide ${isClosed ? "text-gray-700" : "text-teal-800"}`}>
+            {isClosed ? "Closed Loan Record" : "Live OD Snapshot"}
           </span>
+          {isClosed && (
+            <span className="text-[10px] font-bold text-gray-700 bg-gray-200 px-1.5 py-0.5 rounded">CLOSED</span>
+          )}
         </div>
         <span className="text-[11px] text-gray-500">
-          Pool: {poolSnapshotDate ? formatDateDMY(poolSnapshotDate) : "—"} · Accrued: {accruedSnapshotDate ? formatDateDMY(accruedSnapshotDate) : "—"}
+          {isClosed
+            ? `Closed on: ${foreclosure?.closed_date || "—"}${foreclosureSnapshotDate ? ` · Snapshot: ${formatDateDMY(foreclosureSnapshotDate)}` : ""}`
+            : `Pool: ${poolSnapshotDate ? formatDateDMY(poolSnapshotDate) : "—"} · Accrued: ${accruedSnapshotDate ? formatDateDMY(accruedSnapshotDate) : "—"}`}
         </span>
       </div>
 
-      {/* 4 core values — can be hidden by caller if shown elsewhere as form fields */}
-      {!hideValueBoxes && (
+      {/* 4 core values — can be hidden by caller if shown elsewhere as form fields.
+          Closed loans get closure-relevant numbers instead of misleading zero
+          outstandings. */}
+      {!hideValueBoxes && !isClosed && (
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
           <div className="bg-white rounded-lg p-3 border border-teal-100">
             <div className="text-[10px] uppercase tracking-wide text-gray-500">Principal Outstanding</div>
@@ -234,6 +247,26 @@ export function CustomerInfoPanel({ loanAccountNo, customerId, compact = false, 
           <div className="bg-teal-600 rounded-lg p-3 border border-teal-700 shadow-sm">
             <div className="text-[10px] uppercase tracking-wide text-teal-100">Foreclosure Value</div>
             <div className="text-base font-bold text-white mt-0.5">{formatINR(foreclosureValue)}</div>
+          </div>
+        </div>
+      )}
+      {!hideValueBoxes && isClosed && (
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+          <div className="bg-white rounded-lg p-3 border border-gray-200">
+            <div className="text-[10px] uppercase tracking-wide text-gray-500">Closing Principal</div>
+            <div className="text-sm font-semibold text-gray-900 mt-0.5">{formatINR(foreclosure?.closing_principal)}</div>
+          </div>
+          <div className="bg-white rounded-lg p-3 border border-gray-200">
+            <div className="text-[10px] uppercase tracking-wide text-gray-500">Total Interest Collected</div>
+            <div className="text-sm font-semibold text-gray-900 mt-0.5">{formatINR(foreclosure?.total_interest_collected)}</div>
+          </div>
+          <div className="bg-white rounded-lg p-3 border border-gray-200">
+            <div className="text-[10px] uppercase tracking-wide text-gray-500">Penalty Collected</div>
+            <div className="text-sm font-semibold text-gray-900 mt-0.5">{formatINR(foreclosure?.penalty_collected)}</div>
+          </div>
+          <div className="bg-gray-700 rounded-lg p-3 border border-gray-800 shadow-sm">
+            <div className="text-[10px] uppercase tracking-wide text-gray-300">Closure Type</div>
+            <div className="text-sm font-bold text-white mt-0.5">{foreclosure?.closure_type || foreclosure?.closure_reason || "—"}</div>
           </div>
         </div>
       )}
@@ -300,30 +333,51 @@ export function CustomerInfoPanel({ loanAccountNo, customerId, compact = false, 
             {otherLoans.map(l => {
               const effDPD = Math.max(Number(l.customerDPD) || 0, Number(l.overdueDays) || 0);
               const isCurrent = l.loanAccountNo === loanAccountNo;
-              const dpdClass = effDPD > 90 ? "bg-red-100 text-red-700"
+              const isClosed = !!l.isClosed;
+              // For closed loans, override the green-pill behaviour (which
+              // would misleadingly show "0d" healthy) with a CLOSED badge.
+              const statusPillClass = isClosed
+                ? "bg-gray-200 text-gray-700"
+                : effDPD > 90 ? "bg-red-100 text-red-700"
                 : effDPD > 60 ? "bg-orange-100 text-orange-700"
                 : effDPD > 30 ? "bg-amber-100 text-amber-700"
                 : effDPD > 0  ? "bg-yellow-100 text-yellow-700"
                 : "bg-green-100 text-green-700";
+              const statusPillLabel = isClosed ? "CLOSED" : `${effDPD}d`;
               return (
                 <div key={l.loanAccountNo}
                   onClick={() => setSelectedLoan(l)}
-                  className={`p-2.5 rounded-lg border cursor-pointer transition-colors ${isCurrent ? "border-teal-500 bg-teal-50 ring-1 ring-teal-300" : "border-gray-200 bg-white hover:bg-teal-50 hover:border-teal-300"}`}>
+                  className={`p-2.5 rounded-lg border cursor-pointer transition-colors ${isClosed ? "border-gray-300 bg-gray-50 hover:bg-gray-100" : isCurrent ? "border-teal-500 bg-teal-50 ring-1 ring-teal-300" : "border-gray-200 bg-white hover:bg-teal-50 hover:border-teal-300"}`}>
                   <div className="flex items-center justify-between gap-3 flex-wrap">
                     <div className="flex items-center gap-2 flex-wrap">
-                      <span className="font-mono text-sm font-semibold text-gray-800">{l.loanAccountNo}</span>
-                      {isCurrent && <span className="text-[10px] font-bold text-teal-700 bg-teal-100 px-1.5 py-0.5 rounded">CURRENT</span>}
+                      <span className={`font-mono text-sm font-semibold ${isClosed ? "text-gray-500 line-through" : "text-gray-800"}`}>{l.loanAccountNo}</span>
+                      {isClosed && (
+                        <span className="text-[10px] font-bold text-gray-700 bg-gray-200 px-1.5 py-0.5 rounded">CLOSED</span>
+                      )}
+                      {!isClosed && isCurrent && (
+                        <span className="text-[10px] font-bold text-teal-700 bg-teal-100 px-1.5 py-0.5 rounded">CURRENT</span>
+                      )}
                       {l.branch && <span className="text-xs text-gray-500">· {l.branch}</span>}
                       {l.centerName && <span className="text-xs text-gray-500">· {l.centerName}</span>}
                     </div>
-                    <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${dpdClass}`}>{effDPD}d</span>
+                    <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${statusPillClass}`}>{statusPillLabel}</span>
                   </div>
-                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-2 text-xs">
-                    <div><span className="text-gray-500">Outstanding:</span> <span className="font-medium text-gray-800">{formatINR(l.principalOutstanding)}</span></div>
-                    <div><span className="text-gray-500">Unpaid Int:</span> <span className="font-medium text-gray-800">{formatINR(l.interestOverdue)}</span></div>
-                    <div><span className="text-gray-500">Accrued:</span> <span className="font-medium text-gray-800">{formatINR(l.accruedInterest)}</span></div>
-                    <div><span className="text-gray-500">Foreclosure:</span> <span className="font-bold text-teal-700">{formatINR(l.foreclosureValue)}</span></div>
-                  </div>
+                  {isClosed ? (
+                    /* Closed loan — show closure facts instead of misleading zero outstandings. */
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-2 text-xs">
+                      <div><span className="text-gray-500">Closed:</span> <span className="font-medium text-gray-800">{l.closedDate || "—"}</span></div>
+                      <div><span className="text-gray-500">Type:</span> <span className="font-medium text-gray-800">{l.closureType || "—"}</span></div>
+                      <div><span className="text-gray-500">Closing Pr.:</span> <span className="font-medium text-gray-800">{formatINR(l.closingPrincipal)}</span></div>
+                      <div><span className="text-gray-500">Int. Collected:</span> <span className="font-medium text-gray-800">{formatINR(l.totalInterestCollected)}</span></div>
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-2 text-xs">
+                      <div><span className="text-gray-500">Outstanding:</span> <span className="font-medium text-gray-800">{formatINR(l.principalOutstanding)}</span></div>
+                      <div><span className="text-gray-500">Unpaid Int:</span> <span className="font-medium text-gray-800">{formatINR(l.interestOverdue)}</span></div>
+                      <div><span className="text-gray-500">Accrued:</span> <span className="font-medium text-gray-800">{formatINR(l.accruedInterest)}</span></div>
+                      <div><span className="text-gray-500">Foreclosure:</span> <span className="font-bold text-teal-700">{formatINR(l.foreclosureValue)}</span></div>
+                    </div>
+                  )}
                 </div>
               );
             })}
@@ -353,33 +407,49 @@ export function CustomerInfoPanel({ loanAccountNo, customerId, compact = false, 
                 <div><span className="text-gray-500">Disbursed:</span> <span className="font-medium">{selectedLoan.disbursementDate ? formatDateDMY(selectedLoan.disbursementDate) : "—"}</span></div>
                 <div><span className="text-gray-500">Last Paid:</span> <span className="font-medium">{selectedLoan.lastPaymentDate ? formatDateDMY(selectedLoan.lastPaymentDate) : "—"}</span></div>
               </div>
-              <div className="p-3 bg-teal-50 rounded-lg border border-teal-200">
-                <div className="text-xs font-semibold text-teal-800 uppercase mb-2">OD Breakdown</div>
-                <div className="grid grid-cols-2 gap-3">
-                  <div><span className="text-gray-500">Principal Outstanding:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.principalOutstanding)}</div></div>
-                  <div><span className="text-gray-500">Interest Outstanding:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.interestOutstanding)}</div></div>
-                  <div><span className="text-gray-500">Principal Overdue:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.principalOverdue)}</div></div>
-                  <div><span className="text-gray-500">Interest Overdue:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.interestOverdue)}</div></div>
-                  <div><span className="text-gray-500">Current OD:</span><div className="font-bold text-red-700">{formatINR(selectedLoan.currentOD)}</div></div>
-                  <div><span className="text-gray-500">Accrued Interest:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.accruedInterest)}</div></div>
+              {selectedLoan.isClosed ? (
+                <div className="p-3 bg-gray-100 rounded-lg border border-gray-300">
+                  <div className="text-xs font-semibold text-gray-700 uppercase mb-2">Closure Details</div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div><span className="text-gray-500">Closed Date:</span><div className="font-bold text-gray-900">{selectedLoan.closedDate || "—"}</div></div>
+                    <div><span className="text-gray-500">Closure Type:</span><div className="font-bold text-gray-900">{selectedLoan.closureType || "—"}</div></div>
+                    <div><span className="text-gray-500">Closure Reason:</span><div className="font-bold text-gray-900">{selectedLoan.closureReason || "—"}</div></div>
+                    <div><span className="text-gray-500">Maturity Date:</span><div className="font-bold text-gray-900">{selectedLoan.maturityDate || "—"}</div></div>
+                    <div><span className="text-gray-500">Closing Principal:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.closingPrincipal)}</div></div>
+                    <div><span className="text-gray-500">Interest Collected:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.interestCollected)}</div></div>
+                    <div><span className="text-gray-500">Total Int. Collected:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.totalInterestCollected)}</div></div>
+                    <div><span className="text-gray-500">Penalty Collected:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.penaltyCollected)}</div></div>
+                  </div>
                 </div>
-                <div className="mt-3 p-2 bg-white rounded border border-teal-300">
-                  <span className="text-xs text-gray-600">Foreclosure Value:</span>
-                  <div className="text-xl font-bold text-teal-700">{formatINR(selectedLoan.foreclosureValue)}</div>
+              ) : (
+                <div className="p-3 bg-teal-50 rounded-lg border border-teal-200">
+                  <div className="text-xs font-semibold text-teal-800 uppercase mb-2">OD Breakdown</div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div><span className="text-gray-500">Principal Outstanding:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.principalOutstanding)}</div></div>
+                    <div><span className="text-gray-500">Interest Outstanding:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.interestOutstanding)}</div></div>
+                    <div><span className="text-gray-500">Principal Overdue:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.principalOverdue)}</div></div>
+                    <div><span className="text-gray-500">Interest Overdue:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.interestOverdue)}</div></div>
+                    <div><span className="text-gray-500">Current OD:</span><div className="font-bold text-red-700">{formatINR(selectedLoan.currentOD)}</div></div>
+                    <div><span className="text-gray-500">Accrued Interest:</span><div className="font-bold text-gray-900">{formatINR(selectedLoan.accruedInterest)}</div></div>
+                  </div>
+                  <div className="mt-3 p-2 bg-white rounded border border-teal-300">
+                    <span className="text-xs text-gray-600">Foreclosure Value:</span>
+                    <div className="text-xl font-bold text-teal-700">{formatINR(selectedLoan.foreclosureValue)}</div>
+                  </div>
                 </div>
-              </div>
+              )}
               <div className="grid grid-cols-3 gap-2 text-xs">
                 <div className="p-2 bg-gray-50 rounded">
                   <span className="text-gray-500">DPD:</span>
-                  <div className="font-bold">{Math.max(Number(selectedLoan.customerDPD) || 0, Number(selectedLoan.overdueDays) || 0)} days</div>
+                  <div className="font-bold">{selectedLoan.isClosed ? "—" : `${Math.max(Number(selectedLoan.customerDPD) || 0, Number(selectedLoan.overdueDays) || 0)} days`}</div>
                 </div>
                 <div className="p-2 bg-gray-50 rounded">
                   <span className="text-gray-500">Status:</span>
-                  <div className="font-bold">{selectedLoan.loanStatus || "Active"}</div>
+                  <div className={`font-bold ${selectedLoan.isClosed ? "text-gray-700" : ""}`}>{selectedLoan.isClosed ? "Closed" : (selectedLoan.loanStatus || "Active")}</div>
                 </div>
                 <div className="p-2 bg-gray-50 rounded">
                   <span className="text-gray-500">DPD Class:</span>
-                  <div className="font-bold">{selectedLoan.dpdClassification || "—"}</div>
+                  <div className="font-bold">{selectedLoan.isClosed ? "—" : (selectedLoan.dpdClassification || "—")}</div>
                 </div>
               </div>
             </div>
@@ -427,6 +497,12 @@ const REPORT_KINDS = [
     title: "Client-Wise Collection Report",
     hint: "Pipe-delimited. Per-account demand vs collected. Period dates are auto-detected from the file's PRINCIPAL OUTSTANDING (DD-MM-YYYY) columns on file selection.",
     accent: "amber", needsSnapshot: false, needsPeriod: true,
+  },
+  {
+    key: "foreclosure", slug: "foreclosure",
+    title: "Foreclosure Report",
+    hint: "Pipe-delimited. Closed / foreclosed / matured loan accounts. Feeds the customer master so closed-loan customers appear in Group OD Entry autofill alongside active customers.",
+    accent: "violet", needsSnapshot: true,
   },
 ];
 
@@ -644,6 +720,7 @@ export function DataUploadPage({ user, canUpload }) {
     red:     { icon: "text-red-600", ring: "focus:ring-red-500", fileBg: "file:bg-red-50 file:text-red-700", btn: "bg-red-600 hover:bg-red-700" },
     emerald: { icon: "text-emerald-600", ring: "focus:ring-emerald-500", fileBg: "file:bg-emerald-50 file:text-emerald-700", btn: "bg-emerald-600 hover:bg-emerald-700" },
     amber:   { icon: "text-amber-600", ring: "focus:ring-amber-500", fileBg: "file:bg-amber-50 file:text-amber-700", btn: "bg-amber-600 hover:bg-amber-700" },
+    violet:  { icon: "text-violet-600", ring: "focus:ring-violet-500", fileBg: "file:bg-violet-50 file:text-violet-700", btn: "bg-violet-600 hover:bg-violet-700" },
   }[accent] || { icon: "text-gray-600", ring: "focus:ring-gray-500", fileBg: "file:bg-gray-50 file:text-gray-700", btn: "bg-gray-600 hover:bg-gray-700" });
 
   const totalCollectionsRupees = history.totalCollections?.total || 0;
@@ -653,7 +730,7 @@ export function DataUploadPage({ user, canUpload }) {
       <div className="mb-6">
         <h2 className="text-2xl font-bold text-gray-900">OD Data Upload</h2>
         <p className="text-sm text-gray-500 mt-1">
-          Upload any of the five Finflux extracts. Snapshot-based reports are de-duplicated per date; the Collection ledger is idempotent per receipt. Retention: {history.retentionDays || 90} days.
+          Upload any of the six Finflux extracts. Snapshot-based reports are de-duplicated per date; the Collection ledger is idempotent per receipt. Retention: {history.retentionDays || 90} days.
         </p>
       </div>
 
@@ -894,10 +971,22 @@ export function CollectionDashboard({ user, entries, branches }) {
   const [ptpConv, setPtpConv] = useState(null);         // {totalPTPs, paid, pending, missed, conversionPct}
   const [loading, setLoading] = useState(false);
 
+  // Common query-string builder for all OD Insights metric endpoints.
+  // Forwards the user's date range (from/to) AND a `date` cursor (= toDate)
+  // so snapshot-based endpoints (DPD buckets, OD trend, non-contactable,
+  // foreclosure-opportunity) honor the selection too. Each endpoint reads
+  // only the params it needs and ignores the rest.
   const q = (params = {}) => {
     const p = new URLSearchParams();
     if (branchFilter) p.set("branch", branchFilter);
     if (category) p.set("category", category);
+    if (fromDate) p.set("from", fromDate);
+    if (toDate) {
+      p.set("to", toDate);
+      // `date` is the snapshot cursor for current-state metrics —
+      // pick the snapshot taken on or before the user's "To" date.
+      p.set("date", toDate);
+    }
     for (const [k, v] of Object.entries(params)) if (v != null && v !== "") p.set(k, v);
     return p.toString();
   };
@@ -1449,8 +1538,9 @@ export function CollectionDashboard({ user, entries, branches }) {
       {tab === "daily"      && <DailyCollectionsView category={category} branches={branches} openDrill={openDrill} />}
       {tab === "risk"       && <RiskTriageView category={category} openDrill={openDrill} />}
 
-      {/* Shared drilldown drawer */}
-      <DrilldownDrawer slice={drill} onClose={closeDrill} />
+      {/* Shared drilldown drawer — pass the outer Group/Individual category so
+          the drilldown query is scoped to the same loan category as the parent. */}
+      <DrilldownDrawer slice={drill} category={category} onClose={closeDrill} />
     </div>
   );
 }
@@ -1491,7 +1581,7 @@ function KpiCard({ icon, label, value, sub, color, onClick }) {
 // and loads a unified summary + customer list + receipts + trend via
 // /api/od/drilldown. Safe to render at any time — when `slice` is null it
 // renders nothing.
-function DrilldownDrawer({ slice, onClose }) {
+function DrilldownDrawer({ slice, category, onClose }) {
   const [loading, setLoading] = useState(false);
   const [data, setData] = useState(null);
   const [tab, setTab] = useState("customers");
@@ -1499,7 +1589,9 @@ function DrilldownDrawer({ slice, onClose }) {
   const [sortKey, setSortKey] = useState("total_overdue");
   const [sortDir, setSortDir] = useState("desc");
 
-  // Fetch whenever slice changes
+  // Fetch whenever slice OR category changes. Category is the outer
+  // Group-vs-Individual filter from OD Insights; without it, the drill-down
+  // would return rows from both categories regardless of which tab is selected.
   useEffect(() => {
     if (!slice) return;
     setLoading(true); setData(null); setQuery(""); setTab("customers");
@@ -1510,12 +1602,14 @@ function DrilldownDrawer({ slice, onClose }) {
     for (const k of ["npaOnly", "deathOnly", "nonContact"]) {
       if (slice[k]) p.set(k, "1");
     }
+    // Outer category filter — sourced from the parent, not the slice.
+    if (category) p.set("category", category);
     fetch(`${API_BASE}/od/drilldown?${p.toString()}`)
       .then(r => r.json())
       .then(j => setData(j))
       .catch(() => setData(null))
       .finally(() => setLoading(false));
-  }, [slice]);
+  }, [slice, category]);
 
   // Escape to close
   useEffect(() => {
@@ -1548,6 +1642,11 @@ function DrilldownDrawer({ slice, onClose }) {
   const summary = data?.summary || {};
   const trend = data?.trend || [];
   const receipts = data?.receipts || [];
+
+  // Pagination — separate state for customer list and receipts list, default
+  // 10 rows; the user can switch to 25/50/100 via the bar.
+  const customersPg = usePagination(filtered, 10);
+  const receiptsPg = usePagination(receipts, 10);
 
   const sortBtn = (key, label) => (
     <button
@@ -1663,7 +1762,7 @@ function DrilldownDrawer({ slice, onClose }) {
                 <tbody>
                   {filtered.length === 0 ? (
                     <tr><td colSpan={8} className="py-6 text-center text-gray-400">No customers for this slice.</td></tr>
-                  ) : filtered.map((c, i) => (
+                  ) : customersPg.pageRows.map((c, i) => (
                     <tr key={c.loan_account_no + "-" + i} className="border-b hover:bg-gray-50">
                       <td className="py-1.5 pr-2">
                         <div className="font-medium text-gray-800">{c.customer_name || "—"}</div>
@@ -1689,6 +1788,7 @@ function DrilldownDrawer({ slice, onClose }) {
                   ))}
                 </tbody>
               </table>
+              <PaginationBar {...customersPg} label="customers" />
             </div>
           )}
 
@@ -2366,6 +2466,13 @@ function OfficerScorecardView({ category, openDrill }) {
   const [sortKey, setSortKey] = useState("demand");
   const [sortDir, setSortDir] = useState("desc");
   const [query, setQuery] = useState("");
+  // Multi-select branch filter — empty array = all branches (no filter).
+  // Stored as an array so the user can pick any combination of branches
+  // they're responsible for monitoring.
+  const [branchSel, setBranchSel] = useState([]);
+  const toggleBranch = (b) => setBranchSel(prev =>
+    prev.includes(b) ? prev.filter(x => x !== b) : [...prev, b]
+  );
 
   useEffect(() => {
     if (latest && !period.start) setPeriod({ start: latest.period_start, end: latest.period_end });
@@ -2383,13 +2490,50 @@ function OfficerScorecardView({ category, openDrill }) {
 
   useEffect(() => { load(); }, [load]);
 
+  // Distinct branch list for the dropdown — derived from currently loaded
+  // officer rows. Sorted alphabetically. Reactive: changes when category /
+  // period change (the rows themselves change).
+  const branchList = useMemo(() => {
+    const set = new Set();
+    for (const r of rows) {
+      const b = (r.branch_name || "").trim();
+      if (b) set.add(b);
+    }
+    return [...set].sort((a, b) => a.localeCompare(b));
+  }, [rows]);
+
+  // Officer dropdown — list of officers across the selected branches.
+  // If branchSel is empty, ALL officers are shown.
+  const branchSet = useMemo(() => new Set(branchSel), [branchSel]);
+  const officerList = useMemo(() => {
+    const seen = new Set();
+    const out = [];
+    for (const r of rows) {
+      if (branchSet.size > 0 && !branchSet.has(r.branch_name || "")) continue;
+      const code = (r.officer_code || "").trim();
+      const name = (r.officer_name || "").trim() || code || "—";
+      const key = code || name;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ code, name, label: code ? `${name} · ${code}` : name });
+    }
+    return out.sort((a, b) => a.name.localeCompare(b.name));
+  }, [rows, branchSet]);
+
+  // Reset officer selection when the chosen officer is no longer in the new
+  // branch's roster (e.g. user changes the branch selection).
+  useEffect(() => {
+    if (!query) return;
+    const stillValid = officerList.some(o => o.code === query || o.name === query);
+    if (!stillValid) setQuery("");
+  }, [officerList, query]);
+
   const filtered = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    let r = q ? rows.filter(o =>
-      (o.officer_name || "").toLowerCase().includes(q) ||
-      (o.officer_code || "").toLowerCase().includes(q) ||
-      (o.branch_name || "").toLowerCase().includes(q)
-    ) : [...rows];
+    let r = [...rows];
+    if (branchSet.size > 0) r = r.filter(o => branchSet.has(o.branch_name || ""));
+    if (query) {
+      r = r.filter(o => (o.officer_code || "") === query || (o.officer_name || "") === query);
+    }
     r.sort((a, b) => {
       const av = a[sortKey], bv = b[sortKey];
       const an = Number(av), bn = Number(bv);
@@ -2398,7 +2542,38 @@ function OfficerScorecardView({ category, openDrill }) {
       return sortDir === "asc" ? cmp : -cmp;
     });
     return r;
-  }, [rows, query, sortKey, sortDir]);
+  }, [rows, query, branchSet, sortKey, sortDir]);
+
+  // Paginate the filtered+sorted officer list. Default 10/page; user can
+  // switch to 25/50/100. Resets to page 1 when filter/search shrinks.
+  const pg = usePagination(filtered, 10);
+
+  // Chart data — top-N officers by demand for the bar chart, top-N by
+  // collected for the doughnut. Computed once per filtered list change.
+  const barData = useMemo(
+    () => filtered
+      .slice(0, 12)
+      .map(o => ({
+        name: (o.officer_name || o.officer_code || "—").slice(0, 14),
+        demand: Math.round((o.demand || 0) / 100000 * 100) / 100,         // in lakhs for chart axis
+        collected: Math.round((o.collected || 0) / 100000 * 100) / 100,
+        ce: o.cePct == null ? 0 : Math.round(o.cePct * 10) / 10,
+      })),
+    [filtered]
+  );
+  const pieData = useMemo(() => {
+    const top = filtered.slice(0, 8);
+    const totalAll = filtered.reduce((s, o) => s + (o.collected || 0), 0);
+    const topSum = top.reduce((s, o) => s + (o.collected || 0), 0);
+    const slices = top.map(o => ({
+      name: o.officer_name || o.officer_code || "—",
+      value: o.collected || 0,
+    }));
+    if (totalAll - topSum > 0 && filtered.length > 8) {
+      slices.push({ name: `Other (${filtered.length - 8})`, value: totalAll - topSum });
+    }
+    return slices;
+  }, [filtered]);
 
   const totals = useMemo(() => rows.reduce((a, r) => ({
     demand:         a.demand         + (r.demand || 0),
@@ -2441,11 +2616,57 @@ function OfficerScorecardView({ category, openDrill }) {
             ))}
           </select>
         </div>
-        <div className="md:col-span-2">
-          <label className="block text-xs text-gray-500 mb-1">Search officer / branch</label>
-          <input type="text" value={query} onChange={e => setQuery(e.target.value)}
-            placeholder="Name, code, or branch…"
-            className="w-full px-2.5 py-2 border rounded-lg text-sm" />
+        <div>
+          <label className="block text-xs text-gray-500 mb-1 flex items-center gap-1"><Building2 size={11} /> Branch</label>
+          {/* Checkbox dropdown — pick any number of branches. Uses native
+              <details>/<summary> so it auto-handles open/close without extra
+              state. Empty selection = all branches. */}
+          <details className="relative w-full">
+            <summary className="list-none w-full px-2.5 py-2 border rounded-lg text-sm bg-white cursor-pointer flex items-center justify-between hover:border-teal-400">
+              <span className="truncate">
+                {branchSel.length === 0
+                  ? "All branches"
+                  : branchSel.length === 1
+                    ? branchSel[0]
+                    : `${branchSel.length} branches selected`}
+              </span>
+              <ChevronRight size={12} className="text-gray-400 rotate-90" />
+            </summary>
+            <div className="absolute z-20 mt-1 w-full max-h-72 overflow-y-auto bg-white border rounded-lg shadow-lg p-2">
+              <div className="flex justify-between items-center pb-1.5 mb-1.5 border-b">
+                <button type="button" onClick={() => setBranchSel(branchList)}
+                  className="text-[11px] text-teal-700 hover:underline">Select all</button>
+                <button type="button" onClick={() => setBranchSel([])}
+                  className="text-[11px] text-gray-500 hover:underline">Clear</button>
+              </div>
+              {branchList.length === 0 ? (
+                <div className="text-xs text-gray-400 px-1 py-2">No branches in current period.</div>
+              ) : branchList.map(b => (
+                <label key={b} className="flex items-center gap-2 px-1.5 py-1 hover:bg-teal-50 rounded cursor-pointer text-sm">
+                  <input type="checkbox" checked={branchSel.includes(b)}
+                    onChange={() => toggleBranch(b)}
+                    className="accent-teal-600" />
+                  <span className="flex-1 truncate">{b}</span>
+                </label>
+              ))}
+            </div>
+          </details>
+        </div>
+        <div>
+          <label className="block text-xs text-gray-500 mb-1 flex items-center gap-1"><Users size={11} /> Officer</label>
+          <select value={query} onChange={e => setQuery(e.target.value)}
+            className="w-full px-2.5 py-2 border rounded-lg text-sm bg-white">
+            <option value="">
+              {branchSel.length === 0
+                ? "All officers"
+                : branchSel.length === 1
+                  ? `All officers in ${branchSel[0]}`
+                  : `All officers in ${branchSel.length} branches`}
+            </option>
+            {officerList.map(o => (
+              <option key={o.code || o.name} value={o.code || o.name}>{o.label}</option>
+            ))}
+          </select>
         </div>
         <button onClick={() => downloadCSV(filtered, `officer-scorecard-${period.end}.csv`)}
           className="w-full py-2 bg-white border text-gray-700 rounded-lg text-sm font-medium hover:bg-gray-50 flex items-center justify-center gap-1">
@@ -2489,14 +2710,55 @@ function OfficerScorecardView({ category, openDrill }) {
           })} />
       </div>
 
+      {/* Visual analytics — Bar (demand vs collected) + Doughnut (contribution).
+          Both react to filters / search via the same `filtered` source. */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div className="bg-white rounded-xl border p-4">
+          <h3 className="font-semibold text-gray-800 mb-1">Demand vs Collection (top 12 officers)</h3>
+          <p className="text-[11px] text-gray-500 mb-3">Amounts in ₹ Lakhs · matches current search/filter</p>
+          {barData.length === 0 ? (
+            <div className="text-gray-400 text-sm py-12 text-center">No officer data for this period.</div>
+          ) : (
+            <ResponsiveContainer width="100%" height={280}>
+              <BarChart data={barData}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="name" fontSize={10} interval={0} angle={-30} textAnchor="end" height={70} />
+                <YAxis fontSize={11} />
+                <Tooltip formatter={(v, n) => [`₹${(Number(v) || 0).toFixed(2)} L`, n]} />
+                <Legend wrapperStyle={{ fontSize: 12 }} />
+                <Bar dataKey="demand" fill="#6366f1" name="Demand" />
+                <Bar dataKey="collected" fill="#0d9488" name="Collected" />
+              </BarChart>
+            </ResponsiveContainer>
+          )}
+        </div>
+        <div className="bg-white rounded-xl border p-4">
+          <h3 className="font-semibold text-gray-800 mb-1">Collection Contribution Share</h3>
+          <p className="text-[11px] text-gray-500 mb-3">Share of total period collection by officer (top 8 + Other)</p>
+          {pieData.length === 0 ? (
+            <div className="text-gray-400 text-sm py-12 text-center">No collections in this period.</div>
+          ) : (
+            <ResponsiveContainer width="100%" height={280}>
+              <PieChart>
+                <Pie data={pieData} cx="50%" cy="50%" innerRadius={50} outerRadius={100}
+                  dataKey="value" label={(e) => e.name?.slice(0, 12)}>
+                  {pieData.map((p, i) => <Cell key={p.name} fill={COLORS[i % COLORS.length]} />)}
+                </Pie>
+                <Tooltip formatter={(v) => formatLakhs(v)} />
+              </PieChart>
+            </ResponsiveContainer>
+          )}
+        </div>
+      </div>
+
       <div className="bg-white rounded-xl border">
         <div className="px-5 py-3 border-b flex items-center justify-between">
           <h3 className="font-semibold text-gray-800">Officer Scorecard</h3>
           <span className="text-xs text-gray-500">{loading ? "Loading…" : `${filtered.length} officers`}</span>
         </div>
-        <div className="overflow-x-auto max-h-[560px] overflow-y-auto">
+        <div className="overflow-x-auto">
           <table className="w-full text-xs">
-            <thead className="sticky top-0 bg-gray-50 text-gray-600 uppercase text-[10px] z-10">
+            <thead className="bg-gray-50 text-gray-600 uppercase text-[10px]">
               <tr>
                 <th className="text-left px-3 py-2">{sortBtn("officer_name", "Officer")}</th>
                 <th className="text-left px-3 py-2">{sortBtn("branch_name", "Branch")}</th>
@@ -2516,7 +2778,7 @@ function OfficerScorecardView({ category, openDrill }) {
             <tbody>
               {filtered.length === 0 ? (
                 <tr><td colSpan={13} className="text-center text-gray-400 py-6">No officer data.</td></tr>
-              ) : filtered.map((o, i) => (
+              ) : pg.pageRows.map((o, i) => (
                 <tr key={`${o.officer_code}-${i}`}
                     onClick={() => openDrill && openDrill({
                       branch: o.branch_name || undefined,
@@ -2548,6 +2810,9 @@ function OfficerScorecardView({ category, openDrill }) {
               ))}
             </tbody>
           </table>
+        </div>
+        <div className="px-5 py-2 border-t">
+          <PaginationBar {...pg} label="officers" />
         </div>
         <div className="px-5 py-2 border-t bg-gray-50 text-[11px] text-gray-500">
           Tip: officers with <b>&gt;70% cash</b> are flagged red — consider UPI-first targets to cut cash handling risk.
@@ -2811,6 +3076,9 @@ function RiskTriageView({ category, openDrill }) {
   const [deaths, setDeaths] = useState(null);
   const [inst, setInst] = useState(null);
   const [loading, setLoading] = useState(false);
+  // Pagination — separate hooks per table so each can be navigated independently.
+  const deathsPg = usePagination(deaths?.rows || [], 10);
+  const ageingPg = usePagination(ageing?.top || [], 10);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -2990,7 +3258,7 @@ function RiskTriageView({ category, openDrill }) {
               <tbody>
                 {(ageing?.top || []).length === 0 ? (
                   <tr><td colSpan={5} className="py-4 text-center text-gray-400">None.</td></tr>
-                ) : ageing.top.map((r, i) => (
+                ) : ageingPg.pageRows.map((r, i) => (
                   <tr key={i} className="border-b hover:bg-red-50/50 cursor-pointer"
                       onClick={() => openDrill && openDrill({
                         branch: r.branch_name,
@@ -3014,6 +3282,7 @@ function RiskTriageView({ category, openDrill }) {
                 ))}
               </tbody>
             </table>
+            <PaginationBar {...ageingPg} label="customers" />
           </div>
         </div>
 
@@ -3040,7 +3309,7 @@ function RiskTriageView({ category, openDrill }) {
               <tbody>
                 {(deaths?.rows || []).length === 0 ? (
                   <tr><td colSpan={5} className="py-4 text-center text-gray-400">None.</td></tr>
-                ) : deaths.rows.map((r, i) => (
+                ) : deathsPg.pageRows.map((r, i) => (
                   <tr key={i} className="border-b hover:bg-indigo-50/50 cursor-pointer"
                       onClick={() => openDrill && openDrill({
                         branch: r.branch_name,
@@ -3060,6 +3329,7 @@ function RiskTriageView({ category, openDrill }) {
                 ))}
               </tbody>
             </table>
+            <PaginationBar {...deathsPg} label="death cases" />
           </div>
         </div>
       </div>
@@ -3106,6 +3376,8 @@ function BranchPerformanceView({ category, openDrill }) {
     });
     return arr;
   }, [rows, query, sortKey, sortDir]);
+
+  const branchPg = usePagination(filtered, 10);
 
   const totals = useMemo(() => rows.reduce((a, r) => ({
     accounts: a.accounts + (r.accounts || 0),
@@ -3268,7 +3540,7 @@ function BranchPerformanceView({ category, openDrill }) {
             <tbody>
               {filtered.length === 0 ? (
                 <tr><td colSpan={12} className="text-center text-gray-400 py-6">No branch data. Upload a Client-Wise Collection Report to populate.</td></tr>
-              ) : filtered.map((r, i) => {
+              ) : branchPg.pageRows.map((r, i) => {
                 const od = (r.principal_overdue || 0) + (r.interest_overdue || 0);
                 return (
                   <tr key={r.branch + "-" + i}
@@ -3313,6 +3585,9 @@ function BranchPerformanceView({ category, openDrill }) {
               </tfoot>
             )}
           </table>
+        </div>
+        <div className="px-5 py-2 border-t">
+          <PaginationBar {...branchPg} label="branches" />
         </div>
       </div>
     </div>

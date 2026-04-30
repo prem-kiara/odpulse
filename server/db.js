@@ -94,6 +94,46 @@ CREATE TABLE IF NOT EXISTS accrued_snapshots (
 CREATE INDEX IF NOT EXISTS idx_accrued_snap_loan ON accrued_snapshots(loan_account_no);
 CREATE INDEX IF NOT EXISTS idx_accrued_snap_date ON accrued_snapshots(snapshot_date);
 
+-- ─── Foreclosure / closed-loan report ─────────────────────────────────────
+-- Per-snapshot view of CLOSED accounts (foreclosed, pre-closed, matured, etc.).
+-- Pool Report only carries active loans, so closed customers don't show up in
+-- the Group OD Entry autofill. Ingesting the Foreclosure Report into both this
+-- table AND the customers master makes closed-loan customers seamlessly
+-- discoverable via the existing /api/customers/lookup endpoint.
+CREATE TABLE IF NOT EXISTS foreclosure_snapshots (
+  snapshot_date TEXT NOT NULL,
+  loan_account_no TEXT NOT NULL,
+  branch_name TEXT,
+  branch_code TEXT,
+  center TEXT,
+  customer_number TEXT,
+  customer_name TEXT,
+  product_name TEXT,
+  loan_amount REAL,
+  cycle_number INTEGER,
+  disbursement_date TEXT,
+  maturity_date TEXT,
+  closed_date TEXT,
+  closure_reason TEXT,
+  closure_type TEXT,
+  interest_collected REAL,
+  total_interest_collected REAL,
+  closing_principal REAL,
+  penalty_collected REAL,
+  funder TEXT,
+  funding_source TEXT,
+  user_name TEXT,
+  employee_name TEXT,
+  employee_number TEXT,
+  remarks TEXT,
+  PRIMARY KEY (snapshot_date, loan_account_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_fc_loan ON foreclosure_snapshots(loan_account_no);
+CREATE INDEX IF NOT EXISTS idx_fc_date ON foreclosure_snapshots(snapshot_date);
+CREATE INDEX IF NOT EXISTS idx_fc_branch ON foreclosure_snapshots(branch_name);
+CREATE INDEX IF NOT EXISTS idx_fc_customer ON foreclosure_snapshots(customer_number);
+
 CREATE TABLE IF NOT EXISTS upload_log (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   kind TEXT NOT NULL,
@@ -409,5 +449,34 @@ function safeAddColumn(table, column, type) {
 safeAddColumn("customers", "loan_category", "TEXT");
 // Index for fast Group/Individual filtering in OD Insights.
 try { db.exec(`CREATE INDEX IF NOT EXISTS idx_customers_loan_category ON customers(loan_category)`); } catch {}
+
+// ─── Idempotent backfill: classify NULL/empty loan_category rows ───────────
+// Customers ingested before the loan_category column existed (legacy rows)
+// or via the Foreclosure Report (which doesn't carry a category column) end
+// up with NULL. Mirror the runtime fallback in _customerSubqueryForCategory():
+//   center_name OR group_name present  →  'Group Loan'
+//   neither present                    →  'Individual Loan'
+// Idempotent: after first run, the WHERE clauses match nothing.
+try {
+  const r1 = db.prepare(
+    `UPDATE customers SET loan_category = 'Group Loan'
+     WHERE (loan_category IS NULL OR loan_category = '')
+       AND (
+         (group_name IS NOT NULL AND group_name <> '')
+         OR (center_name IS NOT NULL AND center_name <> '')
+       )`
+  ).run();
+  const r2 = db.prepare(
+    `UPDATE customers SET loan_category = 'Individual Loan'
+     WHERE loan_category IS NULL OR loan_category = ''`
+  ).run();
+  if (r1.changes || r2.changes) {
+    console.log(
+      `[db] loan_category backfill: ${r1.changes} → Group Loan, ${r2.changes} → Individual Loan`
+    );
+  }
+} catch (err) {
+  console.warn("[db] loan_category backfill skipped:", err.message);
+}
 
 module.exports = db;
