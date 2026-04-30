@@ -199,7 +199,9 @@ function getCustomerBase() {
 }
 
 app.get("/api/customers/lookup", (req, res) => {
-  const { phone, aadhaar } = req.query;
+  // Supported lookup keys: phone, aadhaar (numeric/exact) and
+  // customerId, loanAccountNo, name (text/partial). Any ONE should be provided.
+  const { phone, aadhaar, customerId, loanAccountNo, name } = req.query;
   const base = getCustomerBase();
   let customers = [];
   let key = "";
@@ -211,39 +213,60 @@ app.get("/api/customers/lookup", (req, res) => {
     customers = (base.byAadhaar[key] || []).slice();
   }
 
-  // Also query the OD SQLite customers table — so customers ingested via the
-  // Pool Report are reachable by phone/Aadhaar even if they aren't in the
-  // legacy customer-base.json file.
-  if (key) {
-    try {
-      let rows = [];
-      if (phone) {
-        // mobile_number in OD data may be stored with or without country code / dashes.
+  // Also query the OD SQLite customers table. Supports all 5 lookup keys so
+  // customers ingested via the OD Upload are reachable by any identifier,
+  // even if they aren't in the legacy customer-base.json file.
+  try {
+    const cols = "loan_account_no, customer_number, customer_name, mobile_number, aadhaar_number, branch";
+    let rows = [];
+    if (phone && key) {
+      // mobile_number in OD data may be stored with or without country code / dashes.
+      rows = db.prepare(
+        `SELECT ${cols} FROM customers WHERE REPLACE(REPLACE(REPLACE(mobile_number,' ',''),'-',''),'+','') LIKE ?`
+      ).all("%" + key + "%");
+    } else if (aadhaar && key) {
+      rows = db.prepare(
+        `SELECT ${cols} FROM customers WHERE REPLACE(REPLACE(aadhaar_number,' ',''),'-','') = ?`
+      ).all(key);
+    } else if (customerId) {
+      const k = String(customerId).trim();
+      if (k.length >= 3) {
         rows = db.prepare(
-          "SELECT loan_account_no, customer_number, customer_name, mobile_number, aadhaar_number FROM customers WHERE REPLACE(REPLACE(REPLACE(mobile_number,' ',''),'-',''),'+','') LIKE ?"
-        ).all("%" + key + "%");
-      } else if (aadhaar) {
+          `SELECT ${cols} FROM customers WHERE customer_number LIKE ? LIMIT 20`
+        ).all(k + "%");
+      }
+    } else if (loanAccountNo) {
+      const k = String(loanAccountNo).trim();
+      if (k.length >= 3) {
         rows = db.prepare(
-          "SELECT loan_account_no, customer_number, customer_name, mobile_number, aadhaar_number FROM customers WHERE REPLACE(REPLACE(aadhaar_number,' ',''),'-','') = ?"
-        ).all(key);
+          `SELECT ${cols} FROM customers WHERE loan_account_no LIKE ? LIMIT 20`
+        ).all(k + "%");
       }
-      // Dedupe against existing customers by loanAccountNo (or customerId fallback).
-      const seen = new Set(customers.map(c => (c.loanAccountNo || c.customerId || "").toString()));
-      for (const r of rows) {
-        const k = (r.loan_account_no || r.customer_number || "").toString();
-        if (seen.has(k)) continue;
-        seen.add(k);
-        customers.push({
-          name: r.customer_name || "",
-          customerId: r.customer_number || "",
-          loanAccountNo: r.loan_account_no || "",
-          aadhaar: r.aadhaar_number || "",
-          phone: r.mobile_number || "",
-        });
+    } else if (name) {
+      const k = String(name).trim();
+      if (k.length >= 3) {
+        rows = db.prepare(
+          `SELECT ${cols} FROM customers WHERE customer_name LIKE ? LIMIT 20`
+        ).all("%" + k + "%");
       }
-    } catch (e) {
-      console.error("[customers/lookup] OD fallback failed:", e.message);
     }
+    // Dedupe against existing customers by loanAccountNo (or customerId fallback).
+    const seen = new Set(customers.map(c => (c.loanAccountNo || c.customerId || "").toString()));
+    for (const r of rows) {
+      const k = (r.loan_account_no || r.customer_number || "").toString();
+      if (seen.has(k)) continue;
+      seen.add(k);
+      customers.push({
+        name: r.customer_name || "",
+        customerId: r.customer_number || "",
+        loanAccountNo: r.loan_account_no || "",
+        aadhaar: r.aadhaar_number || "",
+        phone: r.mobile_number || "",
+        branch: r.branch || "",
+      });
+    }
+  } catch (e) {
+    console.error("[customers/lookup] SQLite lookup failed:", e.message);
   }
 
   res.json({ found: customers.length > 0, customers });
@@ -628,12 +651,89 @@ app.get("/api/od/customers/search", (req, res) => {
   res.json({ results: db.prepare(sql).all(...params) });
 });
 
+// ───────────────────────────────────────────────────────────────────────────
+// Category filter — Group vs Individual split, sourced exclusively from the
+// Pool Report's "Category of Loan" column (ingested into customers.loan_category
+// by server/ingest.js). Values are 'Group Loan' / 'Individual Loan' in-file;
+// matching is case-insensitive on the substring 'GROUP' / 'INDIVIDUAL' so it
+// tolerates trailing spaces and minor header variations.
+//
+//   Group      = customers.loan_category contains 'GROUP'
+//   Individual = customers.loan_category contains 'INDIVIDUAL'
+//
+// Loans where loan_category is NULL/blank (not yet re-uploaded after the schema
+// migration) are NOT classified — they appear under neither tab until a Pool
+// Report that includes the "Category of Loan" column is re-uploaded.
+//
+// Returns a SQL fragment like " AND <loanCol> IN (...)" — or "" when category
+// is falsy/invalid so existing queries stay unfiltered (default behaviour).
+// ───────────────────────────────────────────────────────────────────────────
+
+// SQL subquery that selects loan_account_no from customers matching the category.
+// Primary classification is the Pool Report's "Category of Loan" column
+// (customers.loan_category). If that's NULL/blank for legacy rows ingested
+// before the column existed, fall back to the legacy group_name/center_name
+// heuristic so existing data still shows up on the correct tab.
+function _customerSubqueryForCategory(cat) {
+  if (cat === "group") {
+    return `SELECT loan_account_no FROM customers
+      WHERE UPPER(COALESCE(loan_category,'')) LIKE '%GROUP%'
+         OR (
+           (loan_category IS NULL OR loan_category = '')
+           AND (
+             (group_name IS NOT NULL AND group_name <> '')
+             OR (center_name IS NOT NULL AND center_name <> '')
+           )
+         )`;
+  }
+  return `SELECT loan_account_no FROM customers
+      WHERE UPPER(COALESCE(loan_category,'')) LIKE '%INDIVIDUAL%'
+         OR (
+           (loan_category IS NULL OR loan_category = '')
+           AND (group_name IS NULL OR group_name = '')
+           AND (center_name IS NULL OR center_name = '')
+         )`;
+}
+
+function categoryWhere(category, loanCol) {
+  if (!category) return "";
+  const cat = String(category).toLowerCase();
+  if (cat !== "group" && cat !== "individual") return "";
+  return ` AND ${loanCol} IN (${_customerSubqueryForCategory(cat)})`;
+}
+
+// JS-side predicate for filtering entries.json rows (which reference loanAccountNo).
+// Returns a function (loanAccountNo) => boolean. If category is falsy or invalid,
+// returns () => true (i.e. no filtering).
+//
+// A loan matches iff customers.loan_category (sourced from the Pool Report's
+// "Category of Loan" column) contains 'GROUP' / 'INDIVIDUAL' accordingly.
+function loanCategoryFilter(category) {
+  if (!category) return () => true;
+  const cat = String(category).toLowerCase();
+  if (cat !== "group" && cat !== "individual") return () => true;
+
+  const matchSet = new Set();
+  try {
+    const rows = db.prepare(_customerSubqueryForCategory(cat)).all();
+    for (const r of rows) {
+      const loan = String(r.loan_account_no || "").trim();
+      if (loan) matchSet.add(loan);
+    }
+  } catch (err) {
+    console.warn("[loanCategoryFilter] customers lookup failed:", err.message);
+  }
+
+  return (loan) => matchSet.has(String(loan || "").trim());
+}
+
 // GET /api/od/metrics/dpd-buckets?date=&branch=
 app.get("/api/od/metrics/dpd-buckets", (req, res) => {
   const date = req.query.date ||
     db.prepare(`SELECT MAX(snapshot_date) AS d FROM pool_snapshots`).get()?.d;
   if (!date) return res.json({ snapshotDate: null, buckets: [] });
   const branch = String(req.query.branch || "");
+  const category = String(req.query.category || "");
 
   let sql = `SELECT
       CASE
@@ -650,6 +750,7 @@ app.get("/api/od/metrics/dpd-buckets", (req, res) => {
     FROM pool_snapshots WHERE snapshot_date = ?`;
   const params = [date];
   if (branch) { sql += ` AND branch = ?`; params.push(branch); }
+  sql += categoryWhere(category, "loan_account_no");
   sql += ` GROUP BY bucket
            ORDER BY CASE bucket WHEN '0-Current' THEN 0 WHEN '1-30' THEN 1 WHEN '31-60' THEN 2
                                WHEN '61-90' THEN 3 WHEN '91-180' THEN 4 ELSE 5 END`;
@@ -661,6 +762,7 @@ app.get("/api/od/metrics/od-trend", (req, res) => {
   const from = String(req.query.from || "");
   const to = String(req.query.to || "");
   const branch = String(req.query.branch || "");
+  const category = String(req.query.category || "");
 
   let sql = `SELECT snapshot_date,
       SUM(COALESCE(principal_overdue,0))   AS principal_overdue,
@@ -672,6 +774,7 @@ app.get("/api/od/metrics/od-trend", (req, res) => {
   if (from) { sql += ` AND snapshot_date >= ?`; params.push(from); }
   if (to)   { sql += ` AND snapshot_date <= ?`; params.push(to); }
   if (branch) { sql += ` AND branch = ?`; params.push(branch); }
+  sql += categoryWhere(category, "loan_account_no");
   sql += ` GROUP BY snapshot_date ORDER BY snapshot_date`;
   res.json({ trend: db.prepare(sql).all(...params) });
 });
@@ -681,18 +784,23 @@ app.get("/api/od/metrics/branch-concentration", (req, res) => {
   const date = req.query.date ||
     db.prepare(`SELECT MAX(snapshot_date) AS d FROM pool_snapshots`).get()?.d;
   if (!date) return res.json({ snapshotDate: null, branches: [] });
-  const branches = db.prepare(`SELECT branch,
+  const category = String(req.query.category || "");
+  let sql = `SELECT branch,
       COUNT(*) AS accounts,
       SUM(COALESCE(principal_overdue,0) + COALESCE(interest_overdue,0)) AS overdue_amount,
       SUM(COALESCE(principal_outstanding,0)) AS principal_outstanding
-    FROM pool_snapshots WHERE snapshot_date = ?
-    GROUP BY branch ORDER BY overdue_amount DESC`).all(date);
+    FROM pool_snapshots WHERE snapshot_date = ?`;
+  const params = [date];
+  sql += categoryWhere(category, "loan_account_no");
+  sql += ` GROUP BY branch ORDER BY overdue_amount DESC`;
+  const branches = db.prepare(sql).all(...params);
   res.json({ snapshotDate: date, branches });
 });
 
 // GET /api/od/metrics/non-contactable?branch=
 app.get("/api/od/metrics/non-contactable", (req, res) => {
   const branch = String(req.query.branch || "");
+  const category = String(req.query.category || "");
   let sql = `SELECT c.loan_account_no, c.customer_name, c.branch, c.mobile_number, c.residence_phone,
                     p.overdue_days, (COALESCE(p.principal_overdue,0)+COALESCE(p.interest_overdue,0)) AS overdue_amount
              FROM customers c
@@ -703,6 +811,7 @@ app.get("/api/od/metrics/non-contactable", (req, res) => {
                AND p.overdue_days > 0`;
   const params = [];
   if (branch) { sql += ` AND c.branch = ?`; params.push(branch); }
+  sql += categoryWhere(category, "c.loan_account_no");
   sql += ` ORDER BY overdue_amount DESC LIMIT 500`;
   res.json({ customers: db.prepare(sql).all(...params) });
 });
@@ -711,6 +820,7 @@ app.get("/api/od/metrics/non-contactable", (req, res) => {
 app.get("/api/od/metrics/foreclosure-opportunity", (req, res) => {
   const threshold = Math.max(0, Math.min(2, parseFloat(req.query.threshold || "0.5")));
   const branch = String(req.query.branch || "");
+  const category = String(req.query.category || "");
   let sql = `WITH latest_pool AS (
       SELECT * FROM pool_snapshots p WHERE snapshot_date = (
         SELECT MAX(snapshot_date) FROM pool_snapshots WHERE loan_account_no = p.loan_account_no
@@ -734,6 +844,7 @@ app.get("/api/od/metrics/foreclosure-opportunity", (req, res) => {
       AND (COALESCE(p.principal_outstanding,0) + COALESCE(a.accrued_interest,0) + COALESCE(p.interest_overdue,0)) <= c.loan_amount * ?`;
   const params = [threshold];
   if (branch) { sql += ` AND c.branch = ?`; params.push(branch); }
+  sql += categoryWhere(category, "c.loan_account_no");
   sql += ` ORDER BY foreclosure_value ASC LIMIT 500`;
   res.json({ threshold, customers: db.prepare(sql).all(...params) });
 });
@@ -744,6 +855,8 @@ app.get("/api/od/metrics/efficiency", (req, res) => {
   const to = String(req.query.to || todayIso());
   const branch = String(req.query.branch || "");
   const gran = String(req.query.granularity || "day");
+  const category = String(req.query.category || "");
+  const catFilter = loanCategoryFilter(category);
 
   const entries = loadJSON("entries.json", []);
   const inRange = entries.filter(e => {
@@ -752,6 +865,7 @@ app.get("/api/od/metrics/efficiency", (req, res) => {
     if (from && d < from) return false;
     if (to && d > to) return false;
     if (branch && e.branch !== branch) return false;
+    if (!catFilter(e.loanAccountNo)) return false;
     return true;
   });
 
@@ -788,6 +902,7 @@ app.get("/api/od/metrics/efficiency", (req, res) => {
                     )`;
   const openingParams = [from || "1900-01-01"];
   if (branch) { openingSql += ` AND branch = ?`; openingParams.push(branch); }
+  openingSql += categoryWhere(category, "loan_account_no");
   const openingBook = db.prepare(openingSql).get(...openingParams)?.book || 0;
 
   const totalCollected = series.reduce((s, b) => s + b.collected, 0);
@@ -801,12 +916,15 @@ app.get("/api/od/metrics/officer-productivity", (req, res) => {
   const from = String(req.query.from || "");
   const to = String(req.query.to || "");
   const branch = String(req.query.branch || "");
+  const category = String(req.query.category || "");
+  const catFilter = loanCategoryFilter(category);
   const entries = loadJSON("entries.json", []);
   const filtered = entries.filter(e => {
     const d = e.date;
     if (from && d < from) return false;
     if (to && d > to) return false;
     if (branch && e.branch !== branch) return false;
+    if (!catFilter(e.loanAccountNo)) return false;
     return true;
   });
   const paidOf = (e) => Number(e.totalPaidAmount) || Number(e.groupOdPaidAmount) || Number(e.paidAmount) || 0;
@@ -833,11 +951,14 @@ app.get("/api/od/metrics/ptp-conversion", (req, res) => {
   const from = String(req.query.from || "");
   const to = String(req.query.to || "");
   const branch = String(req.query.branch || "");
+  const category = String(req.query.category || "");
+  const catFilter = loanCategoryFilter(category);
   const entries = loadJSON("entries.json", []).filter(e => e.ptpDate);
   const filtered = entries.filter(e => {
     if (from && e.ptpDate < from) return false;
     if (to && e.ptpDate > to) return false;
     if (branch && e.branch !== branch) return false;
+    if (!catFilter(e.loanAccountNo)) return false;
     return true;
   });
   const paid = filtered.filter(e => e.ptpStatus === "paid").length;
@@ -880,12 +1001,14 @@ app.get("/api/od/analytics/collection-efficiency", (req, res) => {
   };
   const col = fieldMap[groupBy] || "branch_name";
   let { periodStart, periodEnd } = req.query;
+  const category = String(req.query.category || "");
   if (!periodStart || !periodEnd) {
     const p = latestPeriod();
     if (p) { periodStart = p.period_start; periodEnd = p.period_end; }
   }
   if (!periodStart || !periodEnd) return res.json({ headline: null, breakdown: [], period: null });
 
+  const catClause = categoryWhere(category, "loan_account_no");
   const headline = db.prepare(`
     SELECT
       SUM(principal_demand + interest_demand) AS demand,
@@ -896,7 +1019,7 @@ app.get("/api/od/analytics/collection-efficiency", (req, res) => {
       SUM(interest_collected) AS interest_collected,
       COUNT(*) AS accounts
     FROM od_client_period
-    WHERE period_start = ? AND period_end = ?
+    WHERE period_start = ? AND period_end = ?${catClause}
   `).get(periodStart, periodEnd);
   const cePct = headline && headline.demand > 0 ? (headline.collected / headline.demand) * 100 : 0;
 
@@ -909,7 +1032,7 @@ app.get("/api/od/analytics/collection-efficiency", (req, res) => {
       SUM(interest_overdue) AS interest_overdue,
       COUNT(*) AS accounts
     FROM od_client_period
-    WHERE period_start = ? AND period_end = ?
+    WHERE period_start = ? AND period_end = ?${catClause}
     GROUP BY label
     HAVING demand > 0 OR collected > 0 OR principal_overdue > 0
     ORDER BY demand DESC
@@ -926,11 +1049,13 @@ app.get("/api/od/analytics/collection-efficiency", (req, res) => {
 // (rupees actually posted, mode mix, cash handled) on officer_code.
 app.get("/api/od/analytics/officer-scorecard", (req, res) => {
   let { periodStart, periodEnd } = req.query;
+  const category = String(req.query.category || "");
   if (!periodStart || !periodEnd) {
     const p = latestPeriod();
     if (p) { periodStart = p.period_start; periodEnd = p.period_end; }
   }
 
+  const catClauseCP = categoryWhere(category, "loan_account_no");
   // Demand/collected roll-up from client-period (officer owns the account).
   const owned = periodStart && periodEnd ? db.prepare(`
     SELECT
@@ -943,17 +1068,17 @@ app.get("/api/od/analytics/officer-scorecard", (req, res) => {
       SUM(principal_overdue + interest_overdue) AS overdue_end,
       SUM(principal_outstanding_start - principal_outstanding_end) AS principal_reduced
     FROM od_client_period
-    WHERE period_start = ? AND period_end = ?
+    WHERE period_start = ? AND period_end = ?${catClauseCP}
     GROUP BY officer_code
   `).all(periodStart, periodEnd) : [];
 
   // Actual receipt activity — credited to the PAYMENT officer (who physically
   // collected), not necessarily the relationship officer.
-  const collWhere = [];
+  const collWhere = ["1=1"];
   const collArgs = [];
   if (periodStart) { collWhere.push("payment_date >= ?"); collArgs.push(periodStart); }
   if (periodEnd)   { collWhere.push("payment_date <= ?"); collArgs.push(periodEnd); }
-  const collWhereSql = collWhere.length ? "WHERE " + collWhere.join(" AND ") : "";
+  const collWhereSql = "WHERE " + collWhere.join(" AND ") + categoryWhere(category, "loan_account_no");
   const posted = db.prepare(`
     SELECT
       COALESCE(NULLIF(payment_officer_code,''),'(unknown)') AS officer_code,
@@ -1001,12 +1126,13 @@ app.get("/api/od/analytics/officer-scorecard", (req, res) => {
 // Day × branch × mode heatmap data for the Daily Collections dashboard.
 app.get("/api/od/analytics/daily-collections", (req, res) => {
   const { from, to, branch } = req.query;
-  const where = [];
+  const category = String(req.query.category || "");
+  const where = ["1=1"];
   const args = [];
   if (from)   { where.push("payment_date >= ?"); args.push(String(from)); }
   if (to)     { where.push("payment_date <= ?"); args.push(String(to)); }
   if (branch) { where.push("branch_name = ?"); args.push(String(branch)); }
-  const whereSql = where.length ? "WHERE " + where.join(" AND ") : "";
+  const whereSql = "WHERE " + where.join(" AND ") + categoryWhere(category, "loan_account_no");
 
   const byDay = db.prepare(`
     SELECT payment_date AS day,
@@ -1053,6 +1179,7 @@ app.get("/api/od/analytics/daily-collections", (req, res) => {
 // Returns: buckets of NPA duration (first NPA → today) and top stranded accounts.
 app.get("/api/od/analytics/npa-ageing", (req, res) => {
   let snap = String(req.query.snapshotDate || "").slice(0, 10);
+  const category = String(req.query.category || "");
   if (!snap) {
     const r = db.prepare(`SELECT MAX(snapshot_date) AS d FROM od_overdue`).get();
     snap = r && r.d ? r.d : "";
@@ -1063,7 +1190,7 @@ app.get("/api/od/analytics/npa-ageing", (req, res) => {
     SELECT loan_account_no, customer_name, branch_name, officer_name, principal_outstanding,
            interest_outstanding, first_npa_date, current_npa_date, dpd_classification,
            installments_due, max_principal_overdue_days
-    FROM od_overdue WHERE snapshot_date = ? AND UPPER(dpd_classification) = 'NPA'
+    FROM od_overdue WHERE snapshot_date = ? AND UPPER(dpd_classification) = 'NPA'${categoryWhere(category, "loan_account_no")}
   `).all(snap);
 
   const today = new Date(snap);
@@ -1100,6 +1227,7 @@ app.get("/api/od/analytics/npa-ageing", (req, res) => {
 // GET /api/od/analytics/death-cases?snapshotDate=
 app.get("/api/od/analytics/death-cases", (req, res) => {
   let snap = String(req.query.snapshotDate || "").slice(0, 10);
+  const category = String(req.query.category || "");
   if (!snap) {
     const r = db.prepare(`SELECT MAX(snapshot_date) AS d FROM od_overdue`).get();
     snap = r && r.d ? r.d : "";
@@ -1110,7 +1238,7 @@ app.get("/api/od/analytics/death-cases", (req, res) => {
            principal_outstanding, interest_outstanding, fee_insurance_outstanding,
            death_case_remark, death_flagged_date, dpd_classification, product
     FROM od_overdue
-    WHERE snapshot_date = ? AND (death_case_remark != '' OR death_flagged_date != '')
+    WHERE snapshot_date = ? AND (death_case_remark != '' OR death_flagged_date != '')${categoryWhere(category, "loan_account_no")}
     ORDER BY death_flagged_date DESC, principal_outstanding DESC
   `).all(snap);
   const totals = rows.reduce((a, r) => ({
@@ -1125,6 +1253,7 @@ app.get("/api/od/analytics/death-cases", (req, res) => {
 // Bucketed distribution of # Installments Due for action playbook triage.
 app.get("/api/od/analytics/installments-due", (req, res) => {
   let snap = String(req.query.snapshotDate || "").slice(0, 10);
+  const category = String(req.query.category || "");
   if (!snap) {
     const r = db.prepare(`SELECT MAX(snapshot_date) AS d FROM od_overdue`).get();
     snap = r && r.d ? r.d : "";
@@ -1134,7 +1263,7 @@ app.get("/api/od/analytics/installments-due", (req, res) => {
     SELECT installments_due AS n, COUNT(*) AS accounts,
            SUM(principal_outstanding) AS principal,
            SUM(interest_outstanding) AS interest
-    FROM od_overdue WHERE snapshot_date = ? GROUP BY installments_due
+    FROM od_overdue WHERE snapshot_date = ?${categoryWhere(category, "loan_account_no")} GROUP BY installments_due
   `).all(snap);
   const buckets = [
     { bucket: "1 installment", min: 1, max: 1, accounts: 0, principal: 0, interest: 0 },
@@ -1158,6 +1287,7 @@ app.get("/api/od/analytics/installments-due", (req, res) => {
 // GET /api/od/analytics/funder-mix?periodStart=&periodEnd=
 app.get("/api/od/analytics/funder-mix", (req, res) => {
   let { periodStart, periodEnd } = req.query;
+  const category = String(req.query.category || "");
   if (!periodStart || !periodEnd) {
     const p = latestPeriod();
     if (p) { periodStart = p.period_start; periodEnd = p.period_end; }
@@ -1173,7 +1303,7 @@ app.get("/api/od/analytics/funder-mix", (req, res) => {
       SUM(principal_overdue + interest_overdue) AS overdue_end,
       SUM(principal_outstanding_end) AS principal_outstanding_end
     FROM od_client_period
-    WHERE period_start = ? AND period_end = ?
+    WHERE period_start = ? AND period_end = ?${categoryWhere(category, "loan_account_no")}
     GROUP BY funder, fund_source
     ORDER BY principal_outstanding_end DESC
   `).all(periodStart, periodEnd).map(r => ({
@@ -1186,6 +1316,7 @@ app.get("/api/od/analytics/funder-mix", (req, res) => {
 // Top accounts by principal reduction over the period (real recovery).
 app.get("/api/od/analytics/recovery-velocity", (req, res) => {
   let { periodStart, periodEnd } = req.query;
+  const category = String(req.query.category || "");
   const limit = Math.min(parseInt(req.query.limit || "50", 10), 500);
   if (!periodStart || !periodEnd) {
     const p = latestPeriod();
@@ -1199,7 +1330,7 @@ app.get("/api/od/analytics/recovery-velocity", (req, res) => {
            principal_collected, interest_collected, total_collection,
            advance_amount, principal_overdue, interest_overdue
     FROM od_client_period
-    WHERE period_start = ? AND period_end = ?
+    WHERE period_start = ? AND period_end = ?${categoryWhere(category, "loan_account_no")}
     ORDER BY principal_reduced DESC
     LIMIT ?
   `).all(periodStart, periodEnd, limit);
@@ -1219,6 +1350,7 @@ app.get("/api/od/analytics/recovery-velocity", (req, res) => {
 // the shortfall (remaining = demand - collected) per category.
 app.get("/api/od/analytics/monthly-collections/summary", (req, res) => {
   const limit = Math.min(parseInt(req.query.limit || "36", 10), 120);
+  const category = String(req.query.category || "");
   // Note: "collected" here is NET of prepayments — i.e. the demand-portion of
   // cash received. Raw collected (incl. prepayments) is exposed as
   // principal_collected_gross / interest_collected_gross for transparency.
@@ -1244,7 +1376,7 @@ app.get("/api/od/analytics/monthly-collections/summary", (req, res) => {
       SUM(principal_overdue) AS principal_overdue_end,
       SUM(interest_overdue) AS interest_overdue_end
     FROM od_client_period
-    WHERE period_end IS NOT NULL AND period_end <> ''
+    WHERE period_end IS NOT NULL AND period_end <> ''${categoryWhere(category, "loan_account_no")}
     GROUP BY year_month
     ORDER BY year_month DESC
     LIMIT ?
@@ -1285,6 +1417,7 @@ app.get("/api/od/analytics/monthly-collections/breakdown", (req, res) => {
     officer: "officer_name",
   };
   const col = fieldMap[groupBy] || "branch_name";
+  const category = String(req.query.category || "");
 
   let { yearMonth } = req.query;
   if (!yearMonth) {
@@ -1321,7 +1454,7 @@ app.get("/api/od/analytics/monthly-collections/breakdown", (req, res) => {
       SUM(principal_overdue) AS principal_overdue_end,
       SUM(interest_overdue) AS interest_overdue_end
     FROM od_client_period
-    WHERE substr(period_end, 1, 7) = ?
+    WHERE substr(period_end, 1, 7) = ?${categoryWhere(category, "loan_account_no")}
     GROUP BY label
     HAVING total_demand > 0 OR total_collected > 0
     ORDER BY total_demand DESC
@@ -1372,7 +1505,9 @@ function latestOverdueSnapshot() {
 //   NPA accounts, officers on that branch.
 app.get("/api/od/analytics/branch-scorecard", (req, res) => {
   const { periodStart, periodEnd } = resolvePeriod(req);
+  const category = String(req.query.category || "");
   if (!periodStart || !periodEnd) return res.json({ rows: [], period: null });
+  const catClause = categoryWhere(category, "loan_account_no");
 
   // Demand + collected + book from client-period
   const core = db.prepare(`
@@ -1387,7 +1522,7 @@ app.get("/api/od/analytics/branch-scorecard", (req, res) => {
       SUM(interest_overdue) AS interest_overdue,
       SUM(principal_outstanding_start - principal_outstanding_end) AS principal_reduced
     FROM od_client_period
-    WHERE period_start = ? AND period_end = ?
+    WHERE period_start = ? AND period_end = ?${catClause}
     GROUP BY branch
   `).all(periodStart, periodEnd);
 
@@ -1401,7 +1536,7 @@ app.get("/api/od/analytics/branch-scorecard", (req, res) => {
       SUM(CASE WHEN UPPER(mode) IN ('UPI','DIGITAL','ONLINE') THEN amount ELSE 0 END) AS upi_amount,
       SUM(CASE WHEN UPPER(mode) IN ('CHEQUE','DD') THEN amount ELSE 0 END) AS cheque_amount
     FROM od_collections
-    WHERE payment_date >= ? AND payment_date <= ?
+    WHERE payment_date >= ? AND payment_date <= ?${catClause}
     GROUP BY branch
   `).all(periodStart, periodEnd);
   const rByBranch = new Map(receipts.map(r => [r.branch, r]));
@@ -1414,7 +1549,7 @@ app.get("/api/od/analytics/branch-scorecard", (req, res) => {
       SUM(CASE WHEN first_npa_date IS NOT NULL AND first_npa_date <> '' THEN 1 ELSE 0 END) AS npa_accounts,
       SUM(CASE WHEN dpd_classification IN ('DPD-91-180','DPD-180+','SMA2','NPA') THEN 1 ELSE 0 END) AS severe_accounts
     FROM od_overdue
-    WHERE snapshot_date = ?
+    WHERE snapshot_date = ?${catClause}
     GROUP BY branch
   `).all(snap) : [];
   const nByBranch = new Map(npaRows.map(r => [r.branch, r]));
@@ -1453,7 +1588,9 @@ app.get("/api/od/analytics/branch-scorecard", (req, res) => {
 //   Per-product roll-up: accounts, book, demand, collected, CE%, NPA.
 app.get("/api/od/analytics/product-scorecard", (req, res) => {
   const { periodStart, periodEnd } = resolvePeriod(req);
+  const category = String(req.query.category || "");
   if (!periodStart || !periodEnd) return res.json({ rows: [], period: null });
+  const catClause = categoryWhere(category, "loan_account_no");
 
   const core = db.prepare(`
     SELECT
@@ -1467,7 +1604,7 @@ app.get("/api/od/analytics/product-scorecard", (req, res) => {
       SUM(interest_overdue) AS interest_overdue,
       SUM(principal_outstanding_start - principal_outstanding_end) AS principal_reduced
     FROM od_client_period
-    WHERE period_start = ? AND period_end = ?
+    WHERE period_start = ? AND period_end = ?${catClause}
     GROUP BY product
   `).all(periodStart, periodEnd);
 
@@ -1481,7 +1618,7 @@ app.get("/api/od/analytics/product-scorecard", (req, res) => {
       SUM(CASE WHEN UPPER(mode) IN ('UPI','DIGITAL','ONLINE') THEN amount ELSE 0 END) AS upi_amount,
       SUM(CASE WHEN UPPER(mode) IN ('CHEQUE','DD') THEN amount ELSE 0 END) AS cheque_amount
     FROM od_collections
-    WHERE payment_date >= ? AND payment_date <= ?
+    WHERE payment_date >= ? AND payment_date <= ?${catClause}
     GROUP BY product
   `).all(periodStart, periodEnd);
   const rByProduct = new Map(receipts.map(r => [r.product, r]));
@@ -1494,7 +1631,7 @@ app.get("/api/od/analytics/product-scorecard", (req, res) => {
       SUM(CASE WHEN first_npa_date IS NOT NULL AND first_npa_date <> '' THEN 1 ELSE 0 END) AS npa_accounts,
       SUM(CASE WHEN dpd_classification IN ('DPD-91-180','DPD-180+','SMA2','NPA') THEN 1 ELSE 0 END) AS severe_accounts
     FROM od_overdue
-    WHERE snapshot_date = ?
+    WHERE snapshot_date = ?${catClause}
     GROUP BY product
   `).all(snap) : [];
   const nByProduct = new Map(npaRows.map(r => [r.product, r]));
@@ -1534,11 +1671,13 @@ app.get("/api/od/analytics/product-scorecard", (req, res) => {
 app.get("/api/od/analytics/collections-by-product", (req, res) => {
   const from = req.query.from || null;
   const to = req.query.to || null;
+  const category = String(req.query.category || "");
   const where = [];
   const args = [];
   if (from) { where.push("payment_date >= ?"); args.push(from); }
   if (to)   { where.push("payment_date <= ?"); args.push(to); }
-  const whereSql = where.length ? "WHERE " + where.join(" AND ") : "";
+  const catClause = categoryWhere(category, "loan_account_no");
+  const whereSql = (where.length ? "WHERE " + where.join(" AND ") : "WHERE 1=1") + catClause;
 
   const rows = db.prepare(`
     SELECT
@@ -1579,6 +1718,7 @@ app.get("/api/od/analytics/collections-by-product", (req, res) => {
 //   Branch × Product heatmap (CE% per intersection).
 app.get("/api/od/analytics/branch-product-matrix", (req, res) => {
   const { periodStart, periodEnd } = resolvePeriod(req);
+  const category = String(req.query.category || "");
   if (!periodStart || !periodEnd) return res.json({ branches: [], products: [], matrix: [], period: null });
 
   const rows = db.prepare(`
@@ -1591,7 +1731,7 @@ app.get("/api/od/analytics/branch-product-matrix", (req, res) => {
       SUM(principal_collected + interest_collected) AS collected,
       SUM(principal_overdue + interest_overdue) AS total_overdue
     FROM od_client_period
-    WHERE period_start = ? AND period_end = ?
+    WHERE period_start = ? AND period_end = ?${categoryWhere(category, "loan_account_no")}
     GROUP BY branch, product
     HAVING demand > 0 OR collected > 0 OR principal_outstanding > 0
   `).all(periodStart, periodEnd).map(r => ({
@@ -1638,18 +1778,20 @@ app.get("/api/od/drilldown", (req, res) => {
   const nonContact = req.query.nonContact === "1" || req.query.nonContact === "true";
   const minInstallmentsDue = parseInt(req.query.minInstallmentsDue || "0", 10);
   const minMonthsStranded = parseInt(req.query.minMonthsStranded || "0", 10);
+  const category = String(req.query.category || "");
   const limit = Math.min(parseInt(req.query.limit || "500", 10), 2000);
   const { periodStart, periodEnd } = resolvePeriod(req);
   const from = req.query.from || periodStart;
   const to = req.query.to || periodEnd;
   const snap = latestOverdueSnapshot();
+  const catClause = categoryWhere(category, "loan_account_no");
 
   // ── Build WHEREs per source table ──
   const cpWhere = ["period_start = ?", "period_end = ?"];
   const cpArgs = [periodStart, periodEnd];
   if (branch)  { cpWhere.push("COALESCE(NULLIF(branch_name,''),'(unspecified)') = ?"); cpArgs.push(branch); }
   if (product) { cpWhere.push("COALESCE(NULLIF(product_name,''),'(unspecified)') = ?"); cpArgs.push(product); }
-  const cpWhereSql = "WHERE " + cpWhere.join(" AND ");
+  const cpWhereSql = "WHERE " + cpWhere.join(" AND ") + catClause;
 
   const rWhere = [];
   const rArgs = [];
@@ -1662,7 +1804,7 @@ app.get("/api/od/drilldown", (req, res) => {
     else if (mode === "CHEQUE") rWhere.push("UPPER(mode) IN ('CHEQUE','DD')");
     else { rWhere.push("UPPER(mode) = ?"); rArgs.push(mode); }
   }
-  const rWhereSql = rWhere.length ? "WHERE " + rWhere.join(" AND ") : "";
+  const rWhereSql = (rWhere.length ? "WHERE " + rWhere.join(" AND ") : "WHERE 1=1") + catClause;
 
   // ── od_overdue filter (bucket / NPA / death / installments / months stranded) ──
   // When any overdue-report filter is given we pull the matching loan list from
@@ -1684,7 +1826,7 @@ app.get("/api/od/drilldown", (req, res) => {
     if (branch)  { ovWhere.push("COALESCE(NULLIF(branch_name,''),'(unspecified)') = ?"); ovArgs.push(branch); }
     if (product) { ovWhere.push("COALESCE(NULLIF(product,''),'(unspecified)') = ?"); ovArgs.push(product); }
     const ovRows = db.prepare(
-      `SELECT loan_account_no FROM od_overdue WHERE ${ovWhere.join(" AND ")}`
+      `SELECT loan_account_no FROM od_overdue WHERE ${ovWhere.join(" AND ")}${catClause}`
     ).all(...ovArgs);
     bucketAccounts = new Set(ovRows.map(r => r.loan_account_no));
   }
@@ -1872,12 +2014,69 @@ app.get("/api/od/analytics/monthly-history", (req, res) => {
   const from = String(req.query.from || "");
   const to = String(req.query.to || "");
   const branch = String(req.query.branch || "");
+  const category = String(req.query.category || "");
+
+  // When no category filter: use the pre-aggregated pool_monthly_agg for speed.
+  // When category is set: aggregate on-the-fly from pool_monthly_account (which
+  // carries loan_account_no so it can be joined/filtered by customers.loan_category).
+  const useAcct = !!category;
+  const tbl = useAcct ? "pool_monthly_account" : "pool_monthly_agg";
 
   let where = "1=1";
   const params = [];
   if (from)   { where += " AND year_month >= ?"; params.push(from); }
   if (to)     { where += " AND year_month <= ?"; params.push(to); }
   if (branch) { where += " AND branch = ?";      params.push(branch); }
+  if (useAcct) where += categoryWhere(category, "loan_account_no");
+
+  if (useAcct) {
+    // Derive a dpd_bucket expression from account_dpd_classification so we can
+    // produce the same bucket split the pre-aggregated table provides.
+    const bucketExpr = `CASE
+        WHEN overdue_days <= 0 THEN '0-Current'
+        WHEN overdue_days BETWEEN 1 AND 30 THEN '1-30'
+        WHEN overdue_days BETWEEN 31 AND 60 THEN '31-60'
+        WHEN overdue_days BETWEEN 61 AND 90 THEN '61-90'
+        WHEN overdue_days BETWEEN 91 AND 180 THEN '91-180'
+        ELSE '180+'
+      END`;
+
+    const totals = db.prepare(`
+      SELECT year_month,
+             COUNT(*)                   AS accounts,
+             SUM(principal_outstanding) AS principal_outstanding,
+             SUM(interest_outstanding)  AS interest_outstanding,
+             SUM(principal_overdue)     AS principal_overdue,
+             SUM(interest_overdue)      AS interest_overdue,
+             SUM(current_od)            AS current_od
+        FROM ${tbl} WHERE ${where}
+       GROUP BY year_month ORDER BY year_month
+    `).all(...params);
+
+    const buckets = db.prepare(`
+      SELECT year_month, ${bucketExpr} AS dpd_bucket,
+             COUNT(*)                   AS accounts,
+             SUM(principal_outstanding) AS principal_outstanding,
+             SUM(principal_overdue)     AS principal_overdue
+        FROM ${tbl} WHERE ${where}
+       GROUP BY year_month, dpd_bucket
+       ORDER BY year_month,
+                CASE dpd_bucket
+                  WHEN '0-Current' THEN 0 WHEN '1-30' THEN 1 WHEN '31-60' THEN 2
+                  WHEN '61-90' THEN 3 WHEN '91-180' THEN 4 ELSE 5 END
+    `).all(...params);
+
+    const byBranch = branch ? [] : db.prepare(`
+      SELECT year_month, branch,
+             COUNT(*)                   AS accounts,
+             SUM(principal_outstanding) AS principal_outstanding,
+             SUM(principal_overdue)     AS principal_overdue
+        FROM ${tbl} WHERE ${where}
+       GROUP BY year_month, branch ORDER BY year_month, branch
+    `).all(...params);
+
+    return res.json({ filters: { from, to, branch: branch || null, category }, totals, buckets, byBranch });
+  }
 
   // Totals per month (sum across branches and buckets).
   const totals = db.prepare(`
@@ -1930,12 +2129,14 @@ app.get("/api/od/analytics/monthly-account", (req, res) => {
   if (!ym) return res.status(400).json({ error: "year_month is required (YYYY-MM)" });
   const branch = String(req.query.branch || "");
   const dpd = String(req.query.dpd || "");
+  const category = String(req.query.category || "");
   const limit = Math.min(Number(req.query.limit) || 500, 5000);
 
   let where = "year_month = ?";
   const params = [ym];
   if (branch) { where += " AND branch = ?"; params.push(branch); }
   if (dpd)    { where += " AND account_dpd_classification = ?"; params.push(dpd); }
+  where += categoryWhere(category, "loan_account_no");
 
   const rows = db.prepare(`
     SELECT * FROM pool_monthly_account
@@ -2062,6 +2263,168 @@ app.get("/api/pool/center", (req, res) => {
   } catch (e) {
     console.error("[pool/center]", e.message);
     res.json({ found: false, members: [], count: 0 });
+  }
+});
+
+// GET /api/customers/loans?customerId=|loanAccountNo=|phone=|aadhaar=
+// Returns ALL ACTIVE loans for a single customer, each with a full OD breakdown
+// from the latest pool + accrued snapshots. Skips loans whose loan_status is
+// Closed / Written Off / Settled.
+app.get("/api/customers/loans", (req, res) => {
+  try {
+    const { customerId, loanAccountNo, phone, aadhaar } = req.query;
+    // Step 1 — resolve the customer_number(s) from any identifier.
+    let customerNumbers = [];
+    if (customerId) {
+      customerNumbers = [String(customerId).trim()];
+    } else if (loanAccountNo) {
+      const row = db.prepare("SELECT customer_number FROM customers WHERE loan_account_no = ?")
+        .get(String(loanAccountNo).trim());
+      if (row?.customer_number) customerNumbers = [row.customer_number];
+    } else if (phone) {
+      const key = String(phone).replace(/\D/g, "");
+      const rows = db.prepare(
+        "SELECT DISTINCT customer_number FROM customers WHERE REPLACE(REPLACE(REPLACE(mobile_number,' ',''),'-',''),'+','') LIKE ?"
+      ).all("%" + key + "%");
+      customerNumbers = rows.map(r => r.customer_number).filter(Boolean);
+    } else if (aadhaar) {
+      const key = String(aadhaar).replace(/\D/g, "");
+      const rows = db.prepare(
+        "SELECT DISTINCT customer_number FROM customers WHERE REPLACE(REPLACE(aadhaar_number,' ',''),'-','') = ?"
+      ).all(key);
+      customerNumbers = rows.map(r => r.customer_number).filter(Boolean);
+    }
+    if (customerNumbers.length === 0) {
+      return res.json({ found: false, customer: null, loans: [] });
+    }
+
+    // Step 2 — fetch all loans for these customer_numbers, join with latest
+    // pool_snapshots + accrued_snapshots for live OD values.
+    const latestPool = db.prepare("SELECT MAX(snapshot_date) AS d FROM pool_snapshots").get()?.d;
+    const latestAccrued = db.prepare("SELECT MAX(snapshot_date) AS d FROM accrued_snapshots").get()?.d;
+    const placeholders = customerNumbers.map(() => "?").join(",");
+    const rows = db.prepare(`
+      SELECT
+        c.loan_account_no, c.customer_number, c.customer_name, c.branch,
+        c.center_name, c.group_name, c.mobile_number, c.aadhaar_number,
+        c.product_name, c.product_interest_rate, c.loan_amount,
+        c.disbursement_date, c.last_installment_date, c.last_payment_date,
+        p.principal_outstanding, p.interest_outstanding,
+        p.principal_overdue, p.interest_overdue, p.current_od,
+        p.overdue_days, p.customer_dpd, p.loan_status, p.account_dpd_classification,
+        a.accrued_interest
+      FROM customers c
+      LEFT JOIN pool_snapshots p
+        ON p.loan_account_no = c.loan_account_no AND p.snapshot_date = ?
+      LEFT JOIN accrued_snapshots a
+        ON a.loan_account_no = c.loan_account_no AND a.snapshot_date = ?
+      WHERE c.customer_number IN (${placeholders})
+    `).all(latestPool || "", latestAccrued || "", ...customerNumbers);
+
+    const INACTIVE_STATUSES = new Set(["Closed", "Written Off", "Settled", "CLOSED", "WRITTEN OFF", "SETTLED"]);
+    const loans = rows
+      .filter(r => !INACTIVE_STATUSES.has((r.loan_status || "").trim()))
+      .map(r => {
+        const po = Number(r.principal_outstanding) || 0;
+        const ai = Number(r.accrued_interest) || 0;
+        const ui = Number(r.interest_overdue) || 0;
+        return {
+          loanAccountNo: r.loan_account_no || "",
+          customerNumber: r.customer_number || "",
+          customerName: r.customer_name || "",
+          branch: r.branch || "",
+          centerName: r.center_name || "",
+          groupName: r.group_name || "",
+          productName: r.product_name || "",
+          interestRate: Number(r.product_interest_rate) || 0,
+          loanAmount: Number(r.loan_amount) || 0,
+          disbursementDate: r.disbursement_date || "",
+          lastPaymentDate: r.last_payment_date || "",
+          principalOutstanding: po,
+          interestOutstanding: Number(r.interest_outstanding) || 0,
+          principalOverdue: Number(r.principal_overdue) || 0,
+          interestOverdue: ui,
+          currentOD: Number(r.current_od) || 0,
+          overdueDays: Number(r.overdue_days) || 0,
+          customerDPD: Number(r.customer_dpd) || 0,
+          loanStatus: r.loan_status || "",
+          dpdClassification: r.account_dpd_classification || "",
+          accruedInterest: ai,
+          foreclosureValue: po + ui + ai,
+        };
+      })
+      // Sort: highest overdue first, then highest outstanding.
+      .sort((a, b) => (b.currentOD - a.currentOD) || (b.principalOutstanding - a.principalOutstanding));
+
+    // Customer metadata (use the first row as representative).
+    const first = rows[0] || {};
+    const customer = first.customer_number ? {
+      name: first.customer_name || "",
+      customerNumber: first.customer_number || "",
+      phone: first.mobile_number || "",
+      aadhaar: first.aadhaar_number || "",
+      branch: first.branch || "",
+    } : null;
+
+    res.json({
+      found: loans.length > 0,
+      customer,
+      loans,
+      snapshotDate: latestPool || null,
+      accruedDate: latestAccrued || null,
+    });
+  } catch (e) {
+    console.error("[customers/loans]", e.message);
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// GET /api/od/portfolio-totals?branch=
+// Returns the total OD (principal_overdue + interest_overdue) from the LATEST
+// pool snapshot, split by loan type:
+//   - "group"      → customers whose group_name or center_name is populated
+//   - "individual" → everyone else
+// Used by the dashboard KPI cards ("Group OD Amount" / "Individual OD Amount").
+app.get("/api/od/portfolio-totals", (req, res) => {
+  try {
+    const branch = String(req.query.branch || "").trim();
+    const latest = db.prepare("SELECT MAX(snapshot_date) AS d FROM pool_snapshots").get()?.d;
+    if (!latest) {
+      return res.json({ snapshotDate: null, groupOdAmount: 0, individualOdAmount: 0, groupAccounts: 0, individualAccounts: 0 });
+    }
+    // Classification is driven by the Pool Report's "Category of Loan" column
+    // (ingested into customers.loan_category). Rows with a blank/unknown
+    // loan_category fall back to the legacy group_name/center_name heuristic
+    // so existing pool data without the column still shows up on some tab.
+    let sql = `
+      SELECT
+        CASE
+          WHEN UPPER(COALESCE(c.loan_category,'')) LIKE '%GROUP%'      THEN 'group'
+          WHEN UPPER(COALESCE(c.loan_category,'')) LIKE '%INDIVIDUAL%' THEN 'individual'
+          WHEN (c.group_name IS NOT NULL AND c.group_name <> '')
+            OR (c.center_name IS NOT NULL AND c.center_name <> '')    THEN 'group'
+          ELSE 'individual'
+        END AS type,
+        SUM(COALESCE(p.principal_overdue, 0) + COALESCE(p.interest_overdue, 0)) AS amount,
+        COUNT(*) AS accounts
+      FROM pool_snapshots p
+      LEFT JOIN customers c ON c.loan_account_no = p.loan_account_no
+      WHERE p.snapshot_date = ?
+        AND (COALESCE(p.principal_overdue, 0) + COALESCE(p.interest_overdue, 0)) > 0
+    `;
+    const params = [latest];
+    if (branch) { sql += " AND p.branch = ?"; params.push(branch); }
+    sql += " GROUP BY type";
+    const rows = db.prepare(sql).all(...params);
+    const result = { snapshotDate: latest, groupOdAmount: 0, individualOdAmount: 0, groupAccounts: 0, individualAccounts: 0 };
+    for (const r of rows) {
+      if (r.type === "group") { result.groupOdAmount = r.amount || 0; result.groupAccounts = r.accounts || 0; }
+      else                    { result.individualOdAmount = r.amount || 0; result.individualAccounts = r.accounts || 0; }
+    }
+    res.json(result);
+  } catch (e) {
+    console.error("[od/portfolio-totals]", e.message);
+    res.status(500).json({ error: e.message });
   }
 });
 
