@@ -78,7 +78,7 @@ const INDIAN_BANKS = [
   "Punjab & Sind Bank", "Punjab National Bank", "State Bank of India",
   "UCO Bank", "Union Bank of India",
   // Private sector banks
-  "Axis Bank", "Bandhan Bank", "City Union Bank", "CSB Bank", "DCB Bank",
+  "Axis Bank", "Bandhan Bank", "City Union Bank", "DCB Bank",
   "Dhanlaxmi Bank", "Federal Bank", "HDFC Bank", "ICICI Bank", "IDBI Bank",
   "IDFC FIRST Bank", "IndusInd Bank", "J&K Bank", "Karnataka Bank",
   "Karur Vysya Bank", "Kotak Mahindra Bank", "Nainital Bank", "RBL Bank",
@@ -1624,9 +1624,6 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
     if (paymentMode === "Cash" && ptpDate && !ptpTime) { alert("Please enter PTP time."); return; }
     if (!isPtpFuture && waiver > 0 && !approvalEmailSubject.trim()) { alert("Waiver detected. Please enter the approval email subject line."); return; }
 
-    // Auto-detect CSB: no Customer ID + hyphenated loan number (e.g. 0269-80394391-657201)
-    const isCSBCustomer = !customerId.trim() && /\d+-\d+-\d+/.test(loanAccountNo.trim());
-
     // Only match against OTHER Individual OD entries — a same-day Group OD
     // payment by this customer is allowed and must not trigger the warning.
     const isDup = entries.some(e =>
@@ -1646,7 +1643,6 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
       customerName: customerName.trim(), customerId: customerId.trim(), loanAccountNo: loanAccountNo.trim(),
       phone: phone.trim(), aadhaar: aadhaar.replace(/\D/g, ""),
       odType: "Individual OD",
-      isCSBCustomer: isCSBCustomer || undefined,
       smaBucket: smaBucket || "",
       amountDue: due,
       paidAmount: isPtpFuture ? 0 : paid,
@@ -2212,7 +2208,6 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
   const [paymentModeFilter, setPaymentModeFilter] = useState("");
   const [ptpStatusFilter, setPtpStatusFilter] = useState("");
   const [smaBucketFilter, setSmaBucketFilter] = useState("");
-  const [csbFilter, setCsbFilter] = useState(false);
   const [sortField, setSortField] = useState("date");
   const [sortDir, setSortDir] = useState("desc");
   const [dateFrom, setDateFrom] = useState("");
@@ -2290,7 +2285,6 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
     if (selectedStaff.length > 0) data = data.filter(e => selectedStaff.includes(e.enteredBy));
     if (paymentModeFilter) data = data.filter(e => (e.ptpPaymentMode || e.paymentMode || "") === paymentModeFilter);
     if (smaBucketFilter) data = data.filter(e => (e.smaBucket || "") === smaBucketFilter);
-    if (csbFilter) data = data.filter(e => e.isCSBCustomer === true);
     if (ptpStatusFilter) {
       if (ptpStatusFilter === "pending") data = data.filter(e => e.ptpStatus === "pending");
       else if (ptpStatusFilter === "paid") data = data.filter(e => e.ptpStatus === "paid");
@@ -2327,7 +2321,7 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
       return sortDir === "desc" ? -cmp : cmp;
     });
     return data;
-  }, [entries, user, config, selectedBranches, selectedStaff, paymentModeFilter, smaBucketFilter, csbFilter, ptpStatusFilter, dateFrom, dateTo, searchTerm, sortField, sortDir]);
+  }, [entries, user, config, selectedBranches, selectedStaff, paymentModeFilter, smaBucketFilter, ptpStatusFilter, dateFrom, dateTo, searchTerm, sortField, sortDir]);
 
   const canDelete = user.role === "admin" || config.allowStaffDelete;
 
@@ -2396,13 +2390,6 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
               <option value="SMA-2">SMA-2 (61–90 DPD)</option>
               <option value="NPA">NPA (&gt;90 DPD)</option>
             </select>
-          )}
-          {odTypeFilter === "Individual OD" && (
-            <button
-              onClick={() => setCsbFilter(f => !f)}
-              className={`px-3 py-2 rounded-lg text-sm font-medium border transition-colors ${csbFilter ? "bg-blue-600 text-white border-blue-600" : "bg-white text-gray-600 border-gray-300 hover:bg-gray-50"}`}>
-              {csbFilter ? "✓ CSB Only" : "CSB Bank"}
-            </button>
           )}
           <select value={ptpStatusFilter} onChange={e => setPtpStatusFilter(e.target.value)} className="px-3 py-2 border rounded-lg text-sm">
             <option value="">All Status</option>
@@ -2827,7 +2814,6 @@ function Dashboard({ user, entries, branches, config }) {
 
   const visibleEntries = useMemo(() => {
     if (dashView === "group") return allVisibleEntries.filter(e => !e.odType || e.odType === "Group OD");
-    if (dashView === "csb") return allVisibleEntries.filter(e => e.odType === "Individual OD" && e.isCSBCustomer === true);
     return allVisibleEntries.filter(e => e.odType === "Individual OD");
   }, [allVisibleEntries, dashView]);
 
@@ -3148,10 +3134,6 @@ function Dashboard({ user, entries, branches, config }) {
           className={`px-5 py-2 rounded-xl font-semibold text-sm transition-colors flex items-center gap-2 ${dashView === "individual" ? "bg-indigo-600 text-white shadow-md shadow-indigo-200" : "bg-white text-gray-600 border hover:bg-gray-50"}`}>
           <UserPlus size={15} /> Individual OD
         </button>
-        <button onClick={() => { setDashView("csb"); resetDrill(); }}
-          className={`px-5 py-2 rounded-xl font-semibold text-sm transition-colors flex items-center gap-2 ${dashView === "csb" ? "bg-blue-600 text-white shadow-md shadow-blue-200" : "bg-white text-gray-600 border hover:bg-gray-50"}`}>
-          <CreditCard size={15} /> CSB Bank
-        </button>
       </div>
       <div className="mb-4"><DateRangeFilter dateFrom={dateFrom} dateTo={dateTo} setDateFrom={setDateFrom} setDateTo={setDateTo} /></div>
 
@@ -3174,38 +3156,11 @@ function Dashboard({ user, entries, branches, config }) {
           <p className="text-xs text-gray-400">{stats.entriesWithWaiver} entries · <span className="text-teal-600">View details →</span></p>
         </div>
         <div className="bg-white rounded-xl border p-4 cursor-pointer hover:shadow-md transition-shadow" onClick={() => setDrillPanel("groupod")}>
-          <p className="text-xs text-gray-500 mb-1">{dashView === "individual" ? "Total Individual OD Due" : dashView === "csb" ? "Total CSB OD Due" : "Total Group OD Due"}</p>
+          <p className="text-xs text-gray-500 mb-1">{dashView === "individual" ? "Total Individual OD Due" : "Total Group OD Due"}</p>
           <p className="text-2xl font-bold text-gray-600">{formatLakhs(stats.totalGroupOD)}</p>
           <p className="text-xs text-teal-600 mt-1">View details →</p>
         </div>
       </div>
-
-      {/* CSB quick-link chip when viewing Individual OD */}
-      {dashView === "individual" && (() => {
-        const csbCount = allVisibleEntries.filter(e => e.odType === "Individual OD" && e.isCSBCustomer === true).length;
-        if (csbCount === 0) return null;
-        return (
-          <div className="mb-4 flex">
-            <button onClick={() => { setDashView("csb"); resetDrill(); }}
-              className="inline-flex items-center gap-2 px-4 py-2 bg-blue-50 border border-blue-200 text-blue-700 rounded-lg text-sm font-medium hover:bg-blue-100 transition-colors">
-              <CreditCard size={14} /> {csbCount} CSB Bank entries — view separately →
-            </button>
-          </div>
-        );
-      })()}
-
-      {/* CSB Bank info banner */}
-      {dashView === "csb" && (
-        <div className="bg-blue-50 border border-blue-200 rounded-xl p-4 mb-6 flex items-center gap-3">
-          <CreditCard size={20} className="text-blue-600 flex-shrink-0" />
-          <div>
-            <p className="text-sm font-semibold text-blue-800">CSB Bank OD Portfolio</p>
-            <p className="text-xs text-blue-600 mt-0.5">
-              {stats.totalEntries} entries across {new Set(visibleEntries.map(e => e.branch)).size} branches. These customers have CSB Bank loan accounts (hyphenated loan numbers) without Dhanam Customer IDs.
-            </p>
-          </div>
-        </div>
-      )}
 
       {/* Charts: Monthly Trend & Payment Mode */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
@@ -3306,60 +3261,6 @@ function Dashboard({ user, entries, branches, config }) {
           </div>
         </div>
       )}
-    </div>
-  );
-}
-
-// ─── CSB Approval Modal ───────────────────────────────────────────────────────
-function CSBApprovalModal({ candidates, groupODRows, failedRows, onConfirm, onReject }) {
-  return (
-    <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
-      <div className="bg-white rounded-xl shadow-xl w-full max-w-lg max-h-[90vh] flex flex-col">
-        <div className="p-5 border-b">
-          <h3 className="font-bold text-gray-900 text-lg">CSB Bank Customers Detected</h3>
-          <p className="text-sm text-gray-600 mt-1">
-            {candidates.length} entries have no Customer ID but have CSB-format loan numbers (e.g. 0269-XXXXXXXX-657201).
-            Are these CSB Bank customers?
-          </p>
-        </div>
-        <div className="overflow-y-auto flex-1 p-4 space-y-3">
-          <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide">Customer List ({candidates.length})</p>
-          <div className="space-y-1 max-h-48 overflow-y-auto border rounded-lg p-2 bg-gray-50">
-            {candidates.map((r, i) => (
-              <div key={i} className="flex items-center justify-between text-sm py-1 border-b last:border-0">
-                <span className="font-medium text-gray-800">{r.customerName}</span>
-                <span className="text-xs text-gray-500">{r.branch} · {r.loanAccountNo}</span>
-              </div>
-            ))}
-          </div>
-          {groupODRows.length > 0 && (
-            <div className="bg-amber-50 border border-amber-200 rounded-lg p-3">
-              <p className="text-xs font-semibold text-amber-800 mb-1">⚠ {groupODRows.length} Group OD entries detected — will NOT be imported</p>
-              <div className="text-xs text-amber-700 space-y-0.5 max-h-24 overflow-y-auto">
-                {groupODRows.map((r, i) => <div key={i}>{r.customerName} ({r.branch})</div>)}
-              </div>
-            </div>
-          )}
-          {failedRows.length > 0 && (
-            <div className="bg-red-50 border border-red-200 rounded-lg p-3">
-              <p className="text-xs font-semibold text-red-800 mb-1">✗ {failedRows.length} entries will be skipped (missing required fields)</p>
-              <div className="text-xs text-red-700 space-y-0.5 max-h-24 overflow-y-auto">
-                {failedRows.map((r, i) => <div key={i}>{r.customerName || "(no name)"} — {r.reason}</div>)}
-              </div>
-            </div>
-          )}
-        </div>
-        <div className="p-4 border-t flex gap-3">
-          <button onClick={onConfirm}
-            className="flex-1 py-2.5 bg-blue-600 text-white rounded-lg font-medium hover:bg-blue-700 transition-colors text-sm">
-            ✓ Yes, these are CSB customers — import them
-          </button>
-          <button onClick={onReject}
-            className="flex-1 py-2.5 bg-gray-200 text-gray-700 rounded-lg font-medium hover:bg-gray-300 transition-colors text-sm">
-            ✗ No — skip them
-          </button>
-        </div>
-      </div>
     </div>
   );
 }
@@ -3469,7 +3370,6 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
   const [showPassId, setShowPassId] = useState(null);
   const [editingBranch, setEditingBranch] = useState(null);
   const [lastBulkUpload, setLastBulkUpload] = useState(() => loadData(STORAGE_KEYS.lastBulkUpload, null));
-  const [pendingBulkImport, setPendingBulkImport] = useState(null); // holds parsed data waiting for CSB decision
   // Duplicate review modal state. Populated after CSV parse whenever any
   // incoming row matches an existing entry by (date, loanAccountNo). User
   // decides per-row whether to include anyway or skip.
@@ -3477,8 +3377,8 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
   const [pendingDuplicates, setPendingDuplicates] = useState(null);
 
   // Strict duplicate rule: two entries are duplicates iff they share the same
-  // (date, loanAccountNo). Rows without a loanAccountNo (e.g. Mahashemam /
-  // some CSB rows) are NEVER flagged as duplicates — no reliable join key.
+  // (date, loanAccountNo). Rows without a loanAccountNo (e.g. Mahashemam) are
+  // NEVER flagged as duplicates — no reliable join key.
   const findDuplicates = (rows) => {
     const existingByKey = new Map();
     for (const e of entries) {
@@ -3520,7 +3420,7 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
     alert(`Done. Removed ${removed} entries. Records restored to before the upload.`);
   };
 
-  const downloadResultFile = (imported, csbRows, csbApproved, groupODRows, failedRows) => {
+  const downloadResultFile = (imported, groupODRows, failedRows) => {
     const lines = [];
     const q = (v) => `"${String(v ?? "").replace(/"/g, '""')}"`;
     const rowCols = (r) => [r.date, r.branch, r.customerName, r.customerId || "", r.loanAccountNo, r.amountDue, r.paidAmount, r.paymentMode || "", r.smaBucket || ""].map(q).join(",");
@@ -3533,14 +3433,6 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
     lines.push(["Date","Branch","Customer Name","Customer ID","Loan Account No.","OD Amount Due","OD Paid","Payment Mode","SMA Bucket"].map(q).join(","));
     imported.forEach(r => lines.push(rowCols(r)));
     lines.push("");
-
-    if (csbRows.length > 0) {
-      const label = csbApproved ? `CSB BANK ENTRIES — IMPORTED (${csbRows.length})` : `CSB BANK ENTRIES — SKIPPED (${csbRows.length})`;
-      lines.push(`== ${label} ==`);
-      lines.push(["Date","Branch","Customer Name","Customer ID","Loan Account No.","OD Amount Due","OD Paid","Payment Mode","SMA Bucket"].map(q).join(","));
-      csbRows.forEach(r => lines.push(rowCols(r)));
-      lines.push("");
-    }
 
     if (groupODRows.length > 0) {
       lines.push(`== GROUP OD ENTRIES DETECTED — NOT IMPORTED (${groupODRows.length}) ==`);
@@ -3566,12 +3458,11 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
   // Split: dedup check runs between "final set decided" and the actual commit.
   // On duplicates we open the review modal; its onCommit lands back in
   // commitIndivEntries with the user's row-level decisions applied.
-  const finalizeBulkIndivImport = (validRows, csbRows, csbApproved, groupODRows, failedRows) => {
-    const toImport = csbApproved ? [...validRows, ...csbRows] : validRows;
+  const finalizeBulkIndivImport = (validRows, groupODRows, failedRows) => {
+    const toImport = validRows;
 
     const { newOnes, dupes } = findDuplicates(toImport);
     if (dupes.length > 0) {
-      setPendingBulkImport(null); // close CSB modal if it was open
       setPendingDuplicates({
         type: "individual",
         newRows: newOnes,
@@ -3579,31 +3470,29 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
         onCommit: (includedDupes) => {
           commitIndivEntries(
             [...newOnes, ...includedDupes],
-            validRows, csbRows, csbApproved, groupODRows, failedRows,
+            validRows, groupODRows, failedRows,
             dupes.length - includedDupes.length,
           );
         },
       });
       return;
     }
-    commitIndivEntries(toImport, validRows, csbRows, csbApproved, groupODRows, failedRows, 0);
+    commitIndivEntries(toImport, validRows, groupODRows, failedRows, 0);
   };
 
-  const commitIndivEntries = (toImport, validRows, csbRows, csbApproved, groupODRows, failedRows, skippedDupCount) => {
+  const commitIndivEntries = (toImport, validRows, groupODRows, failedRows, skippedDupCount) => {
     const allEntries = [...toImport, ...entries];
     setEntries(allEntries);
     saveData(STORAGE_KEYS.entries, allEntries);
     const snapshot = { type: "Individual OD", ids: toImport.map(e => e.id), count: toImport.length, timestamp: new Date().toISOString() };
     saveData(STORAGE_KEYS.lastBulkUpload, snapshot);
     setLastBulkUpload(snapshot);
-    setPendingBulkImport(null);
     setPendingDuplicates(null);
-    downloadResultFile(validRows, csbRows, csbApproved, groupODRows, failedRows);
-    const csbMsg = csbRows.length > 0 ? (csbApproved ? `\n• ${csbRows.length} CSB entries imported.` : `\n• ${csbRows.length} CSB entries skipped.`) : "";
+    downloadResultFile(validRows, groupODRows, failedRows);
     const groupMsg = groupODRows.length > 0 ? `\n• ${groupODRows.length} Group OD entries were NOT imported (see result file).` : "";
     const failMsg = failedRows.length > 0 ? `\n• ${failedRows.length} entries failed (see result file).` : "";
     const dupMsg = skippedDupCount > 0 ? `\n• ${skippedDupCount} duplicate row(s) skipped (already existed by date + loan account).` : "";
-    alert(`Import complete.\n• ${toImport.length} Individual OD entries imported.${csbMsg}${groupMsg}${failMsg}${dupMsg}\n\nA result file has been downloaded.`);
+    alert(`Import complete.\n• ${toImport.length} Individual OD entries imported.${groupMsg}${failMsg}${dupMsg}\n\nA result file has been downloaded.`);
   };
 
   const [editBranchName, setEditBranchName] = useState("");
@@ -3895,7 +3784,6 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
       const rows = parseCSV(ev.target.result);
 
       const validRows = [];
-      const csbRows = [];
       const groupODRows = [];
       const failedRows = [];
 
@@ -3963,19 +3851,15 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
           enteredBy: enteredById, enteredByName,
         };
 
-        // CSB Bank detection: no Customer ID + loan number contains hyphens (e.g. 0269-80394391-657201)
-        const isCSB = !customerId && /\d+-\d+-\d+/.test(loanAccountNo);
         // Mahashemam detection: no Customer ID + no Loan Account No (Aadhaar-only customers)
         const aadhaar = (r["Aadhaar"] || r["Aadhaar No"] || r["Aadhaar Number"] || r.aadhaar || "").trim().replace(/\D/g, "");
         const isMahashemam = !customerId && !loanAccountNo;
-        if (isCSB) {
-          csbRows.push({ ...entry, customerId: "", isCSBCustomer: true });
-        } else if (isMahashemam) {
+        if (isMahashemam) {
           // Aadhaar-only customers belong to Mahashemam branch
           validRows.push({ ...entry, customerId: "", loanAccountNo: "", branch: "Mahashemam", aadhaar, isMahashemamCustomer: true });
         } else if (!customerId) {
-          // No Customer ID and no CSB pattern — skip
-          failedRows.push({ customerName, branch, loanAccountNo, reason: "Missing Customer ID (not a CSB format loan number)" });
+          // No Customer ID — skip the row
+          failedRows.push({ customerName, branch, loanAccountNo, reason: "Missing Customer ID" });
         } else {
           validRows.push({ ...entry, customerId, aadhaar });
         }
@@ -3983,13 +3867,7 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
 
       rows.forEach(parseRow);
 
-      // If CSB candidates found, show modal for approval
-      if (csbRows.length > 0) {
-        setPendingBulkImport({ validRows, csbRows, groupODRows, failedRows });
-      } else {
-        // No CSB rows — finalize directly
-        finalizeBulkIndivImport(validRows, [], false, groupODRows, failedRows);
-      }
+      finalizeBulkIndivImport(validRows, groupODRows, failedRows);
     };
     reader.readAsText(file);
     e.target.value = "";
@@ -4203,16 +4081,6 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
             </div>
           </div>
         </div>
-      )}
-
-      {pendingBulkImport && (
-        <CSBApprovalModal
-          candidates={pendingBulkImport.csbRows}
-          groupODRows={pendingBulkImport.groupODRows}
-          failedRows={pendingBulkImport.failedRows}
-          onConfirm={() => finalizeBulkIndivImport(pendingBulkImport.validRows, pendingBulkImport.csbRows, true, pendingBulkImport.groupODRows, pendingBulkImport.failedRows)}
-          onReject={() => finalizeBulkIndivImport(pendingBulkImport.validRows, pendingBulkImport.csbRows, false, pendingBulkImport.groupODRows, [...pendingBulkImport.failedRows, ...pendingBulkImport.csbRows.map(r => ({ ...r, reason: "CSB Bank — rejected by user" }))])}
-        />
       )}
 
       {pendingDuplicates && (
