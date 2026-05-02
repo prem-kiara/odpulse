@@ -9,7 +9,6 @@ const iconv = require("iconv-lite");
 
 const db = require("./db");
 const { ingestPool, ingestAccrued, ingestOverdue, ingestCollections, ingestClientPeriod, ingestForeclosure, purgeOldSnapshots, rollupMonthlySnapshots } = require("./ingest");
-const { createBackupZip, saveBackupLocally, listLocalBackups, restoreFromBuffer } = require("./backup");
 
 const app = express();
 const PORT = 3001;
@@ -2577,12 +2576,36 @@ function calcInterestTillDate(record) {
   };
 }
 
+// Derive a DPD bucket from a numeric day count. Mirror of dpdClassFromDays
+// on the frontend — they MUST agree, otherwise the bucket counts shown in
+// the UI will disagree with the server-computed defaulter sums (which
+// drives Total Default Due and Group OD per Member).
+function deriveDPDClass(days) {
+  const d = Number(days) || 0;
+  if (d <= 0)  return "Regular";
+  if (d <= 30) return "SMA-0";
+  if (d <= 60) return "SMA-1";
+  if (d <= 90) return "SMA-2";
+  return "NPA";
+}
+
 function poolAggregates(members) {
   const CLOSED_S   = ["Closed", "Written Off"];
   const DELINQ_DPD = ["SMA-0", "SMA-1", "SMA-2", "NPA"];
+  // Effective DPD class for a record — same rule as the frontend:
+  // pick whichever number is larger between customer DPD and overdueDays,
+  // then bucket. Falls back to the raw classification only if both
+  // numeric fields are zero, so we don't lose info from snapshots that
+  // had a class but no day count.
+  const effectiveClass = (r) => {
+    if (CLOSED_S.includes(r.loanStatus)) return "";
+    const eff = Math.max(Number(r.customerDPD) || 0, Number(r.overdueDays) || 0);
+    if (eff > 0) return deriveDPDClass(eff);
+    return r.customerDPDClass || "Regular";
+  };
   const closedCount     = members.filter(r => CLOSED_S.includes(r.loanStatus)).length;
-  const delinquentCount = members.filter(r => !CLOSED_S.includes(r.loanStatus) && DELINQ_DPD.includes(r.customerDPDClass)).length;
-  const activeCount     = members.filter(r => !CLOSED_S.includes(r.loanStatus) && !DELINQ_DPD.includes(r.customerDPDClass)).length;
+  const delinquentCount = members.filter(r => !CLOSED_S.includes(r.loanStatus) && DELINQ_DPD.includes(effectiveClass(r))).length;
+  const activeCount     = members.filter(r => !CLOSED_S.includes(r.loanStatus) && !DELINQ_DPD.includes(effectiveClass(r))).length;
   const nonClosed       = members.filter(r => !CLOSED_S.includes(r.loanStatus));
   const totalPrincipalOverdue = members.reduce((s, r) => s + r.principalOverdue, 0);
   const totalInterestOverdue  = members.reduce((s, r) => s + r.interestOverdueTillDate, 0);
@@ -2594,8 +2617,14 @@ function poolAggregates(members) {
   // This is a calculated/display value; it is not persisted to the DB.
   // Eligibility to actually pay (i.e. clickable in UI) is restricted to
   // closed members; other members see the share but cannot record it.
+  // Defaulter detection uses effectiveClass (derived from DPD numbers)
+  // rather than the raw customerDPDClass text — this matches the
+  // frontend's bucket display and prevents the case where the UI shows
+  // NPA = 4 but defaulterCount = 0 because the snapshot's DPD class
+  // field was empty / set to "Regular" while the actual DPD numbers
+  // were >90 days.
   const defaulterMembers = members.filter(r =>
-    !CLOSED_S.includes(r.loanStatus) && DELINQ_DPD.includes(r.customerDPDClass)
+    !CLOSED_S.includes(r.loanStatus) && DELINQ_DPD.includes(effectiveClass(r))
   );
   const totalDefaultDue = defaulterMembers.reduce((s, r) => s + (r.arrearAmountTillDate || 0), 0);
   // Edge case: empty group → 0. Otherwise divide by total member count.
@@ -2877,97 +2906,6 @@ app.get("/api/pool/search", (req, res) => {
   }
 });
 
-// ── Backup & Restore ─────────────────────────────────────────────────────────
-
-const backupUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 500 * 1024 * 1024 } });
-
-// GET /api/admin/backup/download — stream a fresh backup ZIP to the browser
-app.get("/api/admin/backup/download", (req, res) => {
-  try {
-    const { zip, tag, metadata } = createBackupZip();
-    // Also save a local copy automatically
-    try { saveBackupLocally(zip, tag); } catch (_) {}
-    const buf = zip.toBuffer();
-    const filename = `odpulse-backup-${tag}.zip`;
-    res.setHeader("Content-Type", "application/zip");
-    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
-    res.setHeader("Content-Length", buf.length);
-    res.setHeader("X-Backup-Files", metadata.fileCount);
-    res.send(buf);
-    console.log(`[Backup] Manual download: ${filename} (${(buf.length / 1048576).toFixed(2)} MB)`);
-  } catch (e) {
-    console.error("[Backup] Download error:", e);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// GET /api/admin/backup/list — list locally saved backups
-app.get("/api/admin/backup/list", (req, res) => {
-  try {
-    res.json({ ok: true, backups: listLocalBackups() });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// GET /api/admin/backup/download/:filename — download a specific saved backup
-app.get("/api/admin/backup/download/:filename", (req, res) => {
-  try {
-    const { filename } = req.params;
-    if (!filename.startsWith("odpulse-backup-") || !filename.endsWith(".zip"))
-      return res.status(400).json({ ok: false, error: "Invalid filename" });
-    const filepath = require("path").join(__dirname, "backups", filename);
-    if (!require("fs").existsSync(filepath))
-      return res.status(404).json({ ok: false, error: "Backup not found" });
-    res.download(filepath, filename);
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// DELETE /api/admin/backup/:filename — delete a saved backup
-app.delete("/api/admin/backup/:filename", (req, res) => {
-  try {
-    const { filename } = req.params;
-    if (!filename.startsWith("odpulse-backup-") || !filename.endsWith(".zip"))
-      return res.status(400).json({ ok: false, error: "Invalid filename" });
-    const filepath = require("path").join(__dirname, "backups", filename);
-    if (require("fs").existsSync(filepath)) require("fs").unlinkSync(filepath);
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// POST /api/admin/backup/restore — upload a ZIP and restore
-app.post("/api/admin/backup/restore", backupUpload.single("backup"), (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ ok: false, error: "No file uploaded" });
-    const { metadata, restored, errors } = restoreFromBuffer(req.file.buffer);
-    console.log(`[Backup] Restore completed — ${restored.length} files restored`);
-    if (errors.length) console.warn("[Backup] Restore errors:", errors);
-    res.json({ ok: true, metadata, restored, errors,
-      message: errors.length
-        ? `Restored ${restored.length} files with ${errors.length} error(s). Please restart the server.`
-        : `Successfully restored ${restored.length} files. Please restart the server to apply database changes.`
-    });
-  } catch (e) {
-    console.error("[Backup] Restore error:", e);
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// POST /api/admin/backup/save-now — create and save a local backup immediately
-app.post("/api/admin/backup/save-now", (req, res) => {
-  try {
-    const { zip, tag, metadata } = createBackupZip();
-    const filename = saveBackupLocally(zip, tag);
-    res.json({ ok: true, filename, metadata });
-  } catch (e) {
-    res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
 // ── Generic CRUD (wildcard — must be LAST) ──
 
 // GET /api/:collection
@@ -3190,17 +3128,6 @@ cron.schedule("0 3 * * *", () => {
   }
   const r = purgeOldSnapshots(RETENTION_DAYS);
   console.log(`[RETENTION] Purged snapshots older than ${RETENTION_DAYS} days:`, r);
-});
-
-// ─── Schedule: Auto-backup at 2:00 AM daily ──────────────────────────────────
-cron.schedule("0 2 * * *", () => {
-  try {
-    const { zip, tag } = createBackupZip();
-    const filename = saveBackupLocally(zip, tag);
-    console.log(`[Backup] Auto-backup saved: ${filename}`);
-  } catch (e) {
-    console.error("[Backup] Auto-backup failed:", e.message);
-  }
 });
 
 // Also run on server start (catches up after restarts)

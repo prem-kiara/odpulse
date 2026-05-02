@@ -15,10 +15,10 @@ server/data/*.sqlite
 server/data/*.sqlite-wal
 server/data/*.sqlite-shm
 server/data/*.sqlite-journal
-# server/data/users.json  # commented 2026-04-30: now committed to repo
-# server/data/entries.json  # commented 2026-04-30: now committed to repo
-# server/data/notifications.json  # commented 2026-04-30: now committed to repo
-# server/data/config.json  # commented 2026-04-30: now committed to repo
+server/data/users.json
+server/data/entries.json
+server/data/notifications.json
+server/data/config.json
 server/data/audit-log.json
 server/uploads/
 
@@ -31,7 +31,7 @@ failed-entries-to-fix.xlsx
 .env.*
 !.env.example
 
-# debug / accidental commits guard (added 2026-04-30)
+# debug / accidental commits guard (preserved from prior main hardening 2026-04-30)
 .fuse_hidden*
 *.head
 test_write.txt

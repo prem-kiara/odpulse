@@ -6,7 +6,6 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "adm-zip": "^0.5.17",
     "better-sqlite3": "^12.9.0",
     "cors": "^2.8.5",
     "csv-parse": "^5.5.6",
