@@ -153,9 +153,12 @@ function ingestPool(fileContent, opts) {
       updated_at=excluded.updated_at
   `);
 
-  // ON CONFLICT DO UPDATE keeps the same PK but avoids REPLACE's delete+insert
-  // behaviour (which churns rowids and fires delete-triggers).
-  const upsertSnap = db.prepare(`
+  // INSERT-ONLY semantics (idempotent): if a (snapshot_date, loan_account_no)
+  // row already exists, leave it untouched. Re-uploading the same file is a
+  // no-op for snapshots. To fix a bad row, delete it manually first, then
+  // re-upload. (The customers table above still upserts so contact info /
+  // branch changes propagate from re-uploads — that's intentional.)
+  const insertSnap = db.prepare(`
     INSERT INTO pool_snapshots
       (snapshot_date, loan_account_no, branch, principal_outstanding, interest_outstanding, principal_overdue,
        interest_overdue, current_od, overdue_days, installments_paid, loan_status, account_dpd_classification,
@@ -164,13 +167,7 @@ function ingestPool(fileContent, opts) {
       (@snapshot_date, @loan_account_no, @branch, @principal_outstanding, @interest_outstanding, @principal_overdue,
        @interest_overdue, @current_od, @overdue_days, @installments_paid, @loan_status, @account_dpd_classification,
        @customer_dpd, @customer_dpd_classification, @last_payment_amount, @total_interest_collected)
-    ON CONFLICT(snapshot_date, loan_account_no) DO UPDATE SET
-      branch=excluded.branch, principal_outstanding=excluded.principal_outstanding, interest_outstanding=excluded.interest_outstanding,
-      principal_overdue=excluded.principal_overdue, interest_overdue=excluded.interest_overdue, current_od=excluded.current_od,
-      overdue_days=excluded.overdue_days, installments_paid=excluded.installments_paid, loan_status=excluded.loan_status,
-      account_dpd_classification=excluded.account_dpd_classification, customer_dpd=excluded.customer_dpd,
-      customer_dpd_classification=excluded.customer_dpd_classification, last_payment_amount=excluded.last_payment_amount,
-      total_interest_collected=excluded.total_interest_collected
+    ON CONFLICT(snapshot_date, loan_account_no) DO NOTHING
   `);
 
   const now = new Date().toISOString();
@@ -184,7 +181,7 @@ function ingestPool(fileContent, opts) {
   const lpKey = rows.length ? lastPaymentKey(rows[0]) : "Last Payment Date";
 
   const txn = db.transaction((rs) => {
-    let count = 0;
+    let total = 0, inserted = 0, skipped = 0;
     for (const r of rs) {
       const loan = str(r["Loan number"]);
       if (!loan) continue;
@@ -240,7 +237,7 @@ function ingestPool(fileContent, opts) {
         updated_at: now,
       });
 
-      upsertSnap.run({
+      const info = insertSnap.run({
         snapshot_date: snapshotDate,
         loan_account_no: loan,
         branch,
@@ -259,12 +256,13 @@ function ingestPool(fileContent, opts) {
         total_interest_collected: num(r["Total Interest Collected"]),
       });
 
-      count++;
+      total++;
+      if (info.changes > 0) inserted++; else skipped++;
     }
-    return count;
+    return { total, inserted, skipped };
   });
 
-  const rowCount = txn(rows);
+  const { total: rowCount, inserted: rowsInserted, skipped: rowsSkipped } = txn(rows);
 
   // Flush branches AFTER the DB commit so the file and DB stay consistent
   // even if the transaction rolls back mid-way.
@@ -283,10 +281,10 @@ function ingestPool(fileContent, opts) {
   db.prepare(
     `INSERT INTO upload_log (kind, filename, snapshot_date, row_count, new_branches, uploaded_by, uploaded_at)
      VALUES (?,?,?,?,?,?,?)`
-  ).run("pool", filename, snapshotDate, rowCount, newBranches, uploadedBy, now);
+  ).run("pool", filename, snapshotDate, rowsInserted, newBranches, uploadedBy, now);
 
   checkpoint();
-  return { rowCount, newBranches };
+  return { rowCount, rowsInserted, rowsSkipped, newBranches };
 }
 
 // ── Foreclosure report ingestion ──────────────────────────────────────────
@@ -400,7 +398,8 @@ function ingestForeclosure(fileContent, opts) {
       updated_at=excluded.updated_at
   `);
 
-  const upsertSnap = db.prepare(`
+  // INSERT-ONLY semantics (idempotent): see pool ingest comment above.
+  const insertSnap = db.prepare(`
     INSERT INTO foreclosure_snapshots
       (snapshot_date, loan_account_no, branch_name, branch_code, center,
        customer_number, customer_name, product_name, loan_amount, cycle_number,
@@ -413,22 +412,13 @@ function ingestForeclosure(fileContent, opts) {
        @disbursement_date, @maturity_date, @closed_date, @closure_reason, @closure_type,
        @interest_collected, @total_interest_collected, @closing_principal, @penalty_collected,
        @funder, @funding_source, @user_name, @employee_name, @employee_number, @remarks)
-    ON CONFLICT(snapshot_date, loan_account_no) DO UPDATE SET
-      branch_name=excluded.branch_name, branch_code=excluded.branch_code, center=excluded.center,
-      customer_number=excluded.customer_number, customer_name=excluded.customer_name,
-      product_name=excluded.product_name, loan_amount=excluded.loan_amount, cycle_number=excluded.cycle_number,
-      disbursement_date=excluded.disbursement_date, maturity_date=excluded.maturity_date,
-      closed_date=excluded.closed_date, closure_reason=excluded.closure_reason, closure_type=excluded.closure_type,
-      interest_collected=excluded.interest_collected, total_interest_collected=excluded.total_interest_collected,
-      closing_principal=excluded.closing_principal, penalty_collected=excluded.penalty_collected,
-      funder=excluded.funder, funding_source=excluded.funding_source, user_name=excluded.user_name,
-      employee_name=excluded.employee_name, employee_number=excluded.employee_number, remarks=excluded.remarks
+    ON CONFLICT(snapshot_date, loan_account_no) DO NOTHING
   `);
 
   const now = new Date().toISOString();
 
   const txn = db.transaction((rs) => {
-    let count = 0;
+    let total = 0, inserted = 0, skipped = 0;
     for (const r of rs) {
       const loan = fcStr(r["ACCOUNT NUMBER"]);
       if (!loan) continue;
@@ -465,7 +455,7 @@ function ingestForeclosure(fileContent, opts) {
         updated_at: now,
       });
 
-      upsertSnap.run({
+      const info = insertSnap.run({
         snapshot_date: snapshotDate,
         loan_account_no: loan,
         branch_name: branch,
@@ -493,12 +483,13 @@ function ingestForeclosure(fileContent, opts) {
         remarks: fcStr(r["REMARKS"]),
       });
 
-      count++;
+      total++;
+      if (info.changes > 0) inserted++; else skipped++;
     }
-    return count;
+    return { total, inserted, skipped };
   });
 
-  const rowCount = txn(rows);
+  const { total: rowCount, inserted: rowsInserted, skipped: rowsSkipped } = txn(rows);
 
   let newBranches = 0;
   if (pendingBranches.length) {
@@ -514,10 +505,10 @@ function ingestForeclosure(fileContent, opts) {
   db.prepare(
     `INSERT INTO upload_log (kind, filename, snapshot_date, row_count, new_branches, uploaded_by, uploaded_at)
      VALUES (?,?,?,?,?,?,?)`
-  ).run("foreclosure", filename, snapshotDate, rowCount, newBranches, uploadedBy, now);
+  ).run("foreclosure", filename, snapshotDate, rowsInserted, newBranches, uploadedBy, now);
 
   checkpoint();
-  return { rowCount, newBranches };
+  return { rowCount, rowsInserted, rowsSkipped, newBranches };
 }
 
 // ── Accrued report ingestion ───────────────────────────────────────────────
@@ -554,7 +545,7 @@ function ingestAccrued(fileContent, opts) {
   }
 
   if (rows.length === 0) {
-    return { rowCount: 0, newBranches: 0, currentAccruedColumn: null };
+    return { rowCount: 0, rowsInserted: 0, rowsSkipped: 0, newBranches: 0, currentAccruedColumn: null };
   }
 
   const missing = missingColumns(rows[0], ACCRUED_REQUIRED_COLS);
@@ -590,23 +581,21 @@ function ingestAccrued(fileContent, opts) {
   const branchRegistry = new Set(existingBranches.map(b => String(b).toLowerCase()));
   const pendingBranches = [];
 
-  const upsertAccrued = db.prepare(`
+  // INSERT-ONLY semantics (idempotent): see pool ingest comment above.
+  const insertAccrued = db.prepare(`
     INSERT INTO accrued_snapshots
       (snapshot_date, loan_account_no, branch, principal_outstanding, accrued_interest, accrued_interest_prev,
        last_installment_date, last_paid_date)
     VALUES
       (@snapshot_date, @loan_account_no, @branch, @principal_outstanding, @accrued_interest, @accrued_interest_prev,
        @last_installment_date, @last_paid_date)
-    ON CONFLICT(snapshot_date, loan_account_no) DO UPDATE SET
-      branch=excluded.branch, principal_outstanding=excluded.principal_outstanding,
-      accrued_interest=excluded.accrued_interest, accrued_interest_prev=excluded.accrued_interest_prev,
-      last_installment_date=excluded.last_installment_date, last_paid_date=excluded.last_paid_date
+    ON CONFLICT(snapshot_date, loan_account_no) DO NOTHING
   `);
 
   const now = new Date().toISOString();
 
   const txn = db.transaction((rs) => {
-    let count = 0;
+    let total = 0, inserted = 0, skipped = 0;
     for (const r of rs) {
       const loan = str(r["Account Number"]);
       if (!loan) continue;
@@ -619,7 +608,7 @@ function ingestAccrued(fileContent, opts) {
         }
       }
 
-      upsertAccrued.run({
+      const info = insertAccrued.run({
         snapshot_date: snapshotDate,
         loan_account_no: loan,
         branch,
@@ -629,12 +618,13 @@ function ingestAccrued(fileContent, opts) {
         last_installment_date: str(r["Last Installment Date"]),
         last_paid_date: str(r["Last Paid Date"]),
       });
-      count++;
+      total++;
+      if (info.changes > 0) inserted++; else skipped++;
     }
-    return count;
+    return { total, inserted, skipped };
   });
 
-  const rowCount = txn(rows);
+  const { total: rowCount, inserted: rowsInserted, skipped: rowsSkipped } = txn(rows);
 
   let newBranches = 0;
   if (pendingBranches.length) {
@@ -650,10 +640,10 @@ function ingestAccrued(fileContent, opts) {
   db.prepare(
     `INSERT INTO upload_log (kind, filename, snapshot_date, row_count, new_branches, uploaded_by, uploaded_at)
      VALUES (?,?,?,?,?,?,?)`
-  ).run("accrued", filename, snapshotDate, rowCount, newBranches, uploadedBy, now);
+  ).run("accrued", filename, snapshotDate, rowsInserted, newBranches, uploadedBy, now);
 
   checkpoint();
-  return { rowCount, newBranches, currentAccruedColumn: currentKey };
+  return { rowCount, rowsInserted, rowsSkipped, newBranches, currentAccruedColumn: currentKey };
 }
 
 // ── Date helpers ───────────────────────────────────────────────────────────
@@ -693,7 +683,7 @@ function ingestOverdue(fileContent, opts) {
     trim: true,
     bom: true,
   });
-  if (rows.length === 0) return { rowCount: 0, newBranches: 0 };
+  if (rows.length === 0) return { rowCount: 0, rowsInserted: 0, rowsSkipped: 0, newBranches: 0 };
 
   const branches = (() => {
     try { return JSON.parse(fs.readFileSync(branchesFile, "utf8")); } catch { return []; }
@@ -701,8 +691,10 @@ function ingestOverdue(fileContent, opts) {
   const branchRegistry = new Set(branches.map(b => b.toLowerCase()));
   let newBranches = 0;
 
-  const upsert = db.prepare(`
-    INSERT OR REPLACE INTO od_overdue (
+  // INSERT-ONLY semantics (idempotent): re-uploading the same file is a no-op.
+  // To fix a bad row, delete it manually first, then re-upload.
+  const insert = db.prepare(`
+    INSERT OR IGNORE INTO od_overdue (
       snapshot_date, loan_account_no, customer_number, customer_name, telephone, guarantor_name,
       branch_name, branch_code, officer_name, officer_code, center_name, center_code, group_name,
       date_of_birth, religious_group, caste, locale, state, product, loan_amount, loan_cycle,
@@ -729,7 +721,7 @@ function ingestOverdue(fileContent, opts) {
 
   const now = new Date().toISOString();
   const txn = db.transaction((rs) => {
-    let count = 0;
+    let total = 0, inserted = 0, skipped = 0;
     for (const r of rs) {
       const loan = str(r["Account Number"]);
       if (!loan) continue;
@@ -738,7 +730,7 @@ function ingestOverdue(fileContent, opts) {
         addBranchIfMissing(branchesFile, branch, branchRegistry);
         newBranches++;
       }
-      upsert.run({
+      const info = insert.run({
         snapshot_date: snapshotDate,
         loan_account_no: loan,
         customer_number: str(r["Customer Number"]),
@@ -790,17 +782,18 @@ function ingestOverdue(fileContent, opts) {
         first_npa_date: toIsoDate(r["First NPA Date"]),
         current_npa_date: toIsoDate(r["Current NPA Date"]),
       });
-      count++;
+      total++;
+      if (info.changes > 0) inserted++; else skipped++;
     }
-    return count;
+    return { total, inserted, skipped };
   });
 
-  const rowCount = txn(rows);
+  const { total: rowCount, inserted: rowsInserted, skipped: rowsSkipped } = txn(rows);
   db.prepare(
     `INSERT INTO upload_log (kind, filename, snapshot_date, row_count, new_branches, uploaded_by, uploaded_at)
      VALUES (?,?,?,?,?,?,?)`
-  ).run("overdue", filename, snapshotDate, rowCount, newBranches, uploadedBy, now);
-  return { rowCount, newBranches };
+  ).run("overdue", filename, snapshotDate, rowsInserted, newBranches, uploadedBy, now);
+  return { rowCount, rowsInserted, rowsSkipped, newBranches };
 }
 
 // ── Collection report (transactional ledger) ───────────────────────────────
@@ -917,7 +910,7 @@ function ingestClientPeriod(fileContent, opts) {
     trim: true,
     bom: true,
   });
-  if (rows.length === 0) return { rowCount: 0, newBranches: 0 };
+  if (rows.length === 0) return { rowCount: 0, rowsInserted: 0, rowsSkipped: 0, newBranches: 0 };
 
   // Discover the 3 "Principal Outstanding (dd-mm-yyyy)" snapshot columns, then
   // sort by embedded date so we can assign start/mid/end consistently.
@@ -939,8 +932,10 @@ function ingestClientPeriod(fileContent, opts) {
   const branchRegistry = new Set(branches.map(b => b.toLowerCase()));
   let newBranches = 0;
 
-  const upsert = db.prepare(`
-    INSERT OR REPLACE INTO od_client_period (
+  // INSERT-ONLY semantics (idempotent): re-uploading the same period is a no-op.
+  // To fix a bad row, delete it manually first, then re-upload.
+  const insert = db.prepare(`
+    INSERT OR IGNORE INTO od_client_period (
       period_start, period_end, loan_account_no, customer_number, customer_name,
       branch_name, branch_code, center_name, center_code, officer_name, officer_code,
       product_name, account_status, disbursement_date, closing_date, installments_remaining,
@@ -965,7 +960,7 @@ function ingestClientPeriod(fileContent, opts) {
 
   const now = new Date().toISOString();
   const txn = db.transaction((rs) => {
-    let count = 0;
+    let total = 0, inserted = 0, skipped = 0;
     for (const r of rs) {
       const loan = str(r["ACCOUNT NUMBER"]);
       if (!loan) continue;
@@ -974,7 +969,7 @@ function ingestClientPeriod(fileContent, opts) {
         addBranchIfMissing(branchesFile, branch, branchRegistry);
         newBranches++;
       }
-      upsert.run({
+      const info = insert.run({
         period_start: periodStart,
         period_end: periodEnd,
         loan_account_no: loan,
@@ -1015,17 +1010,18 @@ function ingestClientPeriod(fileContent, opts) {
         funder_name: str(r["FUNDER NAME"]),
         fund_source_name: str(r["FUND SOURCE NAME"]),
       });
-      count++;
+      total++;
+      if (info.changes > 0) inserted++; else skipped++;
     }
-    return count;
+    return { total, inserted, skipped };
   });
 
-  const rowCount = txn(rows);
+  const { total: rowCount, inserted: rowsInserted, skipped: rowsSkipped } = txn(rows);
   db.prepare(
     `INSERT INTO upload_log (kind, filename, snapshot_date, row_count, new_branches, uploaded_by, uploaded_at)
      VALUES (?,?,?,?,?,?,?)`
-  ).run("client_period", filename, periodEnd, rowCount, newBranches, uploadedBy, now);
-  return { rowCount, newBranches, principalCols: principalCols.length };
+  ).run("client_period", filename, periodEnd, rowsInserted, newBranches, uploadedBy, now);
+  return { rowCount, rowsInserted, rowsSkipped, newBranches, principalCols: principalCols.length };
 }
 
 // ── Monthly rollup (NEVER purged) ──────────────────────────────────────────

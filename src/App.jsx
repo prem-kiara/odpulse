@@ -3665,7 +3665,13 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
   };
 
   const resetAllData = () => {
-    if (!confirm("This will delete ALL entries and notifications. Users and branches will be kept. Are you sure?")) return;
+    if (!confirm(
+      "This will DELETE all repayment entries and notifications.\n\n" +
+      "PRESERVED (not touched):\n" +
+      "  • Users and branches\n" +
+      "  • All OD Insights data — pool, overdue, accrued, foreclosure, collections, client-period reports + customer master\n\n" +
+      "Are you sure?"
+    )) return;
     if (!confirm("This action cannot be undone. Proceed?")) return;
     setEntries([]); saveData(STORAGE_KEYS.entries, []);
     setNotifications([]); saveData(STORAGE_KEYS.notifications, []);

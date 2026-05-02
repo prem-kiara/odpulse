@@ -649,6 +649,12 @@ export function DataUploadPage({ user, canUpload }) {
       let summary = `${kind} uploaded: `;
       if (kind === "collections") {
         summary += `${json.rowsInserted} new receipts, ${json.rowsSkipped} duplicates skipped`;
+      } else if (typeof json.rowsInserted === "number") {
+        // Idempotent insert mode: snapshot tables only add brand-new (date+loan)
+        // rows. Re-uploading the same file is a no-op. Surface both numbers so
+        // operators can see what actually changed.
+        summary += `${json.rowsInserted} new rows added`;
+        if (json.rowsSkipped > 0) summary += `, ${json.rowsSkipped} already existed (skipped)`;
       } else {
         summary += `${json.rowCount} rows`;
       }

@@ -480,7 +480,7 @@ app.post("/api/od/pool/upload", requireUploader, uploadField("file"), (req, res)
     const result = ingestPool(text, {
       snapshotDate, branchesFile: BRANCHES_FILE, uploadedBy, filename: req.file.originalname,
     });
-    console.log(`[POOL UPLOAD] done in ${Date.now()-t0}ms — ${result.rowCount} rows, ${result.newBranches} new branches`);
+    console.log(`[POOL UPLOAD] done in ${Date.now()-t0}ms — ${result.rowsInserted} inserted, ${result.rowsSkipped} already existed, ${result.newBranches} new branches`);
     res.json({ ok: true, snapshotDate, ...result });
   } catch (err) {
     console.error("[POOL UPLOAD] error:", err);
@@ -510,7 +510,7 @@ app.post("/api/od/foreclosure/upload", requireUploader, uploadField("file"), (re
     const result = ingestForeclosure(text, {
       snapshotDate, branchesFile: BRANCHES_FILE, uploadedBy, filename: req.file.originalname,
     });
-    console.log(`[FORECLOSURE UPLOAD] done in ${Date.now()-t0}ms — ${result.rowCount} rows, ${result.newBranches} new branches`);
+    console.log(`[FORECLOSURE UPLOAD] done in ${Date.now()-t0}ms — ${result.rowsInserted} inserted, ${result.rowsSkipped} already existed, ${result.newBranches} new branches`);
     res.json({ ok: true, snapshotDate, ...result });
   } catch (err) {
     console.error("[FORECLOSURE UPLOAD] error:", err);
@@ -538,7 +538,7 @@ app.post("/api/od/accrued/upload", requireUploader, uploadField("file"), (req, r
     const result = ingestAccrued(text, {
       snapshotDate, branchesFile: BRANCHES_FILE, uploadedBy, filename: req.file.originalname,
     });
-    console.log(`[ACCRUED UPLOAD] done in ${Date.now()-t0}ms — ${result.rowCount} rows, col=${result.currentAccruedColumn}`);
+    console.log(`[ACCRUED UPLOAD] done in ${Date.now()-t0}ms — ${result.rowsInserted} inserted, ${result.rowsSkipped} already existed, col=${result.currentAccruedColumn}`);
     res.json({ ok: true, snapshotDate, ...result });
   } catch (err) {
     console.error("[ACCRUED UPLOAD] error:", err);
@@ -569,7 +569,7 @@ app.post("/api/od/overdue/upload", requireUploader, uploadField("file"), (req, r
     const result = ingestOverdue(text, {
       snapshotDate, branchesFile: BRANCHES_FILE, uploadedBy, filename: req.file.originalname,
     });
-    console.log(`[OVERDUE UPLOAD] done in ${Date.now()-t0}ms — ${result.rowCount} rows, ${result.newBranches} new branches`);
+    console.log(`[OVERDUE UPLOAD] done in ${Date.now()-t0}ms — ${result.rowsInserted} inserted, ${result.rowsSkipped} already existed, ${result.newBranches} new branches`);
     res.json({ ok: true, snapshotDate, ...result });
   } catch (err) {
     console.error("[OVERDUE UPLOAD] error:", err);
@@ -679,7 +679,7 @@ app.post("/api/od/client-period/upload", requireUploader, uploadField("file"), (
     const result = ingestClientPeriod(text, {
       periodStart, periodEnd, branchesFile: BRANCHES_FILE, uploadedBy, filename: req.file.originalname,
     });
-    console.log(`[CLIENT-PERIOD UPLOAD] done in ${Date.now()-t0}ms — ${result.rowCount} rows, ${result.principalCols} PO snapshot cols`);
+    console.log(`[CLIENT-PERIOD UPLOAD] done in ${Date.now()-t0}ms — ${result.rowsInserted} inserted, ${result.rowsSkipped} already existed, ${result.principalCols} PO snapshot cols`);
     res.json({ ok: true, periodStart, periodEnd, periodSource: periodSource || "user-or-filename", ...result });
   } catch (err) {
     console.error("[CLIENT-PERIOD UPLOAD] error:", err);
