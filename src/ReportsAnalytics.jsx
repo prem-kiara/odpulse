@@ -149,6 +149,238 @@ function SortHeader({ children, sortKey, currentKey, currentDir, onSort, align =
 
 const PIE_COLORS = ["#0d9488", "#6366f1", "#f59e0b", "#ef4444", "#10b981", "#8b5cf6", "#ec4899", "#14b8a6", "#f43f5e", "#84cc16"];
 
+// ─── Group Loan product grouping (UI-only) ─────────────────────────────────
+// Roll up 250+ raw product codes into 4 user-facing groups. Active ONLY when
+// categoryFilter === "group". Backend API contracts stay unchanged: when the
+// user picks a group, we skip the `product=` query param and filter the
+// returned `recent` array client-side. KPI tiles continue to reflect the
+// API response (server-aggregated) — accepted limitation per spec.
+const GROUP_LOAN_PRODUCT_MAP = {
+  "OLD-JLG": [
+    // Originally-listed codes
+    "15K_FN_27_23", "20K_F_23_1Y", "20K_FN_27_24", "20K_FN_28_24_WI",
+    "25K_F_23_1Y", "25K_FN_27_25", "25K_FN_28_25",
+    "30K_F_19.7_1Y", "30K_F_23_1Y", "30K_FN_26_26", "30K_FN_26_26_JV",
+    "30K_FN_27_25", "30K_FN_28_25", "30K_FN_28_25_JV", "30K_FN_28_25_WI",
+    "30K_M_23_1Y", "30K_MDT_28_15WI", "30K_MDT_28_18WI", "30K_MDY_28_15",
+    "30K_MNDT_27_15", "30K_MNDT_28_15", "30K_MNDT_28_18", "30K_MNDT_28_24",
+    "35K_MNDT_27_17", "35K_MNDT_28_17",
+    "40K_FN_26_30_PK", "40K_FN_27_30", "40K_FN_28_30", "40K_FN_28_30_WI",
+    "40K_FN_28_30_JV", "40K_MNDT_26_24", "40K_MNDT_27_18", "40K_MNDT_28_18",
+    "40K_MNDT_28_24", "40K_MNDY_28_24", "40K_MN_28_24(KCPL)",
+    "45K_MNDT_27_18",
+    "50K_FN_26_35_PK", "50K_FN_27_36", "50K_FN_28_36", "50K_FN_28_36_WI",
+    "50K_MD_26_18_PK", "50K_MDY_28_20WI", "50K_MNDT_26_24", "50K_MNDT_27_20",
+    "50K_MNDT_28_20", "50K_MNDT_28_24", "50K_MNDY_26_17", "50K_MNDY_27_20",
+    "50K_MNDY_28_20", "50K_MNDY_28_24", "50K_MN_27_24(KCPL)",
+    "60K_FN_27_37", "60K_FN_27_37_AN", "60K_FN_28_37", "60K_FN_28_37_WI",
+    "60K_MDY_28_22WI", "60K_MNDT_27_22", "60K_MNDT_28_22", "60K_MNDT_28_24",
+    "60K_MNDY_27_20", "60K_MNDY_27_AN", "60K_MNDY_28_22", "60K_MNDY_28_24",
+    "70K_MNDT_28_24", "70K_MNMS_28_24",
+    // ── Added 2026-05 from check_other_bucket.mjs report (older-format
+    //    Group products that were falling into "Other"). All have the
+    //    same K-prefix + interest/tenure pattern as the codes above.
+    "5K_M_0_1Y",
+    "10K_F_23_1Y",
+    "15K_F_23_1Y_MG", "15K_F_26_25",
+    "20K_F_19.7_1Y", "20K_F_26_26", "20K_Func_Loan", "20K_MN_23_1Y", "20K_MNDT_27_12",
+    "25K_F_19.7_1Y", "25K_F_26_26",
+    "30K_F_19.86_1Y", "30K_F_26_26",
+    "30K_FN_26_26_PK",
+    "30K_M_19.7_1Y", "30K_M_19.86_1Y", "30K_M_26_12",
+    "30K_MDY_28_18", "30K_MNDY_26_12", "30K_MNDY_28_24",
+    "35K_FN_27_28",
+    "36K_M_2Y",
+    "40K_F_19.7_2Y", "40K_F_26_30",
+    "40K_MNDY_26_15", "40K_MNDY_27_18", "40K_MNDY_28_18",
+    "45K_FN_27_33", "45K_M_23_2Y", "45K_MNDT_28_18",
+    "54K_M_23_2Y",
+    "55K_MNDT_27_21", "55K_MNDT_28_21",
+    // ── Folded into OLD-JLG (per spec: keep only the original 4 buckets).
+    //    These were briefly split into ML-MN / RE / RS sub-buckets but
+    //    rolled back into OLD-JLG so the dropdown stays at the original
+    //    4 categories. Underlying product_name on each row is preserved
+    //    — this is purely a UI-side rollup.
+    // ── ML_MN family (Micro-Loan Monthly + IND variants) ─────────────
+    "ML_MN_1K_27_1", "ML_MN_2K_27_2", "ML_MN_3K_27_3", "ML_MN_4K_27_4",
+    "ML_MN_5K_27_5", "ML_MN_6K_27_5", "ML_MN_7K_27_6", "ML_MN_8K_27_7",
+    "ML_MN_9K_27_8", "ML_MN_10K_27_8", "ML_MN_11K_27_9", "ML_MN_12K_27_9",
+    "ML_MN_13K_27_10", "ML_MN_14K_27_10", "ML_MN_15K_27_10",
+    "ML_MN_16K_27_11", "ML_MN_17K_27_11", "ML_MN_18K_27_11",
+    "ML_MN_19K_27_11", "ML_MN_20K_27_11", "ML_MN_21K_27_11",
+    "ML_MN_22K_27_11", "ML_MN_23K_27_12", "ML_MN_24K_27_12",
+    "ML_MN_25K_27_12", "ML_MN_26K_27_12", "ML_MN_27K_27_13",
+    "ML_MN_28K_27_13", "ML_MN_29K_27_13", "ML_MN_29K_27_14",
+    "ML_MN_30K_27_13", "ML_MN_30K_27_15", "ML_MN_31K_27_13",
+    "ML_MN_31K_27_15", "ML_MN_32K_27_13", "ML_MN_32K_27_15",
+    "ML_MN_33K_27_13", "ML_MN_33K_27_15", "ML_MN_34K_27_13",
+    "ML_MN_34K_27_15", "ML_MN_35K_27_14", "ML_MN_35K_27_15",
+    "ML_MN_36K_27_14", "ML_MN_36K_27_16", "ML_MN_37K_27_14",
+    "ML_MN_37K_27_16", "ML_MN_38K_27_15", "ML_MN_38K_27_16",
+    "ML_MN_39K_27_15", "ML_MN_39K_27_17", "ML_MN_40K_27_15",
+    "ML_MN_40K_27_17", "ML_MN_41K_27_16", "ML_MN_41K_27_18",
+    "ML_MN_42K_27_16", "ML_MN_42K_27_18", "ML_MN_43K_27_16",
+    "ML_MN_43K_27_18", "ML_MN_44K_27_17", "ML_MN_44K_27_19",
+    "ML_MN_45K_27_17", "ML_MN_45K_27_19", "ML_MN_46K_27_17",
+    "ML_MN_46K_27_19", "ML_MN_47K_27_17", "ML_MN_47K_27_19",
+    "ML_MN_48K_27_17", "ML_MN_48K_27_20", "ML_MN_49K_27_17",
+    "ML_MN_49K_27_19", "ML_MN_50K_27_17", "ML_MN_50K_27_20",
+    "ML_MN_51K_27_18", "ML_MN_51K_27_20", "ML_MN_52K_27_18",
+    "ML_MN_52K_27_21", "ML_MN_53K_27_18", "ML_MN_53K_27_21",
+    "ML_MN_54K_27_18", "ML_MN_54K_27_21", "ML_MN_55K_27_18",
+    "ML_MN_55K_27_21", "ML_MN_56K_27_18", "ML_MN_56K_27_21",
+    "ML_MN_57K_27_18", "ML_MN_57K_27_20", "ML_MN_58K_27_18",
+    "ML_MN_58K_27_21", "ML_MN_59K_27_18", "ML_MN_59K_27_21",
+    "ML_MN_60K_27_18", "ML_MN_60K_27_21", "ML_MN_61K_27_19",
+    "ML_MN_61K_27_21", "ML_MN_62K_27_19", "ML_MN_62K_27_22",
+    "ML_MN_63K_27_19", "ML_MN_63K_27_22", "ML_MN_64K_27_19",
+    "ML_MN_64K_27_22", "ML_MN_65K_27_19", "ML_MN_65K_27_22",
+    "ML_MN_66K_27_20", "ML_MN_67K_27_20", "ML_MN_67K_27_23",
+    "ML_MN_68K_27_20", "ML_MN_68K_27_24", "ML_MN_69K_27_20",
+    "ML_MN_69K_27_23", "ML_MN_70K_27_24", "ML_MN_71K_27_22",
+    "ML_MN_71K_27_24", "ML_MN_72K_27_25", "ML_MN_73K_27_22",
+    "ML_MN_73K_27_26", "ML_MN_74K_27_22", "ML_MN_75K_27_26",
+    "ML_MN_76K_27_26", "ML_MN_77K_27_26", "ML_MN_78K_27_27",
+    "ML_MN_79K_27_24", "ML_MN_79K_27_28", "ML_MN_81K_27_29",
+    "ML_MN_82K_27_24", "ML_MN_84K_27_29", "ML_MN_85K_27_29",
+    "ML_MN_1K_IND", "ML_MN_3K_IND", "ML_MN_4K_IND", "ML_MN_5K_IND",
+    "ML_MN_6K_IND", "ML_MN_7K_IND", "ML_MN_14K_IND", "ML_MN_15K_IND",
+    "ML_MD_19K_27_11",
+    // ── RE family (Recurring Weekly + Fortnightly) ───────────────────
+    "RE_WK_1K", "RE_WK_2K", "RE_WK_3K", "RE_WK_4K", "RE_WK_5K", "RE_WK_6K",
+    "RE_WK_7K", "RE_WK_8K", "RE_WK_9K", "RE_WK_10K", "RE_WK_11K", "RE_WK_12K",
+    "RE_WK_13K", "RE_WK_14K", "RE_WK_15K", "RE_WK_16K", "RE_WK_17K", "RE_WK_18K",
+    "RE_WK_19K", "RE_WK_20K", "RE_WK_21K", "RE_WK_22K", "RE_WK_23K", "RE_WK_24K",
+    "RE_WK_25K", "RE_WK_26K", "RE_WK_27K", "RE_WK_28K", "RE_WK_29K", "RE_WK_30K",
+    "RE_FN_6K_9", "RE_FN_7K_10", "RE_FN_8K_12", "RE_FN_9K_13", "RE_FN_10K_15",
+    "RE_FN_10K_15_AL", "RE_FN_11K_16", "RE_FN_12K_18", "RE_FN_13K_18",
+    "RE_FN_14K_17", "RE_FN_15K_19", "RE_FN_16K_18", "RE_FN_17K_19",
+    "RE_FN_18K_20", "RE_FN_19K_21", "RE_FN_20K_22", "RE_FN_21K_22",
+    "RE_FN_23K_22", "RE_FN_24K_22", "RE_FN_25K_22",
+    "RE_14K_FN_19.7New",
+    // ── RS family (Recurring Small Fortnightly) ──────────────────────
+    "RS_FN_2K_4", "RS_FN_3K_6", "RS_FN_4K_8", "RS_FN_5K_10", "RS_FN_6K_12",
+    "RS_FN_7K_14", "RS_FN_8K_15", "RS_FN_9K_17", "RS_FN_10K_18",
+    "RS_FN_11K_19", "RS_FN_12K_19", "RS_FN_13K_20", "RS_FN_14K_21",
+    "RS_FN_15K_21", "RS_FN_16K_22", "RS_FN_17K_22", "RS_FN_18K_23",
+    "RS_FN_19K_24", "RS_FN_22K_27", "RS_FN_23K_27", "RS_FN_28K_28",
+    "RS_FN_37K_29",
+  ],
+  "JLG": [
+    "30K_MNDT_28_15", "30K_MNDT_28_18", "30K_MNDT_28_24",
+    "40K_FN_28_30_JV", "40K_MN_28_24", "40K_MNDT_28_18", "40K_MNDT_28_24",
+    "50K_MN_27_24", "50K_MNDT_28_24",
+    "60K_MNDT_28_24", "70K_MNDT_28_24", "70K_MNMS_28_24",
+  ],
+  "VM - JLG": [
+    "JLG_20000", "JLG_25000", "JLG_25K_YRD", "JLG_28000", "JLG_30000",
+    // OTY variant
+    "JLG_30000_OTY",
+  ],
+  "VM - GOLDJLG": [
+    "CGL_1G_New", "CGL_33K", "CGL_34K", "CGL_35K", "CGL_36K",
+    "CGL_36K_26W", "CLG_35K_26W",
+    // Ooty / OTY variants
+    "CGL_41K_26-Ooty", "CGL_40K_OTY_26W", "CGL_39K_OTY_26",
+  ],
+};
+const GROUP_LOAN_GROUPS = Object.keys(GROUP_LOAN_PRODUCT_MAP);
+const PRODUCT_TO_GROUP_LOAN = (() => {
+  const m = {};
+  for (const [g, codes] of Object.entries(GROUP_LOAN_PRODUCT_MAP)) {
+    for (const c of codes) m[c] = g;
+  }
+  return m;
+})();
+const isGroupLoanGroup = (val) => GROUP_LOAN_GROUPS.includes(val);
+
+// ─── Individual Loan category grouping (UI-only) ───────────────────────────
+// Roll up 65 raw individual product codes into 12 user-facing "Category of
+// Loan" buckets (per the Individual loan product list reference CSV).
+// Active ONLY when categoryFilter === "individual". Same client-side-only
+// pattern as the Group Loan grouping above — backend untouched, no schema
+// or API changes. The values are matched against the raw product_name field
+// the API returns; product_name itself is preserved on every record so
+// internal logic that depends on it is unaffected.
+const INDIVIDUAL_LOAN_PRODUCT_MAP = {
+  "KMCL_STBL": [
+    "1.25L_IND_28_24", "1.25L_IND_30_24", "1.5L_IND_28_24",
+    "1L_IND_28_24", "1L_IND_29_24", "2L_IND1_28_24",
+    "50K_IND_28_24", "60K_IND_30_24",
+  ],
+  "KMCL_PL": [
+    "1L_IND_30_24", "60K_IND_28_24", "70K_IND_28_24", "80K_IND_28_24",
+  ],
+  "KMCL_MLAP": [
+    "10L_IND_24_84", "12L_IND_24_120", "15L_IND1_24_120", "15L_IND_24_120",
+    "1L_IND_24_84", "2.25L_IND_24_36", "25L_IND_24_120", "25L_IND_24_120_1",
+    "2L_IND_24_36", "3.5L_IND_24_120", "3.5L_IND_24_84", "3L_IND_24_24",
+    "3L_IND_24_60_3", "4.5L_IND_24_120", "4L_IND1_24_84", "4L_IND_24_36",
+    "4L_IND_24_84_2", "5L_IND_24_60", "5L_IND_24_72", "5L_IND_24_84",
+    "6.5L_IND_24_60", "6L_IND_24_84", "7L_IND_24_120", "7L_IND_24_120_2",
+    "7L_IND_24_36", "8.5L_IND_24_120", "8L_IND1_24_120", "8L_IND_24_118",
+    "8L_IND_24_60", "Loan Against Property", "M_LAP_Old_Clone",
+  ],
+  "KMCL_GL": [
+    "GOLD_18%", "GOLD_EMI_24", "GOLD_HALFYEARLY",
+    "GOLD_MONTHLY_24%", "GOLD_QUARTERLY", "GOLD_SEC",
+  ],
+  "KMCL_GPL": [
+    "Gold PL Plus", "Gold PL Plus (Interest Only)",
+    "PL_EMI", "PL_FLEXI", "PL_FLEXI_24",
+  ],
+  "GRC_GL":  ["GOLD_GRC"],
+  "GRC_GPL": ["GOLD_GRC_PLFLEXI"],
+  "SKPB_GL": ["HO_GOLD_MONTHLY", "SKPB_GOLD_MONTHLY"],
+  "VM_GL":   ["GOLD LOAN M-INT", "GOLD_MONTHLY_E"],
+  "VM_GPL":  ["Erode_PL", "PL_FLEXI_E", "PL_Others"],
+  "MIG":     ["ML_MN_8K_IND"],
+  "SSS":     ["Sowbhagyam Scheme"],
+};
+const INDIVIDUAL_LOAN_GROUPS = Object.keys(INDIVIDUAL_LOAN_PRODUCT_MAP);
+const PRODUCT_TO_INDIVIDUAL_LOAN = (() => {
+  const m = {};
+  for (const [g, codes] of Object.entries(INDIVIDUAL_LOAN_PRODUCT_MAP)) {
+    for (const c of codes) m[c] = g;
+  }
+  return m;
+})();
+const isIndividualLoanGroup = (val) => INDIVIDUAL_LOAN_GROUPS.includes(val);
+
+// ─── Merged map (used when categoryFilter === "" / All) ────────────────────
+// Union of Group + Individual buckets, so the All-category view also shows
+// the rollup labels in the dropdown / pie / table instead of 250+ raw codes.
+// Group and Individual code namespaces are disjoint by construction
+// (group products use codes like "30K_FN_28_25", individual products use
+// "1L_IND_28_24" / "GOLD_*" / etc.) so the spread merge is safe.
+const MERGED_LOAN_PRODUCT_MAP = { ...GROUP_LOAN_PRODUCT_MAP, ...INDIVIDUAL_LOAN_PRODUCT_MAP };
+const MERGED_LOAN_GROUPS = [...GROUP_LOAN_GROUPS, ...INDIVIDUAL_LOAN_GROUPS];
+const MERGED_PRODUCT_TO_LOAN = { ...PRODUCT_TO_GROUP_LOAN, ...PRODUCT_TO_INDIVIDUAL_LOAN };
+
+// ─── Unified accessors ─────────────────────────────────────────────────────
+// Single switch point for "which mapping is active right now" so the rollup
+// logic below works identically across All / Group / Individual without
+// scattering category checks throughout the component.
+function getActiveProductMap(categoryFilter) {
+  if (categoryFilter === "group")      return GROUP_LOAN_PRODUCT_MAP;
+  if (categoryFilter === "individual") return INDIVIDUAL_LOAN_PRODUCT_MAP;
+  return MERGED_LOAN_PRODUCT_MAP;
+}
+function getActiveGroups(categoryFilter) {
+  if (categoryFilter === "group")      return GROUP_LOAN_GROUPS;
+  if (categoryFilter === "individual") return INDIVIDUAL_LOAN_GROUPS;
+  return MERGED_LOAN_GROUPS;
+}
+function getActiveProductToGroup(categoryFilter) {
+  if (categoryFilter === "group")      return PRODUCT_TO_GROUP_LOAN;
+  if (categoryFilter === "individual") return PRODUCT_TO_INDIVIDUAL_LOAN;
+  return MERGED_PRODUCT_TO_LOAN;
+}
+function isActiveGroupLabel(val, categoryFilter) {
+  return getActiveGroups(categoryFilter).includes(val);
+}
+
+
 // ─── Customer-grouped list (used by the "Unique Customers" focused view) ──
 // Pulled out as its own component so we can use the usePagination hook
 // without breaking the rules-of-hooks (no conditional hook calls in the
@@ -242,6 +474,11 @@ export default function ReportsAnalytics({ user }) {
   // it doesn't disturb the recent-disbursements table sort.
   const [custSortKey, setCustSortKey] = useState("total");
   const [custSortDir, setCustSortDir] = useState("desc");
+
+  // Display mode for the Product-wise Disbursements section: user picks
+  // between the bar chart and the breakdown table — only one is shown at
+  // a time, full width.
+  const [productDisplayMode, setProductDisplayMode] = useState("chart"); // "chart" | "table"
   const handleCustSort = (key) => {
     if (custSortKey === key) setCustSortDir(d => d === "asc" ? "desc" : "asc");
     else { setCustSortKey(key); setCustSortDir("desc"); }
@@ -251,11 +488,18 @@ export default function ReportsAnalytics({ user }) {
   // Static so the user can always switch between any branch.
   const [branchOptions, setBranchOptions] = useState([]);
 
-  // Product dropdown options — depend on the selected loan category, so a
-  // user picking "Group Loan" sees only group products. We cache the full
-  // list for each category once on mount so toggling category is instant.
+  // Product dropdown options — always returns the rollup labels for the
+  // current category. Group → 4 group labels. Individual → 12 category
+  // labels. All → union of all 16 buckets (rendered as optgroups in the
+  // dropdown JSX below). The raw-code fallback only applies if the active
+  // mapping ever returns an empty list, which is no longer reachable for
+  // any of the three categories.
   const [productsByCategory, setProductsByCategory] = useState({ "": [], group: [], individual: [] });
-  const productOptions = productsByCategory[categoryFilter] || productsByCategory[""] || [];
+  const productOptions = useMemo(() => {
+    const groups = getActiveGroups(categoryFilter);
+    if (groups.length) return groups;
+    return productsByCategory[categoryFilter] || productsByCategory[""] || [];
+  }, [categoryFilter, productsByCategory]);
 
   // ── main data fetch ──
   // Reactive: re-fires whenever any filter or the status view changes.
@@ -267,7 +511,15 @@ export default function ReportsAnalytics({ user }) {
       if (fromDate) p.set("from", fromDate);
       if (toDate)   p.set("to", toDate);
       if (branchFilter) p.set("branch", branchFilter);
-      if (productFilter) p.set("product", productFilter);
+      // Active group labels (Group: OLD-JLG/JLG/VM-JLG/VM-GOLDJLG;
+      // Individual: KMCL_STBL/KMCL_PL/.../SSS) aren't real product codes —
+      // the API only accepts a single exact code. When the user picks a
+      // bucket label, skip the product param so the API returns ALL
+      // products for the current branch/date/category, then we filter the
+      // response client-side below.
+      if (productFilter && !isActiveGroupLabel(productFilter, categoryFilter)) {
+        p.set("product", productFilter);
+      }
       if (categoryFilter) p.set("category", categoryFilter);
       if (view === "active" || view === "closed" || view === "pending") {
         p.set("status", view);
@@ -312,14 +564,17 @@ export default function ReportsAnalytics({ user }) {
   }, []);
 
   // When the user switches Loan Category, clear the Product filter if the
-  // currently-selected product isn't valid for the new category.
+  // currently-selected product isn't valid for the new category. Uses
+  // `productOptions` (the user-facing list, which is the 4 groups when
+  // category=group) so a Group Loan group label like "OLD-JLG" survives
+  // category re-toggles within Group, but clears when switching to All /
+  // Individual where group labels aren't options.
   useEffect(() => {
     if (!productFilter) return;
-    const valid = productsByCategory[categoryFilter] || productsByCategory[""];
-    if (valid.length && !valid.includes(productFilter)) {
+    if (productOptions.length && !productOptions.includes(productFilter)) {
       setProductFilter("");
     }
-  }, [categoryFilter, productFilter, productsByCategory]);
+  }, [productOptions, productFilter]);
 
   // Sync the table sort to whichever KPI/view is selected, so the data the
   // user sees matches the focus they picked. Users can still click any column
@@ -349,12 +604,51 @@ export default function ReportsAnalytics({ user }) {
   const handlePresetThisYear = () => { setFromDate(startOfYearISO()); setToDate(todayISO()); };
 
   // ── derived ──
-  const summary = data?.summary || { count: 0, totalAmount: 0, avgTicket: 0, customerCount: 0, active: 0, closed: 0, pending: 0 };
+  const apiSummary = data?.summary || { count: 0, totalAmount: 0, avgTicket: 0, customerCount: 0, active: 0, closed: 0, pending: 0 };
   const byBranch = data?.byBranch || [];
   const byProduct = data?.byProduct || [];
   const byCategory = data?.byCategory || [];
   const byMonth = data?.byMonth || [];
   const recent = data?.recent || [];
+
+  // KPI summary — when a category bucket label (Group or Individual) is
+  // selected, recompute KPIs client-side. Total count and amount come from
+  // byProduct (server-side aggregated, not capped) — accurate. Status splits
+  // (active/closed/pending) and customer count come from the recent array
+  // (capped at 10,000) which is an accepted approximation per spec. For all
+  // other states (no bucket selected, or category=All), use the
+  // server-aggregated summary as-is.
+  const summary = useMemo(() => {
+    const productMap = getActiveProductMap(categoryFilter);
+    if (!productMap || !isActiveGroupLabel(productFilter, categoryFilter)) {
+      return apiSummary;
+    }
+    const codes = new Set(productMap[productFilter] || []);
+    // Accurate count + total from server-aggregated byProduct.
+    let total = 0, count = 0;
+    for (const p of byProduct) {
+      if (codes.has(p.key)) {
+        total += Number(p.total) || 0;
+        count += Number(p.count) || 0;
+      }
+    }
+    // Status splits + unique customers from recent (best-effort).
+    const rows = recent.filter(r => codes.has(r.product_name));
+    let customers = new Set(), active = 0, closed = 0, pending = 0;
+    for (const r of rows) {
+      if (r.customer_number) customers.add(r.customer_number);
+      if (r.status === "Active")  active++;
+      else if (r.status === "Closed")  closed++;
+      else if (r.status === "Pending") pending++;
+    }
+    return {
+      count,
+      totalAmount: Math.round(total * 100) / 100,
+      avgTicket: count > 0 ? Math.round((total / count) * 100) / 100 : 0,
+      customerCount: customers.size,
+      active, closed, pending,
+    };
+  }, [apiSummary, recent, byProduct, categoryFilter, productFilter]);
 
   const filteredRecent = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -363,8 +657,16 @@ export default function ReportsAnalytics({ user }) {
                        : view === "closed" ? "Closed"
                        : view === "pending" ? "Pending"
                        : null;
+    // Bucket-label filter (client-side). When the user picks a Group or
+    // Individual category bucket, narrow rows to those whose product_name
+    // belongs to that bucket's code list.
+    const _activeMap = getActiveProductMap(categoryFilter);
+    const groupFilterCodes = (_activeMap && isActiveGroupLabel(productFilter, categoryFilter))
+      ? new Set(_activeMap[productFilter] || [])
+      : null;
     let arr = recent.filter(r => {
       if (statusFilter && r.status !== statusFilter) return false;
+      if (groupFilterCodes && !groupFilterCodes.has(r.product_name)) return false;
       if (q) {
         return (r.customer_name || "").toLowerCase().includes(q) ||
                (r.loan_account_no || "").toLowerCase().includes(q) ||
@@ -382,7 +684,7 @@ export default function ReportsAnalytics({ user }) {
       return sortDir === "asc" ? cmp : -cmp;
     });
     return arr;
-  }, [recent, search, sortKey, sortDir, view]);
+  }, [recent, search, sortKey, sortDir, view, productFilter, categoryFilter]);
 
   const handleSort = (key) => {
     if (sortKey === key) setSortDir(d => d === "asc" ? "desc" : "asc");
@@ -458,10 +760,79 @@ export default function ReportsAnalytics({ user }) {
     [byMonth]
   );
 
-  // ── product pie chart ──
+  // ── product breakdown (table + pie chart source) ──
+  // When category=group OR category=individual, roll up the raw product
+  // codes into the active mapping's user-facing buckets (4 group labels or
+  // 12 individual category labels). Codes that don't appear in the hardcoded
+  // map fall into an "Other" bucket so nothing is silently dropped from the
+  // totals. For category=All, byProduct is used as-is.
+  // Each bucket also carries a `codes` list of underlying raw products,
+  // which the breakdown table surfaces via a tooltip — handy for diagnosing
+  // which codes ended up in "Other".
+  const productBreakdown = useMemo(() => {
+    const productToGroup = getActiveProductToGroup(categoryFilter);
+    const groups = getActiveGroups(categoryFilter);
+    if (!productToGroup || !groups.length) {
+      return byProduct.map(p => ({
+        key: p.key,
+        total: Number(p.total) || 0,
+        count: Number(p.count) || 0,
+        codes: [p.key],
+      }));
+    }
+    const buckets = new Map();
+    for (const g of groups) buckets.set(g, { key: g, total: 0, count: 0, codes: [] });
+    buckets.set("Other", { key: "Other", total: 0, count: 0, codes: [] });
+    for (const p of byProduct) {
+      const g = productToGroup[p.key] || "Other";
+      const b = buckets.get(g);
+      b.total += Number(p.total) || 0;
+      b.count += Number(p.count) || 0;
+      b.codes.push(p.key);
+    }
+    return [...buckets.values()].filter(b => b.count > 0).sort((a, b) => b.total - a.total);
+  }, [byProduct, categoryFilter]);
+
+  // Total used to compute the share-percentage column in the breakdown table.
+  const productBreakdownTotal = useMemo(
+    () => productBreakdown.reduce((acc, p) => acc + (Number(p.total) || 0), 0),
+    [productBreakdown]
+  );
+
+  // ── breakdown table sort (Bucket / Loans / Total / Share) ──
+  // productBreakdown is already returned sorted by total desc; keeping that
+  // as the default. Click a column header to override.
+  const [bdSortKey, setBdSortKey] = useState("total");
+  const [bdSortDir, setBdSortDir] = useState("desc");
+  const handleBdSort = (key) => {
+    if (bdSortKey === key) setBdSortDir(d => d === "asc" ? "desc" : "asc");
+    else { setBdSortKey(key); setBdSortDir("desc"); }
+  };
+  const sortedProductBreakdown = useMemo(() => {
+    const arr = [...productBreakdown];
+    arr.sort((a, b) => {
+      let av, bv;
+      switch (bdSortKey) {
+        case "key":   av = String(a.key || ""); bv = String(b.key || ""); break;
+        case "count": av = Number(a.count) || 0; bv = Number(b.count) || 0; break;
+        case "share":
+        case "total": av = Number(a.total) || 0; bv = Number(b.total) || 0; break;
+        default:      av = Number(a.total) || 0; bv = Number(b.total) || 0;
+      }
+      const cmp = (typeof av === "number" && typeof bv === "number")
+        ? av - bv
+        : String(av).localeCompare(String(bv));
+      return bdSortDir === "asc" ? cmp : -cmp;
+    });
+    return arr;
+  }, [productBreakdown, bdSortKey, bdSortDir]);
+
+  // ── product bar chart series — every bucket from productBreakdown.
+  // Variable name kept as `productPie` for backwards compat with existing
+  // references; the section now renders a horizontal bar chart, not a pie.
   const productPie = useMemo(
-    () => byProduct.slice(0, 10).map(p => ({ name: p.key, value: p.total, count: p.count })),
-    [byProduct]
+    () => productBreakdown.map(p => ({ name: p.key, value: p.total, count: p.count })),
+    [productBreakdown]
   );
 
   // ────────────────────────────────────────────────────────────────────────
@@ -520,7 +891,23 @@ export default function ReportsAnalytics({ user }) {
             <select value={productFilter} onChange={e => setProductFilter(e.target.value)}
               className="w-full border rounded-lg px-3 py-1.5 text-sm bg-white">
               <option value="">All products</option>
-              {productOptions.map(p => <option key={p} value={p}>{p}</option>)}
+              {/* When categoryFilter is "" (All), split the 16 buckets into
+                  optgroups so the user can visually distinguish Group from
+                  Individual buckets while still picking from a single flat
+                  list. For Group / Individual category modes we render a
+                  plain list of just that mapping's labels. */}
+              {categoryFilter === "" ? (
+                <>
+                  <optgroup label="Group Loan">
+                    {GROUP_LOAN_GROUPS.map(p => <option key={`g-${p}`} value={p}>{p}</option>)}
+                  </optgroup>
+                  <optgroup label="Individual Loan">
+                    {INDIVIDUAL_LOAN_GROUPS.map(p => <option key={`i-${p}`} value={p}>{p}</option>)}
+                  </optgroup>
+                </>
+              ) : (
+                productOptions.map(p => <option key={p} value={p}>{p}</option>)
+              )}
             </select>
           </div>
           <div>
@@ -697,19 +1084,111 @@ export default function ReportsAnalytics({ user }) {
         </SectionCard>
         )}
         {(view === "overview" || view === "product") && (
-        <SectionCard title="Product-wise Disbursements" subtitle="Top 10 products by amount">
+        <SectionCard
+          title="Product-wise Disbursements"
+          subtitle={
+            categoryFilter === "group"
+              ? "Rolled up into the 4 group-loan buckets (OLD-JLG, JLG, VM - JLG, VM - GOLDJLG). Unmapped codes fall into 'Other'."
+              : categoryFilter === "individual"
+                ? "Rolled up into the 12 individual-loan categories (KMCL_STBL, KMCL_PL, KMCL_MLAP, KMCL_GL, KMCL_GPL, GRC_GL, GRC_GPL, SKPB_GL, VM_GL, VM_GPL, MIG, SSS). Unmapped codes fall into 'Other'."
+                : "Rolled up into 16 buckets — 4 group-loan + 12 individual-loan. Unmapped codes fall into 'Other'."
+          }
+          action={
+            <div className="inline-flex rounded-lg border overflow-hidden text-xs">
+              <button
+                type="button"
+                onClick={() => setProductDisplayMode("chart")}
+                className={`px-3 py-1 ${productDisplayMode === "chart" ? "bg-teal-600 text-white" : "bg-white text-gray-700 hover:bg-gray-100"}`}
+              >Chart</button>
+              <button
+                type="button"
+                onClick={() => setProductDisplayMode("table")}
+                className={`px-3 py-1 border-l ${productDisplayMode === "table" ? "bg-teal-600 text-white" : "bg-white text-gray-700 hover:bg-gray-100"}`}
+              >Table</button>
+            </div>
+          }
+        >
           {productPie.length === 0 ? (
             <div className="text-gray-400 text-sm py-6 text-center">No data.</div>
-          ) : (
-            <ResponsiveContainer width="100%" height={260}>
-              <PieChart>
-                <Pie data={productPie} cx="50%" cy="50%" innerRadius={45} outerRadius={85}
-                  dataKey="value" label={(e) => e.name}>
+          ) : productDisplayMode === "chart" ? (
+            /* Horizontal bar chart, full width — one bar per bucket sorted
+               by total disbursement amount. Y-axis carries the bucket label,
+               X-axis the amount in K/L/Cr. Height grows with bucket count
+               (28px per bar, min 260px). */
+            <ResponsiveContainer width="100%" height={Math.max(260, productPie.length * 28)}>
+              <BarChart
+                data={productPie}
+                layout="vertical"
+                margin={{ top: 8, right: 16, left: 8, bottom: 8 }}
+              >
+                <CartesianGrid strokeDasharray="3 3" horizontal={false} />
+                <XAxis type="number" fontSize={11}
+                  tickFormatter={v => v >= 1e7 ? `${(v / 1e7).toFixed(1)}Cr` : v >= 1e5 ? `${(v / 1e5).toFixed(1)}L` : `${Math.round(v / 1000)}K`}
+                />
+                <YAxis type="category" dataKey="name" fontSize={11} width={130} interval={0} />
+                <Tooltip
+                  formatter={(v, n, e) => [`${formatINR(v)} (${formatNum(e.payload.count)} loans)`, e.payload.name]}
+                />
+                <Bar dataKey="value" name="Disbursed">
                   {productPie.map((p, i) => <Cell key={p.name} fill={PIE_COLORS[i % PIE_COLORS.length]} />)}
-                </Pie>
-                <Tooltip formatter={(v, n, e) => [`${formatINR(v)} (${formatNum(e.payload.count)} loans)`, e.payload.name]} />
-              </PieChart>
+                </Bar>
+              </BarChart>
             </ResponsiveContainer>
+          ) : (
+            /* Tabular breakdown, full width — Bucket / Loans / Total /
+               Share % with colored swatches that match the bar chart. */
+            <div className="overflow-x-auto rounded-lg border">
+                <table className="w-full text-xs">
+                  <thead className="bg-gray-50 sticky top-0">
+                    <tr>
+                      <SortHeader sortKey="key"   currentKey={bdSortKey} currentDir={bdSortDir} onSort={handleBdSort}>
+                        {categoryFilter === "group"      ? "Group"
+                          : categoryFilter === "individual" ? "Category"
+                          : "Bucket"}
+                      </SortHeader>
+                      <SortHeader sortKey="count" currentKey={bdSortKey} currentDir={bdSortDir} onSort={handleBdSort} align="right">Loans</SortHeader>
+                      <SortHeader sortKey="total" currentKey={bdSortKey} currentDir={bdSortDir} onSort={handleBdSort} align="right">Total</SortHeader>
+                      <SortHeader sortKey="share" currentKey={bdSortKey} currentDir={bdSortDir} onSort={handleBdSort} align="right">Share</SortHeader>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-100">
+                    {sortedProductBreakdown.length === 0 ? (
+                      <tr><td colSpan={4} className="px-3 py-6 text-center text-gray-400">No products.</td></tr>
+                    ) : sortedProductBreakdown.map((p, i) => {
+                      const share = productBreakdownTotal > 0
+                        ? ((p.total / productBreakdownTotal) * 100).toFixed(1)
+                        : "0.0";
+                      // Tooltip surfaces the underlying raw product codes
+                      // — most useful on the "Other" row so the user can
+                      // see which codes weren't mapped into the 4 groups.
+                      const codeList = (p.codes && p.codes.length)
+                        ? p.codes.slice(0, 50).join(", ") + (p.codes.length > 50 ? `, …(+${p.codes.length - 50} more)` : "")
+                        : "";
+                      const _hasActiveMap = !!getActiveProductMap(categoryFilter);
+                      const tooltip = (_hasActiveMap && p.key === "Other" && codeList)
+                        ? `Unmapped product codes:\n${codeList}`
+                        : codeList;
+                      return (
+                        <tr key={p.key} className="hover:bg-gray-50" title={tooltip}>
+                          <td className="px-3 py-2 font-medium text-gray-800">
+                            <span
+                              className="inline-block w-2.5 h-2.5 rounded-sm mr-2 align-middle"
+                              style={{ background: PIE_COLORS[i % PIE_COLORS.length] }}
+                            />
+                            {p.key}
+                            {_hasActiveMap && p.key === "Other" && (
+                              <span className="ml-2 text-[10px] text-gray-400">(hover to inspect)</span>
+                            )}
+                          </td>
+                          <td className="px-3 py-2 text-right">{formatNum(p.count)}</td>
+                          <td className="px-3 py-2 text-right font-semibold">{formatINR(p.total)}</td>
+                          <td className="px-3 py-2 text-right text-gray-500">{share}%</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
           )}
         </SectionCard>
         )}
@@ -790,7 +1269,29 @@ export default function ReportsAnalytics({ user }) {
                     <td className="px-3 py-2 font-medium text-gray-800">{r.customer_name || "—"}</td>
                     <td className="px-3 py-2 font-mono text-gray-500">{r.loan_account_no}</td>
                     <td className="px-3 py-2 text-gray-700">{r.branch || "—"}</td>
-                    <td className="px-3 py-2 text-gray-700">{r.product_name || "—"}</td>
+                    <td className="px-3 py-2 text-gray-700">
+                      {/* Active rollup display: when category=group, raw
+                          codes (e.g. "30K_FN_26_26") are shown as their
+                          group label (e.g. "OLD-JLG"); when category=
+                          individual, raw codes (e.g. "1L_IND_28_24") are
+                          shown as their Category-of-Loan bucket (e.g.
+                          "KMCL_STBL"). Underlying r.product_name is
+                          unchanged on the row. Codes not in the active map
+                          render as "Other (raw_code)" so the user can still
+                          see what's behind them. category=All keeps raw
+                          codes as-is. */}
+                      {(() => {
+                        const _ptg = getActiveProductToGroup(categoryFilter);
+                        if (!_ptg) return r.product_name || "—";
+                        const mapped = _ptg[r.product_name];
+                        if (mapped) return mapped;
+                        return (
+                          <span title={r.product_name || ""} className="italic text-gray-500">
+                            Other{r.product_name ? ` (${r.product_name})` : ""}
+                          </span>
+                        );
+                      })()}
+                    </td>
                     <td className="px-3 py-2">
                       <span className={`text-[10px] px-1.5 py-0.5 rounded ${
                         /GROUP/i.test(r.loan_category || "") ? "bg-teal-100 text-teal-700"

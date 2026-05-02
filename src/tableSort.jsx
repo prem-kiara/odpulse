@@ -92,3 +92,46 @@ export function SortableSection({ initialKey = "", initialDir = "desc", render }
   const sort = useTableSort(initialKey, initialDir);
   return render(sort);
 }
+
+// PaginatedSortableSection — same as SortableSection, plus client-side
+// pagination wired via usePagination + a PaginationBar rendered AFTER the
+// caller's JSX. Pass `rows` directly so we can sort + paginate them
+// internally. The render prop receives { sort, pageRows, pg } where
+// pageRows is the sorted+paginated slice ready to render in <tbody>.
+//
+// Usage:
+//   <PaginatedSortableSection rows={items} initialKey="date" initialDir="desc"
+//     pageSize={10} label="customers"
+//     render={({ sort, pageRows }) => (
+//       <table>
+//         <thead><tr><th>{sort.header("date", "Date")}</th></tr></thead>
+//         <tbody>
+//           {pageRows.length === 0
+//             ? <tr><td>No data.</td></tr>
+//             : pageRows.map(r => <tr key={r.id}>...</tr>)}
+//         </tbody>
+//       </table>
+//     )} />
+import { usePagination, PaginationBar } from "./Pagination";
+export function PaginatedSortableSection({
+  rows,
+  initialKey = "",
+  initialDir = "desc",
+  pageSize = 10,
+  label = "rows",
+  getValue,
+  render,
+}) {
+  const sort = useTableSort(initialKey, initialDir);
+  const sorted = useMemo(
+    () => sort.apply(rows || [], getValue),
+    [sort, rows, getValue]
+  );
+  const pg = usePagination(sorted, pageSize);
+  return (
+    <>
+      {render({ sort, pageRows: pg.pageRows, pg })}
+      <PaginationBar {...pg} label={label} />
+    </>
+  );
+}

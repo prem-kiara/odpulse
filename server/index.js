@@ -2576,12 +2576,36 @@ function calcInterestTillDate(record) {
   };
 }
 
+// Derive a DPD bucket from a numeric day count. Mirror of dpdClassFromDays
+// on the frontend — they MUST agree, otherwise the bucket counts shown in
+// the UI will disagree with the server-computed defaulter sums (which
+// drives Total Default Due and Group OD per Member).
+function deriveDPDClass(days) {
+  const d = Number(days) || 0;
+  if (d <= 0)  return "Regular";
+  if (d <= 30) return "SMA-0";
+  if (d <= 60) return "SMA-1";
+  if (d <= 90) return "SMA-2";
+  return "NPA";
+}
+
 function poolAggregates(members) {
   const CLOSED_S   = ["Closed", "Written Off"];
   const DELINQ_DPD = ["SMA-0", "SMA-1", "SMA-2", "NPA"];
+  // Effective DPD class for a record — same rule as the frontend:
+  // pick whichever number is larger between customer DPD and overdueDays,
+  // then bucket. Falls back to the raw classification only if both
+  // numeric fields are zero, so we don't lose info from snapshots that
+  // had a class but no day count.
+  const effectiveClass = (r) => {
+    if (CLOSED_S.includes(r.loanStatus)) return "";
+    const eff = Math.max(Number(r.customerDPD) || 0, Number(r.overdueDays) || 0);
+    if (eff > 0) return deriveDPDClass(eff);
+    return r.customerDPDClass || "Regular";
+  };
   const closedCount     = members.filter(r => CLOSED_S.includes(r.loanStatus)).length;
-  const delinquentCount = members.filter(r => !CLOSED_S.includes(r.loanStatus) && DELINQ_DPD.includes(r.customerDPDClass)).length;
-  const activeCount     = members.filter(r => !CLOSED_S.includes(r.loanStatus) && !DELINQ_DPD.includes(r.customerDPDClass)).length;
+  const delinquentCount = members.filter(r => !CLOSED_S.includes(r.loanStatus) && DELINQ_DPD.includes(effectiveClass(r))).length;
+  const activeCount     = members.filter(r => !CLOSED_S.includes(r.loanStatus) && !DELINQ_DPD.includes(effectiveClass(r))).length;
   const nonClosed       = members.filter(r => !CLOSED_S.includes(r.loanStatus));
   const totalPrincipalOverdue = members.reduce((s, r) => s + r.principalOverdue, 0);
   const totalInterestOverdue  = members.reduce((s, r) => s + r.interestOverdueTillDate, 0);
@@ -2593,8 +2617,14 @@ function poolAggregates(members) {
   // This is a calculated/display value; it is not persisted to the DB.
   // Eligibility to actually pay (i.e. clickable in UI) is restricted to
   // closed members; other members see the share but cannot record it.
+  // Defaulter detection uses effectiveClass (derived from DPD numbers)
+  // rather than the raw customerDPDClass text — this matches the
+  // frontend's bucket display and prevents the case where the UI shows
+  // NPA = 4 but defaulterCount = 0 because the snapshot's DPD class
+  // field was empty / set to "Regular" while the actual DPD numbers
+  // were >90 days.
   const defaulterMembers = members.filter(r =>
-    !CLOSED_S.includes(r.loanStatus) && DELINQ_DPD.includes(r.customerDPDClass)
+    !CLOSED_S.includes(r.loanStatus) && DELINQ_DPD.includes(effectiveClass(r))
   );
   const totalDefaultDue = defaulterMembers.reduce((s, r) => s + (r.arrearAmountTillDate || 0), 0);
   // Edge case: empty group → 0. Otherwise divide by total member count.

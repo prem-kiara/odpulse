@@ -1325,6 +1325,32 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
           </label>
         </div>
 
+        {/* Paying-customer banner — shows whose Group OD share is being
+            recorded by this entry. Populated from the Closed-Members row
+            click which sets customerName / customerId / loanAccountNo.
+            Visible only when at least one of those fields is set. */}
+        {(customerName || customerId || loanAccountNo) && (
+          <div className="mb-4 p-3 bg-teal-50 border border-teal-200 rounded-lg flex flex-wrap items-center gap-x-4 gap-y-1">
+            <div className="flex items-center gap-2">
+              <Users size={14} className="text-teal-700" />
+              <span className="text-xs text-gray-500 uppercase tracking-wide">Paying Customer</span>
+            </div>
+            <div className="text-sm font-semibold text-teal-800">
+              {customerName || "—"}
+            </div>
+            {customerId && (
+              <div className="text-xs text-gray-600">
+                ID: <span className="font-mono text-gray-800">{customerId}</span>
+              </div>
+            )}
+            {loanAccountNo && (
+              <div className="text-xs text-gray-600">
+                Loan A/C: <span className="font-mono text-gray-800">{loanAccountNo}</span>
+              </div>
+            )}
+          </div>
+        )}
+
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Customer Share</label>

@@ -19,7 +19,7 @@ import {
 import {
   enqueueUpload, listQueue, deleteFromQueue, drainQueue, isBackendUp,
 } from "./uploadQueue";
-import { SortableSection } from "./tableSort.jsx";
+import { SortableSection, PaginatedSortableSection } from "./tableSort.jsx";
 import { usePagination, PaginationBar } from "./Pagination";
 
 const API_BASE = "/api";
@@ -901,26 +901,27 @@ export function DataUploadPage({ user, canUpload }) {
           </button>
         </div>
         <div className="overflow-x-auto">
-          <SortableSection initialKey="uploaded_at" initialDir="desc" render={sort => (
-            <table className="w-full text-sm">
-              <thead className="bg-gray-50 text-xs uppercase text-gray-500">
-                <tr>
-                  <th className="text-left px-4 py-2">{sort.header("kind", "Kind")}</th>
-                  <th className="text-left px-4 py-2">{sort.header("snapshot_date", "Snapshot Date")}</th>
-                  <th className="text-left px-4 py-2">{sort.header("filename", "Filename")}</th>
-                  <th className="text-right px-4 py-2">{sort.header("row_count", "Rows")}</th>
-                  <th className="text-right px-4 py-2">{sort.header("new_branches", "New Branches")}</th>
-                  <th className="text-left px-4 py-2">{sort.header("uploaded_by", "Uploaded By")}</th>
-                  <th className="text-left px-4 py-2">{sort.header("uploaded_at", "At")}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {(() => {
-                  const sortedUploads = sort.apply(history.uploads || []);
-                  if (!sortedUploads || sortedUploads.length === 0) {
-                    return <tr><td colSpan={7} className="text-center text-gray-400 py-6">No uploads yet.</td></tr>;
-                  }
-                  return sortedUploads.map(h => (
+          <PaginatedSortableSection
+            rows={history.uploads || []}
+            initialKey="uploaded_at" initialDir="desc"
+            pageSize={10} label="uploads"
+            render={({ sort, pageRows }) => (
+              <table className="w-full text-sm">
+                <thead className="bg-gray-50 text-xs uppercase text-gray-500">
+                  <tr>
+                    <th className="text-left px-4 py-2">{sort.header("kind", "Kind")}</th>
+                    <th className="text-left px-4 py-2">{sort.header("snapshot_date", "Snapshot Date")}</th>
+                    <th className="text-left px-4 py-2">{sort.header("filename", "Filename")}</th>
+                    <th className="text-right px-4 py-2">{sort.header("row_count", "Rows")}</th>
+                    <th className="text-right px-4 py-2">{sort.header("new_branches", "New Branches")}</th>
+                    <th className="text-left px-4 py-2">{sort.header("uploaded_by", "Uploaded By")}</th>
+                    <th className="text-left px-4 py-2">{sort.header("uploaded_at", "At")}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pageRows.length === 0 ? (
+                    <tr><td colSpan={7} className="text-center text-gray-400 py-6">No uploads yet.</td></tr>
+                  ) : pageRows.map(h => (
                     <tr key={h.id} className="border-t">
                       <td className="px-4 py-2">
                         <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${h.kind === "pool" ? "bg-teal-100 text-teal-700" : "bg-indigo-100 text-indigo-700"}`}>{h.kind}</span>
@@ -932,11 +933,10 @@ export function DataUploadPage({ user, canUpload }) {
                       <td className="px-4 py-2">{h.uploaded_by}</td>
                       <td className="px-4 py-2 text-gray-500 text-xs">{h.uploaded_at ? new Date(h.uploaded_at).toLocaleString() : "—"}</td>
                     </tr>
-                  ));
-                })()}
-              </tbody>
-            </table>
-          )} />
+                  ))}
+                </tbody>
+              </table>
+            )} />
         </div>
       </div>
     </div>
@@ -1149,8 +1149,11 @@ export function CollectionDashboard({ user, entries, branches }) {
 
       {tab === "portfolio" && (
       <>
-      {/* Filters */}
-      <div className="bg-white rounded-xl border p-4 grid grid-cols-2 md:grid-cols-5 gap-3 items-end">
+      {/* Filters — reactive: every change auto-fires loadAll via useEffect.
+          No Apply button needed; the dependency-tracked useCallback above
+          re-runs whenever From / To / Granularity / Branch / Category
+          change, so the page is always in sync with the current selection. */}
+      <div className="bg-white rounded-xl border p-4 grid grid-cols-2 md:grid-cols-4 gap-3 items-end">
         <div>
           <label className="block text-xs text-gray-500 mb-1">From</label>
           <input type="date" value={fromDate} onChange={e => setFromDate(e.target.value)}
@@ -1178,10 +1181,6 @@ export function CollectionDashboard({ user, entries, branches }) {
             {branches?.map(b => <option key={b} value={b}>{b}</option>)}
           </select>
         </div>
-        <button onClick={loadAll}
-          className="w-full py-2 bg-teal-600 text-white rounded-lg text-sm font-medium hover:bg-teal-700">
-          Apply
-        </button>
       </div>
 
       {/* Headline KPIs */}
@@ -1386,26 +1385,27 @@ export function CollectionDashboard({ user, entries, branches }) {
             <button onClick={() => downloadCSV(officerProd, "officer-productivity.csv")}
               className="text-xs text-teal-700 flex items-center gap-1"><Download size={12} /> CSV</button>
           </div>
-          <div className="overflow-y-auto max-h-80">
-            <SortableSection initialKey="collected" initialDir="desc" render={sort => (
-              <table className="w-full text-xs">
-                <thead className="sticky top-0 bg-white shadow-sm">
-                  <tr className="text-left text-gray-500 border-b">
-                    <th className="py-2 pr-2">{sort.header("officer", "Officer")}</th>
-                    <th className="py-2 pr-2 text-right">{sort.header("entries", "Entries")}</th>
-                    <th className="py-2 pr-2 text-right">{sort.header("collected", "Collected")}</th>
-                    <th className="py-2 pr-2 text-right">{sort.header("ptps", "PTPs")}</th>
-                    <th className="py-2 pr-2 text-right">{sort.header("ptpsPaid", "Paid")}</th>
-                    <th className="py-2 pr-2 text-right">{sort.header("ptpsMissed", "Missed")}</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {(() => {
-                    const sortedOfficers = sort.apply(officerProd);
-                    if (sortedOfficers.length === 0) {
-                      return <tr><td colSpan={6} className="py-4 text-center text-gray-400">No activity.</td></tr>;
-                    }
-                    return sortedOfficers.map((o, i) => (
+          <div className="overflow-x-auto">
+            <PaginatedSortableSection
+              rows={officerProd}
+              initialKey="collected" initialDir="desc"
+              pageSize={10} label="officers"
+              render={({ sort, pageRows }) => (
+                <table className="w-full text-xs">
+                  <thead className="bg-gray-50 shadow-sm">
+                    <tr className="text-left text-gray-500 border-b">
+                      <th className="py-2 pr-2">{sort.header("officer", "Officer")}</th>
+                      <th className="py-2 pr-2 text-right">{sort.header("entries", "Entries")}</th>
+                      <th className="py-2 pr-2 text-right">{sort.header("collected", "Collected")}</th>
+                      <th className="py-2 pr-2 text-right">{sort.header("ptps", "PTPs")}</th>
+                      <th className="py-2 pr-2 text-right">{sort.header("ptpsPaid", "Paid")}</th>
+                      <th className="py-2 pr-2 text-right">{sort.header("ptpsMissed", "Missed")}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {pageRows.length === 0 ? (
+                      <tr><td colSpan={6} className="py-4 text-center text-gray-400">No activity.</td></tr>
+                    ) : pageRows.map((o, i) => (
                       <tr key={i} className="border-b">
                         <td className="py-1.5 pr-2">{o.officer || "—"}</td>
                         <td className="py-1.5 pr-2 text-right">{o.entries}</td>
@@ -1414,11 +1414,10 @@ export function CollectionDashboard({ user, entries, branches }) {
                         <td className="py-1.5 pr-2 text-right text-green-700">{o.ptpsPaid || 0}</td>
                         <td className="py-1.5 pr-2 text-right text-red-600">{o.ptpsMissed || 0}</td>
                       </tr>
-                    ));
-                  })()}
-                </tbody>
-              </table>
-            )} />
+                    ))}
+                  </tbody>
+                </table>
+              )} />
           </div>
         </div>
       </div>
@@ -1434,25 +1433,26 @@ export function CollectionDashboard({ user, entries, branches }) {
             <button onClick={() => downloadCSV(foreOpp, "foreclosure-opportunities.csv")}
               className="text-xs text-teal-700 flex items-center gap-1"><Download size={12} /> CSV</button>
           </div>
-          <div className="overflow-y-auto max-h-80">
-            <SortableSection initialKey="dpd" initialDir="desc" render={sort => (
-              <table className="w-full text-xs">
-                <thead className="sticky top-0 bg-white">
-                  <tr className="text-left text-gray-500 border-b">
-                    <th className="py-2 pr-2">{sort.header("customer", "Customer")}</th>
-                    <th className="py-2 pr-2">{sort.header("branch", "Branch")}</th>
-                    <th className="py-2 pr-2 text-right">{sort.header("foreclosure", "Foreclosure")}</th>
-                    <th className="py-2 pr-2 text-right">{sort.header("originalLoan", "Orig. Loan")}</th>
-                    <th className="py-2 pr-2 text-right">{sort.header("dpd", "DPD")}</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {(() => {
-                    const sortedFore = sort.apply(foreOpp.slice(0, 100));
-                    if (sortedFore.length === 0) {
-                      return <tr><td colSpan={5} className="py-4 text-center text-gray-400">None.</td></tr>;
-                    }
-                    return sortedFore.map((f, i) => (
+          <div className="overflow-x-auto">
+            <PaginatedSortableSection
+              rows={foreOpp.slice(0, 100)}
+              initialKey="dpd" initialDir="desc"
+              pageSize={10} label="candidates"
+              render={({ sort, pageRows }) => (
+                <table className="w-full text-xs">
+                  <thead className="bg-gray-50">
+                    <tr className="text-left text-gray-500 border-b">
+                      <th className="py-2 pr-2">{sort.header("customer", "Customer")}</th>
+                      <th className="py-2 pr-2">{sort.header("branch", "Branch")}</th>
+                      <th className="py-2 pr-2 text-right">{sort.header("foreclosure", "Foreclosure")}</th>
+                      <th className="py-2 pr-2 text-right">{sort.header("originalLoan", "Orig. Loan")}</th>
+                      <th className="py-2 pr-2 text-right">{sort.header("dpd", "DPD")}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {pageRows.length === 0 ? (
+                      <tr><td colSpan={5} className="py-4 text-center text-gray-400">None.</td></tr>
+                    ) : pageRows.map((f, i) => (
                       <tr key={i} className="border-b hover:bg-teal-50/50 cursor-pointer"
                           onClick={() => openDrill({
                             branch: f.branch,
@@ -1469,11 +1469,10 @@ export function CollectionDashboard({ user, entries, branches }) {
                         <td className="py-1.5 pr-2 text-right text-gray-500">{formatINR(f.loan_amount)}</td>
                         <td className="py-1.5 pr-2 text-right">{f.overdue_days || 0}</td>
                       </tr>
-                    ));
-                  })()}
-                </tbody>
-              </table>
-            )} />
+                    ))}
+                  </tbody>
+                </table>
+              )} />
           </div>
         </div>
 
@@ -1486,24 +1485,25 @@ export function CollectionDashboard({ user, entries, branches }) {
             <button onClick={() => downloadCSV(nonContact, "non-contactable.csv")}
               className="text-xs text-teal-700 flex items-center gap-1"><Download size={12} /> CSV</button>
           </div>
-          <div className="overflow-y-auto max-h-80">
-            <SortableSection initialKey="overdue_days" initialDir="desc" render={sort => (
-              <table className="w-full text-xs">
-                <thead className="sticky top-0 bg-white">
-                  <tr className="text-left text-gray-500 border-b">
-                    <th className="py-2 pr-2">{sort.header("customer_name", "Customer")}</th>
-                    <th className="py-2 pr-2">{sort.header("branch", "Branch")}</th>
-                    <th className="py-2 pr-2 text-right">{sort.header("overdue_days", "DPD")}</th>
-                    <th className="py-2 pr-2 text-right">{sort.header("overdue_amount", "Overdue")}</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {(() => {
-                    const sortedNonContact = sort.apply(nonContact.slice(0, 100));
-                    if (sortedNonContact.length === 0) {
-                      return <tr><td colSpan={4} className="py-4 text-center text-gray-400">None.</td></tr>;
-                    }
-                    return sortedNonContact.map((n, i) => (
+          <div className="overflow-x-auto">
+            <PaginatedSortableSection
+              rows={nonContact.slice(0, 100)}
+              initialKey="overdue_days" initialDir="desc"
+              pageSize={10} label="accounts"
+              render={({ sort, pageRows }) => (
+                <table className="w-full text-xs">
+                  <thead className="bg-gray-50">
+                    <tr className="text-left text-gray-500 border-b">
+                      <th className="py-2 pr-2">{sort.header("customer_name", "Customer")}</th>
+                      <th className="py-2 pr-2">{sort.header("branch", "Branch")}</th>
+                      <th className="py-2 pr-2 text-right">{sort.header("overdue_days", "DPD")}</th>
+                      <th className="py-2 pr-2 text-right">{sort.header("overdue_amount", "Overdue")}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {pageRows.length === 0 ? (
+                      <tr><td colSpan={4} className="py-4 text-center text-gray-400">None.</td></tr>
+                    ) : pageRows.map((n, i) => (
                       <tr key={i} className="border-b hover:bg-amber-50/50 cursor-pointer"
                           onClick={() => openDrill({
                             branch: n.branch,
@@ -1519,11 +1519,10 @@ export function CollectionDashboard({ user, entries, branches }) {
                         <td className="py-1.5 pr-2 text-right">{n.overdue_days || 0}</td>
                         <td className="py-1.5 pr-2 text-right font-medium">{formatINR(n.overdue_amount)}</td>
                       </tr>
-                    ));
-                  })()}
-                </tbody>
-              </table>
-            )} />
+                    ))}
+                  </tbody>
+                </table>
+              )} />
           </div>
         </div>
       </div>
@@ -1818,26 +1817,27 @@ function DrilldownDrawer({ slice, category, onClose }) {
 
           {!loading && tab === "receipts" && (
             <div className="overflow-x-auto">
-              <SortableSection initialKey="payment_date" initialDir="desc" render={sort => (
-                <table className="w-full text-xs">
-                  <thead className="sticky top-0 bg-white shadow-sm">
-                    <tr className="text-left text-gray-500 border-b">
-                      <th className="py-2 pr-2">{sort.header("payment_date", "Date")}</th>
-                      <th className="py-2 pr-2">{sort.header("receipt_no", "Receipt")}</th>
-                      <th className="py-2 pr-2">{sort.header("customer_name", "Customer / Loan")}</th>
-                      <th className="py-2 pr-2">{sort.header("branch_name", "Branch")}</th>
-                      <th className="py-2 pr-2">{sort.header("mode", "Mode")}</th>
-                      <th className="py-2 pr-2 text-right">{sort.header("amount", "Amount")}</th>
-                      <th className="py-2 pr-2">{sort.header("payment_officer_name", "Officer")}</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {(() => {
-                      const sortedReceipts = sort.apply(receipts);
-                      if (sortedReceipts.length === 0) {
-                        return <tr><td colSpan={7} className="py-6 text-center text-gray-400">No receipts.</td></tr>;
-                      }
-                      return sortedReceipts.map((r, i) => (
+              <PaginatedSortableSection
+                rows={receipts}
+                initialKey="payment_date" initialDir="desc"
+                pageSize={10} label="receipts"
+                render={({ sort, pageRows }) => (
+                  <table className="w-full text-xs">
+                    <thead className="bg-gray-50 shadow-sm">
+                      <tr className="text-left text-gray-500 border-b">
+                        <th className="py-2 pr-2">{sort.header("payment_date", "Date")}</th>
+                        <th className="py-2 pr-2">{sort.header("receipt_no", "Receipt")}</th>
+                        <th className="py-2 pr-2">{sort.header("customer_name", "Customer / Loan")}</th>
+                        <th className="py-2 pr-2">{sort.header("branch_name", "Branch")}</th>
+                        <th className="py-2 pr-2">{sort.header("mode", "Mode")}</th>
+                        <th className="py-2 pr-2 text-right">{sort.header("amount", "Amount")}</th>
+                        <th className="py-2 pr-2">{sort.header("payment_officer_name", "Officer")}</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {pageRows.length === 0 ? (
+                        <tr><td colSpan={7} className="py-6 text-center text-gray-400">No receipts.</td></tr>
+                      ) : pageRows.map((r, i) => (
                         <tr key={r.receipt_no + "-" + i} className="border-b hover:bg-gray-50">
                           <td className="py-1.5 pr-2 text-gray-600">{formatDateDMY(r.payment_date)}</td>
                           <td className="py-1.5 pr-2 font-mono text-[10px] text-gray-500">{r.receipt_no}</td>
@@ -1856,11 +1856,10 @@ function DrilldownDrawer({ slice, category, onClose }) {
                           <td className="py-1.5 pr-2 text-right font-semibold text-teal-700">{formatINR(r.amount)}</td>
                           <td className="py-1.5 pr-2 text-gray-600">{r.payment_officer_name || "—"}</td>
                         </tr>
-                      ));
-                    })()}
-                  </tbody>
-                </table>
-              )} />
+                      ))}
+                    </tbody>
+                  </table>
+                )} />
             </div>
           )}
         </div>
@@ -2053,27 +2052,28 @@ function CollectionEfficiencyView({ category, openDrill }) {
           <h3 className="font-semibold text-gray-800">Full Breakdown</h3>
           <span className="text-xs text-gray-500">{breakdown.length.toLocaleString()} rows</span>
         </div>
-        <div className="overflow-x-auto max-h-96 overflow-y-auto">
-          <SortableSection initialKey="collected" initialDir="desc" render={sort => (
-            <table className="w-full text-xs">
-              <thead className="sticky top-0 bg-gray-50 text-gray-600 uppercase text-[10px]">
-                <tr>
-                  <th className="text-left px-4 py-2">{sort.header("label", groupBy.charAt(0).toUpperCase() + groupBy.slice(1))}</th>
-                  <th className="text-right px-4 py-2">{sort.header("accounts", "Accts")}</th>
-                  <th className="text-right px-4 py-2">{sort.header("demand", "Demand")}</th>
-                  <th className="text-right px-4 py-2">{sort.header("collected", "Collected")}</th>
-                  <th className="text-right px-4 py-2">{sort.header("cePct", "CE%")}</th>
-                  <th className="text-right px-4 py-2">{sort.header("principal_overdue", "Prin. Overdue")}</th>
-                  <th className="text-right px-4 py-2">{sort.header("interest_overdue", "Int. Overdue")}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {(() => {
-                  const sortedBreakdown = sort.apply(breakdown);
-                  if (sortedBreakdown.length === 0) {
-                    return <tr><td colSpan={7} className="text-center text-gray-400 py-6">No data for selected period.</td></tr>;
-                  }
-                  return sortedBreakdown.map((r, i) => {
+        <div className="overflow-x-auto">
+          <PaginatedSortableSection
+            rows={breakdown}
+            initialKey="collected" initialDir="desc"
+            pageSize={10} label={`${groupBy}s`}
+            render={({ sort, pageRows }) => (
+              <table className="w-full text-xs">
+                <thead className="bg-gray-50 text-gray-600 uppercase text-[10px]">
+                  <tr>
+                    <th className="text-left px-4 py-2">{sort.header("label", groupBy.charAt(0).toUpperCase() + groupBy.slice(1))}</th>
+                    <th className="text-right px-4 py-2">{sort.header("accounts", "Accts")}</th>
+                    <th className="text-right px-4 py-2">{sort.header("demand", "Demand")}</th>
+                    <th className="text-right px-4 py-2">{sort.header("collected", "Collected")}</th>
+                    <th className="text-right px-4 py-2">{sort.header("cePct", "CE%")}</th>
+                    <th className="text-right px-4 py-2">{sort.header("principal_overdue", "Prin. Overdue")}</th>
+                    <th className="text-right px-4 py-2">{sort.header("interest_overdue", "Int. Overdue")}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pageRows.length === 0 ? (
+                    <tr><td colSpan={7} className="text-center text-gray-400 py-6">No data for selected period.</td></tr>
+                  ) : pageRows.map((r, i) => {
                     const slice = {
                       periodStart: period.start, periodEnd: period.end,
                       from: period.start, to: period.end,
@@ -2096,11 +2096,10 @@ function CollectionEfficiencyView({ category, openDrill }) {
                         <td className="px-4 py-1.5 text-right text-amber-600">{formatLakhs(r.interest_overdue)}</td>
                       </tr>
                     );
-                  });
-                })()}
-              </tbody>
-            </table>
-          )} />
+                  })}
+                </tbody>
+              </table>
+            )} />
         </div>
       </div>
 
@@ -2115,26 +2114,27 @@ function CollectionEfficiencyView({ category, openDrill }) {
             <button onClick={() => downloadCSV(funderMix, `funder-mix-${period.end}.csv`)}
               className="text-xs text-teal-700 flex items-center gap-1"><Download size={12} /> CSV</button>
           </div>
-          <div className="overflow-y-auto max-h-72">
-            <SortableSection initialKey="collected" initialDir="desc" render={sort => (
-              <table className="w-full text-xs">
-                <thead className="sticky top-0 bg-white">
-                  <tr className="text-left text-gray-500 border-b">
-                    <th className="py-2 pr-2">{sort.header("funder", "Funder")}</th>
-                    <th className="py-2 pr-2">{sort.header("fund_source", "Fund Source")}</th>
-                    <th className="py-2 pr-2 text-right">{sort.header("principal_outstanding_end", "POS End")}</th>
-                    <th className="py-2 pr-2 text-right">{sort.header("demand", "Demand")}</th>
-                    <th className="py-2 pr-2 text-right">{sort.header("collected", "Collected")}</th>
-                    <th className="py-2 pr-2 text-right">{sort.header("cePct", "CE%")}</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {(() => {
-                    const sortedFunder = sort.apply(funderMix);
-                    if (sortedFunder.length === 0) {
-                      return <tr><td colSpan={6} className="py-4 text-center text-gray-400">None.</td></tr>;
-                    }
-                    return sortedFunder.map((f, i) => (
+          <div className="overflow-x-auto">
+            <PaginatedSortableSection
+              rows={funderMix}
+              initialKey="collected" initialDir="desc"
+              pageSize={10} label="funders"
+              render={({ sort, pageRows }) => (
+                <table className="w-full text-xs">
+                  <thead className="bg-gray-50">
+                    <tr className="text-left text-gray-500 border-b">
+                      <th className="py-2 pr-2">{sort.header("funder", "Funder")}</th>
+                      <th className="py-2 pr-2">{sort.header("fund_source", "Fund Source")}</th>
+                      <th className="py-2 pr-2 text-right">{sort.header("principal_outstanding_end", "POS End")}</th>
+                      <th className="py-2 pr-2 text-right">{sort.header("demand", "Demand")}</th>
+                      <th className="py-2 pr-2 text-right">{sort.header("collected", "Collected")}</th>
+                      <th className="py-2 pr-2 text-right">{sort.header("cePct", "CE%")}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {pageRows.length === 0 ? (
+                      <tr><td colSpan={6} className="py-4 text-center text-gray-400">None.</td></tr>
+                    ) : pageRows.map((f, i) => (
                       <tr key={i} className="border-b">
                         <td className="py-1.5 pr-2 font-medium">{f.funder}</td>
                         <td className="py-1.5 pr-2 text-gray-600">{f.fund_source}</td>
@@ -2143,11 +2143,10 @@ function CollectionEfficiencyView({ category, openDrill }) {
                         <td className="py-1.5 pr-2 text-right text-teal-700">{formatLakhs(f.collected)}</td>
                         <td className={`py-1.5 pr-2 text-right font-semibold ${ceColor(f.cePct)}`}>{formatPct(f.cePct)}</td>
                       </tr>
-                    ));
-                  })()}
-                </tbody>
-              </table>
-            )} />
+                    ))}
+                  </tbody>
+                </table>
+              )} />
           </div>
         </div>
 
@@ -2160,25 +2159,26 @@ function CollectionEfficiencyView({ category, openDrill }) {
             <button onClick={() => downloadCSV(recovery, `recovery-velocity-${period.end}.csv`)}
               className="text-xs text-teal-700 flex items-center gap-1"><Download size={12} /> CSV</button>
           </div>
-          <div className="overflow-y-auto max-h-72">
-            <SortableSection initialKey="principal_reduction" initialDir="desc" render={sort => (
-              <table className="w-full text-xs">
-                <thead className="sticky top-0 bg-white">
-                  <tr className="text-left text-gray-500 border-b">
-                    <th className="py-2 pr-2">{sort.header("customer_name", "Customer")}</th>
-                    <th className="py-2 pr-2">{sort.header("branch_name", "Branch")}</th>
-                    <th className="py-2 pr-2 text-right">{sort.header("principal_start", "POS Start")}</th>
-                    <th className="py-2 pr-2 text-right">{sort.header("principal_end", "POS End")}</th>
-                    <th className="py-2 pr-2 text-right">{sort.header("principal_reduction", "Reduced")}</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {(() => {
-                    const sortedRecovery = sort.apply(recovery);
-                    if (sortedRecovery.length === 0) {
-                      return <tr><td colSpan={5} className="py-4 text-center text-gray-400">None.</td></tr>;
-                    }
-                    return sortedRecovery.map((r, i) => (
+          <div className="overflow-x-auto">
+            <PaginatedSortableSection
+              rows={recovery}
+              initialKey="principal_reduction" initialDir="desc"
+              pageSize={10} label="accounts"
+              render={({ sort, pageRows }) => (
+                <table className="w-full text-xs">
+                  <thead className="bg-gray-50">
+                    <tr className="text-left text-gray-500 border-b">
+                      <th className="py-2 pr-2">{sort.header("customer_name", "Customer")}</th>
+                      <th className="py-2 pr-2">{sort.header("branch_name", "Branch")}</th>
+                      <th className="py-2 pr-2 text-right">{sort.header("principal_start", "POS Start")}</th>
+                      <th className="py-2 pr-2 text-right">{sort.header("principal_end", "POS End")}</th>
+                      <th className="py-2 pr-2 text-right">{sort.header("principal_reduction", "Reduced")}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {pageRows.length === 0 ? (
+                      <tr><td colSpan={5} className="py-4 text-center text-gray-400">None.</td></tr>
+                    ) : pageRows.map((r, i) => (
                       <tr key={i} className="border-b">
                         <td className="py-1.5 pr-2">
                           <div className="font-medium">{r.customer_name || "—"}</div>
@@ -2189,11 +2189,10 @@ function CollectionEfficiencyView({ category, openDrill }) {
                         <td className="py-1.5 pr-2 text-right">{formatLakhs(r.principal_outstanding_end)}</td>
                         <td className="py-1.5 pr-2 text-right font-semibold text-emerald-700">{formatLakhs(r.principal_reduced)}</td>
                       </tr>
-                    ));
-                  })()}
-                </tbody>
-              </table>
-            )} />
+                    ))}
+                  </tbody>
+                </table>
+              )} />
           </div>
         </div>
       </div>
@@ -2288,6 +2287,11 @@ function MonthlyCollectionsView({ category, openDrill }) {
   };
   const drillable = groupBy === "branch" || groupBy === "product";
 
+  // Pagination for the Officer/Branch/Product breakdown table — defaults
+  // to 10 rows per page so the dashboard isn't dominated by a 200-row
+  // scrolling block. User can switch to 25/50/100 from the bar.
+  const breakdownPg = usePagination(breakdown, 10);
+
   return (
     <div className="space-y-4">
       {/* Headline KPIs for the latest month */}
@@ -2325,43 +2329,49 @@ function MonthlyCollectionsView({ category, openDrill }) {
               className="text-xs text-teal-700 flex items-center gap-1"><Download size={12} /> CSV</button>
           </div>
         </div>
-        <div className="overflow-x-auto max-h-[28rem] overflow-y-auto">
-          <table className="w-full text-xs">
-            <thead className="sticky top-0 bg-gray-50 text-gray-600 uppercase text-[10px]">
-              <tr>
-                <th className="text-left px-4 py-2">Month</th>
-                <th className="text-right px-4 py-2">Accts</th>
-                <th className="text-right px-4 py-2">Demand</th>
-                <th className="text-right px-4 py-2">Prin. Collected</th>
-                <th className="text-right px-4 py-2">Int. Collected</th>
-                <th className="text-right px-4 py-2">Total Collected</th>
-                <th className="text-right px-4 py-2">Remaining (Prin.)</th>
-                <th className="text-right px-4 py-2">Remaining (Int.)</th>
-                <th className="text-right px-4 py-2">CE%</th>
-              </tr>
-            </thead>
-            <tbody>
-              {months.length === 0 ? (
-                <tr><td colSpan={9} className="text-center text-gray-400 py-6">
-                  {loadingMonths ? "Loading…" : "No client-period data uploaded yet."}
-                </td></tr>
-              ) : months.map(m => (
-                <tr key={m.year_month}
-                    onClick={() => setSelectedMonth(m.year_month)}
-                    className={`border-t hover:bg-gray-50 cursor-pointer ${selectedMonth === m.year_month ? "bg-teal-50/60" : ""}`}>
-                  <td className="px-4 py-1.5 font-medium text-gray-800">{monthLabel(m.year_month)}</td>
-                  <td className="px-4 py-1.5 text-right">{(m.accounts || 0).toLocaleString()}</td>
-                  <td className="px-4 py-1.5 text-right">{formatLakhs(m.total_demand)}</td>
-                  <td className="px-4 py-1.5 text-right text-indigo-700">{formatLakhs(m.principal_collected)}</td>
-                  <td className="px-4 py-1.5 text-right text-amber-700">{formatLakhs(m.interest_collected)}</td>
-                  <td className="px-4 py-1.5 text-right text-teal-700 font-medium">{formatLakhs(m.total_collected)}</td>
-                  <td className="px-4 py-1.5 text-right text-red-600">{formatLakhs(m.remaining_principal)}</td>
-                  <td className="px-4 py-1.5 text-right text-red-600">{formatLakhs(m.remaining_interest)}</td>
-                  <td className={`px-4 py-1.5 text-right font-semibold ${ceColor(m.ce_pct)}`}>{formatPct(m.ce_pct)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+        <div className="overflow-x-auto">
+          <PaginatedSortableSection
+            rows={months}
+            initialKey="year_month" initialDir="desc"
+            pageSize={10} label="months"
+            render={({ sort, pageRows }) => (
+              <table className="w-full text-xs">
+                <thead className="bg-gray-50 text-gray-600 uppercase text-[10px]">
+                  <tr>
+                    <th className="text-left px-4 py-2">{sort.header("year_month", "Month")}</th>
+                    <th className="text-right px-4 py-2">{sort.header("accounts", "Accts")}</th>
+                    <th className="text-right px-4 py-2">{sort.header("total_demand", "Demand")}</th>
+                    <th className="text-right px-4 py-2">{sort.header("principal_collected", "Prin. Collected")}</th>
+                    <th className="text-right px-4 py-2">{sort.header("interest_collected", "Int. Collected")}</th>
+                    <th className="text-right px-4 py-2">{sort.header("total_collected", "Total Collected")}</th>
+                    <th className="text-right px-4 py-2">{sort.header("remaining_principal", "Remaining (Prin.)")}</th>
+                    <th className="text-right px-4 py-2">{sort.header("remaining_interest", "Remaining (Int.)")}</th>
+                    <th className="text-right px-4 py-2">{sort.header("ce_pct", "CE%")}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {pageRows.length === 0 ? (
+                    <tr><td colSpan={9} className="text-center text-gray-400 py-6">
+                      {loadingMonths ? "Loading…" : "No client-period data uploaded yet."}
+                    </td></tr>
+                  ) : pageRows.map(m => (
+                    <tr key={m.year_month}
+                        onClick={() => setSelectedMonth(m.year_month)}
+                        className={`border-t hover:bg-gray-50 cursor-pointer ${selectedMonth === m.year_month ? "bg-teal-50/60" : ""}`}>
+                      <td className="px-4 py-1.5 font-medium text-gray-800">{monthLabel(m.year_month)}</td>
+                      <td className="px-4 py-1.5 text-right">{(m.accounts || 0).toLocaleString()}</td>
+                      <td className="px-4 py-1.5 text-right">{formatLakhs(m.total_demand)}</td>
+                      <td className="px-4 py-1.5 text-right text-indigo-700">{formatLakhs(m.principal_collected)}</td>
+                      <td className="px-4 py-1.5 text-right text-amber-700">{formatLakhs(m.interest_collected)}</td>
+                      <td className="px-4 py-1.5 text-right text-teal-700 font-medium">{formatLakhs(m.total_collected)}</td>
+                      <td className="px-4 py-1.5 text-right text-red-600">{formatLakhs(m.remaining_principal)}</td>
+                      <td className="px-4 py-1.5 text-right text-red-600">{formatLakhs(m.remaining_interest)}</td>
+                      <td className={`px-4 py-1.5 text-right font-semibold ${ceColor(m.ce_pct)}`}>{formatPct(m.ce_pct)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )} />
         </div>
       </div>
 
@@ -2411,9 +2421,9 @@ function MonthlyCollectionsView({ category, openDrill }) {
           <button onClick={() => downloadCSV(breakdown, `monthly-${groupBy}-${selectedMonth}.csv`)}
             className="text-xs text-teal-700 flex items-center gap-1"><Download size={12} /> CSV</button>
         </div>
-        <div className="overflow-x-auto max-h-[32rem] overflow-y-auto">
+        <div className="overflow-x-auto">
           <table className="w-full text-xs">
-            <thead className="sticky top-0 bg-gray-50 text-gray-600 uppercase text-[10px]">
+            <thead className="bg-gray-50 text-gray-600 uppercase text-[10px]">
               <tr>
                 <th className="text-left px-4 py-2">{groupBy.charAt(0).toUpperCase() + groupBy.slice(1)}</th>
                 <th className="text-right px-4 py-2">Accts</th>
@@ -2431,7 +2441,7 @@ function MonthlyCollectionsView({ category, openDrill }) {
                 <tr><td colSpan={9} className="text-center text-gray-400 py-6">
                   {loadingBreakdown ? "Loading…" : "No data for selected month."}
                 </td></tr>
-              ) : breakdown.map((r, i) => (
+              ) : breakdownPg.pageRows.map((r, i) => (
                 <tr key={`${r.label}-${i}`}
                     onClick={drillable ? () => openSliceForRow(r) : undefined}
                     className={`border-t hover:bg-gray-50 ${drillable ? "cursor-pointer" : ""}`}>
@@ -2449,6 +2459,7 @@ function MonthlyCollectionsView({ category, openDrill }) {
             </tbody>
           </table>
         </div>
+        <PaginationBar {...breakdownPg} label={`${groupBy}s`} />
       </div>
     </div>
   );
@@ -2831,6 +2842,9 @@ function DailyCollectionsView({ category, branches, openDrill }) {
   const [branch, setBranch] = useState("");
   const [data, setData] = useState({ byDay: [], byBranch: [], modeMix: [] });
   const [loading, setLoading] = useState(false);
+  // Display mode for the Mode Mix card — user toggles between a horizontal
+  // bar graph and a Mode / Total / Share % table. Default is graph.
+  const [modeMixView, setModeMixView] = useState("graph"); // "graph" | "table"
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -2986,80 +3000,133 @@ function DailyCollectionsView({ category, branches, openDrill }) {
             <button onClick={() => downloadCSV(data.byBranch, `branch-collections-${from}_${to}.csv`)}
               className="text-xs text-teal-700 flex items-center gap-1"><Download size={12} /> CSV</button>
           </div>
-          <div className="overflow-y-auto max-h-80">
-            <table className="w-full text-xs">
-              <thead className="sticky top-0 bg-white">
-                <tr className="text-left text-gray-500 border-b">
-                  <th className="py-2 pr-2">Branch</th>
-                  <th className="py-2 pr-2 text-right">Receipts</th>
-                  <th className="py-2 pr-2 text-right">Total</th>
-                  <th className="py-2 pr-2 text-right">Cash</th>
-                  <th className="py-2 pr-2 text-right">UPI</th>
-                  <th className="py-2 pr-2 text-right">Cheque</th>
-                  <th className="py-2 pr-2 text-right">Cash%</th>
-                </tr>
-              </thead>
-              <tbody>
-                {data.byBranch.length === 0 ? (
-                  <tr><td colSpan={7} className="py-4 text-center text-gray-400">None.</td></tr>
-                ) : data.byBranch.slice(0, 100).map((b, i) => {
-                  const cashPct = b.total > 0 ? (b.cash / b.total) * 100 : 0;
-                  return (
-                    <tr key={i} className="border-b hover:bg-teal-50/50 cursor-pointer"
-                        onClick={() => openDrill && openDrill({
-                          branch: b.branch, from, to,
-                          title: `Branch: ${b.branch}`,
-                          subtitle: `Receipts ${formatDateDMY(from)} → ${formatDateDMY(to)}`,
-                        })}>
-                      <td className="py-1.5 pr-2 font-medium">{b.branch}</td>
-                      <td className="py-1.5 pr-2 text-right">{(b.receipts || 0).toLocaleString()}</td>
-                      <td className="py-1.5 pr-2 text-right text-teal-700 font-medium">{formatLakhs(b.total)}</td>
-                      <td className="py-1.5 pr-2 text-right">{formatLakhs(b.cash)}</td>
-                      <td className="py-1.5 pr-2 text-right">{formatLakhs(b.upi)}</td>
-                      <td className="py-1.5 pr-2 text-right">{formatLakhs(b.cheque)}</td>
-                      <td className={`py-1.5 pr-2 text-right font-semibold ${cashPct > 70 ? "text-red-600" : cashPct > 40 ? "text-amber-600" : "text-emerald-700"}`}>
-                        {cashPct.toFixed(0)}%
-                      </td>
+          <div className="overflow-x-auto">
+            <PaginatedSortableSection
+              rows={data.byBranch.slice(0, 100)}
+              initialKey="total" initialDir="desc"
+              pageSize={10} label="branches"
+              render={({ sort, pageRows }) => (
+                <table className="w-full text-xs">
+                  <thead className="bg-gray-50">
+                    <tr className="text-left text-gray-500 border-b">
+                      <th className="py-2 pr-2">{sort.header("branch", "Branch")}</th>
+                      <th className="py-2 pr-2 text-right">{sort.header("receipts", "Receipts")}</th>
+                      <th className="py-2 pr-2 text-right">{sort.header("total", "Total")}</th>
+                      <th className="py-2 pr-2 text-right">{sort.header("cash", "Cash")}</th>
+                      <th className="py-2 pr-2 text-right">{sort.header("upi", "UPI")}</th>
+                      <th className="py-2 pr-2 text-right">{sort.header("cheque", "Cheque")}</th>
+                      <th className="py-2 pr-2 text-right">Cash%</th>
                     </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+                  </thead>
+                  <tbody>
+                    {pageRows.length === 0 ? (
+                      <tr><td colSpan={7} className="py-4 text-center text-gray-400">None.</td></tr>
+                    ) : pageRows.map((b, i) => {
+                      const cashPct = b.total > 0 ? (b.cash / b.total) * 100 : 0;
+                      return (
+                        <tr key={i} className="border-b hover:bg-teal-50/50 cursor-pointer"
+                            onClick={() => openDrill && openDrill({
+                              branch: b.branch, from, to,
+                              title: `Branch: ${b.branch}`,
+                              subtitle: `Receipts ${formatDateDMY(from)} → ${formatDateDMY(to)}`,
+                            })}>
+                          <td className="py-1.5 pr-2 font-medium">{b.branch}</td>
+                          <td className="py-1.5 pr-2 text-right">{(b.receipts || 0).toLocaleString()}</td>
+                          <td className="py-1.5 pr-2 text-right text-teal-700 font-medium">{formatLakhs(b.total)}</td>
+                          <td className="py-1.5 pr-2 text-right">{formatLakhs(b.cash)}</td>
+                          <td className="py-1.5 pr-2 text-right">{formatLakhs(b.upi)}</td>
+                          <td className="py-1.5 pr-2 text-right">{formatLakhs(b.cheque)}</td>
+                          <td className={`py-1.5 pr-2 text-right font-semibold ${cashPct > 70 ? "text-red-600" : cashPct > 40 ? "text-amber-600" : "text-emerald-700"}`}>
+                            {cashPct.toFixed(0)}%
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              )} />
           </div>
         </div>
 
         <div className="bg-white rounded-xl border p-4">
-          <h3 className="font-semibold text-gray-800 mb-3">Mode Mix</h3>
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="font-semibold text-gray-800">Mode Mix</h3>
+            {/* Graph / Table toggle — switches between a horizontal bar
+                chart and a tabular breakdown of the same data. */}
+            <div className="inline-flex rounded-lg border overflow-hidden text-xs">
+              <button
+                type="button"
+                onClick={() => setModeMixView("graph")}
+                className={`px-3 py-1 ${modeMixView === "graph" ? "bg-teal-600 text-white" : "bg-white text-gray-700 hover:bg-gray-100"}`}
+              >Graph</button>
+              <button
+                type="button"
+                onClick={() => setModeMixView("table")}
+                className={`px-3 py-1 border-l ${modeMixView === "table" ? "bg-teal-600 text-white" : "bg-white text-gray-700 hover:bg-gray-100"}`}
+              >Table</button>
+            </div>
+          </div>
           {data.modeMix.length === 0 ? (
             <div className="text-gray-400 text-sm">No data.</div>
+          ) : modeMixView === "graph" ? (
+            /* Horizontal bar chart — one bar per payment mode. Y-axis
+               carries the mode name, X-axis the amount in K/L/Cr. Bars
+               sorted by total descending so the dominant mode sits at
+               the top. Each bar uses the same color it would have in the
+               table swatch column for visual continuity. */
+            <ResponsiveContainer width="100%" height={Math.max(220, data.modeMix.length * 32)}>
+              <BarChart
+                data={[...data.modeMix].sort((a, b) => (b.total || 0) - (a.total || 0))}
+                layout="vertical"
+                margin={{ top: 8, right: 16, left: 8, bottom: 8 }}
+              >
+                <CartesianGrid strokeDasharray="3 3" horizontal={false} />
+                <XAxis type="number" fontSize={11}
+                  tickFormatter={v => v >= 1e7 ? `${(v / 1e7).toFixed(1)}Cr` : v >= 1e5 ? `${(v / 1e5).toFixed(1)}L` : `${Math.round(v / 1000)}K`}
+                />
+                <YAxis type="category" dataKey="mode" fontSize={11} width={70} interval={0} />
+                <Tooltip
+                  formatter={(v, n, e) => {
+                    const pct = totals.total > 0 ? ((v / totals.total) * 100).toFixed(1) : "0.0";
+                    return [`${formatLakhs(v)} (${pct}%)`, e.payload.mode];
+                  }}
+                />
+                <Bar dataKey="total" name="Amount">
+                  {[...data.modeMix].sort((a, b) => (b.total || 0) - (a.total || 0)).map((_, i) =>
+                    <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
           ) : (
-            <>
-              <ResponsiveContainer width="100%" height={200}>
-                <PieChart>
-                  <Pie data={data.modeMix} cx="50%" cy="50%" innerRadius={50} outerRadius={80}
-                    dataKey="total" nameKey="mode"
-                    paddingAngle={1} minAngle={2}
-                    isAnimationActive={false}>
-                    {data.modeMix.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
-                  </Pie>
-                  <Tooltip formatter={(v, n) => [formatLakhs(v), n]} />
-                </PieChart>
-              </ResponsiveContainer>
-              <div className="mt-3 space-y-1 text-xs">
-                {data.modeMix.map((m, i) => {
-                  const pct = totals.total > 0 ? (m.total / totals.total) * 100 : 0;
-                  return (
-                    <div key={i} className="flex items-center justify-between">
-                      <div className="flex items-center gap-1.5">
-                        <span className="w-2 h-2 rounded-full" style={{ backgroundColor: COLORS[i % COLORS.length] }} />
-                        <span className="text-gray-700">{m.mode}</span>
-                      </div>
-                      <span className="text-gray-500">{formatLakhs(m.total)} <span className="text-gray-400">({pct.toFixed(0)}%)</span></span>
-                    </div>
-                  );
-                })}
-              </div>
-            </>
+            /* Tabular breakdown — same data, sortable columns. Color swatch
+               on each row matches the doughnut slice color. */
+            <div className="overflow-x-auto rounded-lg border">
+              <table className="w-full text-xs">
+                <thead className="bg-gray-50">
+                  <tr>
+                    <th className="px-3 py-2 text-left font-medium text-gray-600">Mode</th>
+                    <th className="px-3 py-2 text-right font-medium text-gray-600">Amount</th>
+                    <th className="px-3 py-2 text-right font-medium text-gray-600">Share</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  {data.modeMix.map((m, i) => {
+                    const pct = totals.total > 0 ? (m.total / totals.total) * 100 : 0;
+                    return (
+                      <tr key={i} className="hover:bg-gray-50">
+                        <td className="px-3 py-2 font-medium text-gray-800">
+                          <span className="inline-block w-2.5 h-2.5 rounded-sm mr-2 align-middle"
+                            style={{ background: COLORS[i % COLORS.length] }} />
+                          {m.mode}
+                        </td>
+                        <td className="px-3 py-2 text-right font-semibold">{formatLakhs(m.total)}</td>
+                        <td className="px-3 py-2 text-right text-gray-500">{pct.toFixed(1)}%</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
           )}
         </div>
       </div>
@@ -3444,10 +3511,25 @@ function BranchPerformanceView({ category, openDrill }) {
           </select>
         </div>
         <div>
-          <label className="block text-xs text-gray-500 mb-1">Search branch</label>
-          <input type="text" value={query} onChange={e => setQuery(e.target.value)}
-            placeholder="Branch name…"
-            className="w-full px-2.5 py-2 border rounded-lg text-sm" />
+          <label className="block text-xs text-gray-500 mb-1">Branch</label>
+          {/* Branch picker — dropdown over the full universe of branches in
+              the current period (rows), sorted alphabetically. Empty value
+              ("All branches") clears the filter. The downstream `filtered`
+              computation already uses `query` as a substring match, so an
+              exact-name selection from this dropdown matches that one
+              branch only. */}
+          <select
+            value={query}
+            onChange={e => setQuery(e.target.value)}
+            className="w-full px-2.5 py-2 border rounded-lg text-sm bg-white"
+          >
+            <option value="">All branches</option>
+            {[...rows]
+              .map(r => r.branch)
+              .filter(Boolean)
+              .sort((a, b) => a.localeCompare(b))
+              .map(b => <option key={b} value={b}>{b}</option>)}
+          </select>
         </div>
         <div className="text-xs text-gray-500 self-center">
           {loading ? "Loading…" : `${rows.length} branches tracked`}
@@ -3650,6 +3732,11 @@ function ProductPerformanceView({ category, openDrill }) {
     return arr;
   }, [rows, sortKey, sortDir]);
 
+  // Pagination for the Product Scorecard table — defaults to 10 rows/page.
+  const productPg = usePagination(sorted, 10);
+  // Pagination for the Collections-by-Product table.
+  const collByProductPg = usePagination(collByProduct, 10);
+
   const totals = useMemo(() => rows.reduce((a, r) => ({
     accounts: a.accounts + (r.accounts || 0),
     principal_outstanding: a.principal_outstanding + (r.principal_outstanding || 0),
@@ -3783,9 +3870,9 @@ function ProductPerformanceView({ category, openDrill }) {
           <h3 className="font-semibold text-gray-800">Product Scorecard</h3>
           <span className="text-xs text-gray-500">Click any row for detail.</span>
         </div>
-        <div className="overflow-x-auto max-h-[480px] overflow-y-auto">
+        <div className="overflow-x-auto">
           <table className="w-full text-xs">
-            <thead className="sticky top-0 bg-gray-50 text-gray-600 uppercase text-[10px] z-10">
+            <thead className="bg-gray-50 text-gray-600 uppercase text-[10px]">
               <tr>
                 <th className="text-left px-3 py-2">{sortBtn("product", "Product")}</th>
                 <th className="text-right px-3 py-2">{sortBtn("accounts", "Accts")}</th>
@@ -3804,7 +3891,7 @@ function ProductPerformanceView({ category, openDrill }) {
             <tbody>
               {sorted.length === 0 ? (
                 <tr><td colSpan={12} className="text-center text-gray-400 py-6">No product data. Upload a Client-Wise Collection Report to populate.</td></tr>
-              ) : sorted.map((r, i) => (
+              ) : productPg.pageRows.map((r, i) => (
                 <tr key={r.product + "-" + i}
                     onClick={() => drill(r.product)}
                     className="border-t hover:bg-indigo-50/50 cursor-pointer group">
@@ -3827,6 +3914,9 @@ function ProductPerformanceView({ category, openDrill }) {
             </tbody>
           </table>
         </div>
+        <div className="px-5 py-2 border-t">
+          <PaginationBar {...productPg} label="products" />
+        </div>
       </div>
 
       {/* Collections by product */}
@@ -3836,9 +3926,9 @@ function ProductPerformanceView({ category, openDrill }) {
           <button onClick={() => downloadCSV(collByProduct, `collections-by-product-${period.end}.csv`)}
             className="text-xs text-teal-700 flex items-center gap-1"><Download size={12} /> CSV</button>
         </div>
-        <div className="overflow-x-auto max-h-80 overflow-y-auto">
+        <div className="overflow-x-auto">
           <table className="w-full text-xs">
-            <thead className="sticky top-0 bg-gray-50 text-gray-600 uppercase text-[10px] z-10">
+            <thead className="bg-gray-50 text-gray-600 uppercase text-[10px]">
               <tr>
                 <th className="text-left px-3 py-2">Product</th>
                 <th className="text-right px-3 py-2">Receipts</th>
@@ -3856,7 +3946,7 @@ function ProductPerformanceView({ category, openDrill }) {
             <tbody>
               {collByProduct.length === 0 ? (
                 <tr><td colSpan={11} className="text-center text-gray-400 py-6">No receipts in this window.</td></tr>
-              ) : collByProduct.map((r, i) => (
+              ) : collByProductPg.pageRows.map((r, i) => (
                 <tr key={r.product + "-" + i}
                     onClick={() => drill(r.product)}
                     className="border-t hover:bg-amber-50/50 cursor-pointer group">
@@ -3877,6 +3967,9 @@ function ProductPerformanceView({ category, openDrill }) {
               ))}
             </tbody>
           </table>
+        </div>
+        <div className="px-5 py-2 border-t">
+          <PaginationBar {...collByProductPg} label="products" />
         </div>
       </div>
 
