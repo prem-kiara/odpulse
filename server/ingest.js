@@ -53,6 +53,23 @@ function writeBranchesAtomic(branchesFile, branches) {
   fs.renameSync(tmp, branchesFile);
 }
 
+// Append a single branch to branches.json if it isn't already present.
+// Used by the per-row Overdue / Collections / Client-Period ingest flows
+// that don't batch a `pendingBranches` array. Mutates the in-memory
+// `branchRegistry` Set so subsequent rows in the same file skip the
+// disk write. The on-disk write is atomic (temp file + rename). Empty
+// branch names are silently ignored. Errors surface to the caller.
+function addBranchIfMissing(branchesFile, branch, branchRegistry) {
+  if (!branch) return;
+  const key = String(branch).toLowerCase();
+  if (branchRegistry.has(key)) return;
+  branchRegistry.add(key);
+  const existing = readBranches(branchesFile);
+  // Re-check on disk in case another writer beat us here — still cheap.
+  if (existing.some(b => String(b).toLowerCase() === key)) return;
+  writeBranchesAtomic(branchesFile, existing.concat(branch));
+}
+
 // Validate required headers exist (case-insensitive, trim-insensitive).
 // Returns the list of missing columns (empty = OK).
 function missingColumns(firstRow, required) {

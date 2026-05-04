@@ -3,7 +3,8 @@ import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContaine
 import { Plus, Trash2, LogOut, Settings, Users, GitBranch, LayoutDashboard, FileText, ChevronDown, ChevronRight, ArrowLeft, Search, Eye, EyeOff, Edit2, Save, X, AlertTriangle, CheckCircle, Database, Shield, UserPlus, ChevronUp, Download, Calendar, Tag, Lock, Upload, Bell, Clock, CreditCard, TrendingUp, Activity } from "lucide-react";
 import { CustomerInfoPanel, DataUploadPage, CollectionDashboard } from "./OdInsights.jsx";
 import ReportsAnalytics from "./ReportsAnalytics.jsx";
-import { SortableSection } from "./tableSort.jsx";
+import { SortableSection, PaginatedSortableSection } from "./tableSort.jsx";
+import { usePagination, PaginationBar } from "./Pagination";
 
 // ─── Constants & Helpers ────────────────────────────────────────────────────
 const COLORS = ["#0f766e", "#06b6d4", "#8b5cf6", "#f59e0b", "#ef4444", "#10b981", "#ec4899", "#6366f1", "#14b8a6", "#f97316"];
@@ -35,6 +36,29 @@ const formatLakhs = (num) => {
   if (n >= 1000) return `Rs. ${(n / 1000).toFixed(1)} K`;
   return formatINR(n);
 };
+
+// True only when an entry has a real, authorized waiver. Filters out
+// phantom entries from older buggy bulk imports that stamped placeholder
+// approvals with approverName="Bulk Upload" and the OD Type as the email
+// subject. Real authorizations carry the actual user's name.
+const isAuthorizedWaiver = (e) => {
+  if (!e || !e.waiverApproval) return false;
+  const approver = String(e.waiverApproval.approverName || "").trim();
+  const subject  = String(e.waiverApproval.emailSubject  || "").trim();
+  if (approver === "" || approver === "Bulk Upload") return false;
+  // Filter out the synthetic case where the subject was just the OD Type
+  // (e.g. emailSubject = "Group OD" / "Individual OD" / "Self OD").
+  if (subject === "" || subject === e.odType) return false;
+  return true;
+};
+const sumAuthorizedWaiver = (arr) =>
+  (arr || []).reduce((s, e) => s + (isAuthorizedWaiver(e) ? (Number(e.waiver) || 0) : 0), 0);
+const countAuthorizedWaiver = (arr) =>
+  (arr || []).filter(e => isAuthorizedWaiver(e) && Number(e.waiver) > 0).length;
+// Per-entry equivalent — used by accumulator loops over byBranch /
+// byStaff / byMonth / byPaymentMode so they sum only authorized waivers
+// and never count synthetic placeholders from older bulk imports.
+const authorizedWaiverOf = (e) => isAuthorizedWaiver(e) ? (Number(e.waiver) || 0) : 0;
 
 const generateId = () => Date.now().toString(36) + Math.random().toString(36).substr(2, 9);
 const nowDate = () => new Date().toISOString().split("T")[0];
@@ -2333,7 +2357,14 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
   };
 
   const totalRecovered = visibleEntries.reduce((s, e) => s + getPaid(e), 0);
-  const totalWaiver = visibleEntries.reduce((s, e) => s + (Number(e.waiver) || 0), 0);
+  // Only count waivers that carry a real authorization record. Synthetic
+  // placeholders from old buggy bulk imports (approverName="Bulk Upload",
+  // empty/derived subject) are filtered out by isAuthorizedWaiver.
+  const totalWaiver = sumAuthorizedWaiver(visibleEntries);
+
+  // Pagination over the already-filtered + sorted visibleEntries. Default
+  // 10/page; user can switch to 25/50/100 via the bar.
+  const entriesPg = usePagination(visibleEntries, 10);
 
   return (
     <div>
@@ -2509,7 +2540,7 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
             <tbody>
               {visibleEntries.length === 0 ? (
                 <tr><td colSpan={odTypeFilter === "Individual OD" ? 9 : 13} className="text-center py-12 text-gray-400">No records found</td></tr>
-              ) : visibleEntries.map(e => {
+              ) : entriesPg.pageRows.map(e => {
                 const paid = getPaid(e);
                 return (
                 <React.Fragment key={e.id}>
@@ -2541,15 +2572,16 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
                       )}
                     </td>
                     <td className="px-4 py-3 text-right">
-                      {e.ptpStatus === "pending" ? (
-                        <span className="text-orange-600 text-xs">{formatDateDMY(e.ptpDate)} {e.ptpTime || ""}</span>
-                      ) : e.waiver > 0 ? (
-                        <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-amber-100 text-amber-800 rounded-full text-xs font-medium">
-                          <AlertTriangle size={10} /> {formatINR(e.waiver)}
-                        </span>
-                      ) : (
-                        <span className="text-green-600 text-xs">No waiver</span>
-                      )}
+                      {(() => {
+                        const aw = authorizedWaiverOf(e);
+                        if (e.ptpStatus === "pending") return <span className="text-orange-600 text-xs">{formatDateDMY(e.ptpDate)} {e.ptpTime || ""}</span>;
+                        if (aw > 0) return (
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-amber-100 text-amber-800 rounded-full text-xs font-medium">
+                            <AlertTriangle size={10} /> {formatINR(aw)}
+                          </span>
+                        );
+                        return <span className="text-green-600 text-xs">No waiver</span>;
+                      })()}
                     </td>
                     <td className="px-4 py-3 text-left">
                       <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${
@@ -2678,6 +2710,11 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
             </tbody>
           </table>
         </div>
+        {visibleEntries.length > 0 && (
+          <div className="px-4 py-2 border-t">
+            <PaginationBar {...entriesPg} label="records" />
+          </div>
+        )}
       </div>
 
       {ptpPaymentEntry && (
@@ -2820,21 +2857,48 @@ function Dashboard({ user, entries, branches, config }) {
   // Helper: backward compat — old entries used customerShare as paid, new entries have totalPaidAmount
   const getEntryPaid = (e) => e.totalPaidAmount !== undefined ? e.totalPaidAmount : (Number(e.customerShare) || 0);
 
-  // Helper: get the OD amount due (Group OD uses groupOdAmount; Individual OD uses amountDue)
-  const getODAmount = (e) => e.odType === "Individual OD" ? (Number(e.amountDue) || 0) : (Number(e.groupOdAmount) || 0);
+  // Helper: decide whether a waiver record is a real authorized waiver
+  // (vs. a phantom from older buggy bulk imports). A real authorization has
+  // BOTH a non-placeholder approver AND a non-empty subject. The previous
+  // parser stamped synthetic approvals with approverName="Bulk Upload" and
+  // emailSubject = the OD Type — those are filtered out here. Form-entered
+  // waivers carry the actual user's name in approverName, so they pass.
+
+  // Helper: get the OD amount due.
+  //   Individual OD → e.amountDue.
+  //   Group OD      → e.groupOdAmount (the full group's OD due). For older
+  //                   entries that were uploaded via a CSV format which
+  //                   captured only customerShare and not the group total,
+  //                   groupOdAmount can be 0 even though the entry is real.
+  //                   Fall back to customerShare × numberOfCustomers in
+  //                   that case — it's the same value mathematically and
+  //                   recovers the proper figure without modifying any
+  //                   stored data.
+  const getODAmount = (e) => {
+    if (e.odType === "Individual OD") return Number(e.amountDue) || 0;
+    const stored = Number(e.groupOdAmount) || 0;
+    if (stored > 0) return stored;
+    const share = Number(e.customerShare) || 0;
+    const nMembers = Number(e.numberOfCustomers) || 0;
+    if (share > 0 && nMembers > 0) return share * nMembers;
+    return 0;
+  };
 
   const stats = useMemo(() => {
     const totalRecovered = visibleEntries.reduce((s, e) => s + getEntryPaid(e), 0);
     const totalGroupOD = visibleEntries.reduce((s, e) => s + getODAmount(e), 0);
-    const totalWaiver = visibleEntries.reduce((s, e) => s + (Number(e.waiver) || 0), 0);
-    const entriesWithWaiver = visibleEntries.filter(e => (Number(e.waiver) || 0) > 0).length;
+    // Only count properly authorized waivers (real approver name + non-
+    // empty subject). Synthetic "Bulk Upload" placeholders from older
+    // buggy imports are filtered out by isAuthorizedWaiver.
+    const totalWaiver = sumAuthorizedWaiver(visibleEntries);
+    const entriesWithWaiver = countAuthorizedWaiver(visibleEntries);
 
     // Branch breakdown
     const byBranch = {};
     visibleEntries.forEach(e => {
       if (!byBranch[e.branch]) byBranch[e.branch] = { branch: e.branch, recovered: 0, waiver: 0, groupOD: 0, count: 0 };
       byBranch[e.branch].recovered += getEntryPaid(e);
-      byBranch[e.branch].waiver += Number(e.waiver) || 0;
+      byBranch[e.branch].waiver += authorizedWaiverOf(e);
       byBranch[e.branch].groupOD += getODAmount(e);
       byBranch[e.branch].count += 1;
     });
@@ -2847,7 +2911,7 @@ function Dashboard({ user, entries, branches, config }) {
       const staffId = e.enteredBy || "unknown";
       if (!byStaff[staffId]) byStaff[staffId] = { staffId, staff: staffName, recovered: 0, waiver: 0, groupOD: 0, count: 0 };
       byStaff[staffId].recovered += getEntryPaid(e);
-      byStaff[staffId].waiver += Number(e.waiver) || 0;
+      byStaff[staffId].waiver += authorizedWaiverOf(e);
       byStaff[staffId].groupOD += getODAmount(e);
       byStaff[staffId].count += 1;
     });
@@ -2859,7 +2923,7 @@ function Dashboard({ user, entries, branches, config }) {
       const m = e.date ? e.date.substring(0, 7) : "Unknown";
       if (!byMonth[m]) byMonth[m] = { month: m, recovered: 0, waiver: 0, count: 0 };
       byMonth[m].recovered += getEntryPaid(e);
-      byMonth[m].waiver += Number(e.waiver) || 0;
+      byMonth[m].waiver += authorizedWaiverOf(e);
       byMonth[m].count += 1;
     });
     const monthData = Object.values(byMonth).sort((a, b) => a.month.localeCompare(b.month));
@@ -2870,7 +2934,7 @@ function Dashboard({ user, entries, branches, config }) {
       const mode = e.ptpPaymentMode || e.paymentMode || "Not Specified";
       if (!byPaymentMode[mode]) byPaymentMode[mode] = { mode, recovered: 0, waiver: 0, count: 0 };
       byPaymentMode[mode].recovered += getEntryPaid(e);
-      byPaymentMode[mode].waiver += Number(e.waiver) || 0;
+      byPaymentMode[mode].waiver += authorizedWaiverOf(e);
       byPaymentMode[mode].count += 1;
     });
     const paymentModeData = Object.values(byPaymentMode).sort((a, b) => b.recovered - a.recovered);
@@ -2884,7 +2948,7 @@ function Dashboard({ user, entries, branches, config }) {
     let panelEntries = visibleEntries;
     let highlightField = null;
     if (drillPanel === "recovered") { panelTitle = "Recovery Details"; highlightField = "paid"; }
-    else if (drillPanel === "waiver") { panelTitle = "Waiver Details"; panelEntries = visibleEntries.filter(e => (Number(e.waiver) || 0) > 0); highlightField = "waiver"; }
+    else if (drillPanel === "waiver") { panelTitle = "Waiver Details"; panelEntries = visibleEntries.filter(e => isAuthorizedWaiver(e) && (Number(e.waiver) || 0) > 0); highlightField = "waiver"; }
     else if (drillPanel === "groupod") { panelTitle = "Group OD Details"; highlightField = "groupod"; }
 
     // Group by branch for summary
@@ -2893,8 +2957,11 @@ function Dashboard({ user, entries, branches, config }) {
       if (!byBranch[e.branch]) byBranch[e.branch] = { branch: e.branch, entries: 0, recovered: 0, waiver: 0, groupOD: 0 };
       byBranch[e.branch].entries += 1;
       byBranch[e.branch].recovered += getEntryPaid(e);
-      byBranch[e.branch].waiver += Number(e.waiver) || 0;
-      byBranch[e.branch].groupOD += Number(e.groupOdAmount) || 0;
+      byBranch[e.branch].waiver += authorizedWaiverOf(e);
+      // Same fallback as getODAmount — older entries may have stored 0
+      // for groupOdAmount but a non-zero customerShare × numberOfCustomers
+      // recovers the correct figure.
+      byBranch[e.branch].groupOD += getODAmount(e);
     });
     const branchSummary = Object.values(byBranch).sort((a, b) => b.recovered - a.recovered);
 
@@ -2907,68 +2974,82 @@ function Dashboard({ user, entries, branches, config }) {
         <div className="grid grid-cols-1 sm:grid-cols-4 gap-4 mb-6">
           <div className="bg-white rounded-xl border p-4"><p className="text-xs text-gray-500">Total Entries</p><p className="text-2xl font-bold">{panelEntries.length}</p></div>
           <div className="bg-white rounded-xl border p-4"><p className="text-xs text-gray-500">Total Recovered</p><p className="text-2xl font-bold text-teal-700">{formatLakhs(panelEntries.reduce((s, e) => s + getEntryPaid(e), 0))}</p></div>
-          <div className="bg-white rounded-xl border p-4"><p className="text-xs text-gray-500">Total Waiver</p><p className="text-2xl font-bold text-amber-700">{formatLakhs(panelEntries.reduce((s, e) => s + (Number(e.waiver) || 0), 0))}</p></div>
+          <div className="bg-white rounded-xl border p-4"><p className="text-xs text-gray-500">Total Waiver</p><p className="text-2xl font-bold text-amber-700">{formatLakhs(sumAuthorizedWaiver(panelEntries))}</p></div>
           <div className="bg-white rounded-xl border p-4"><p className="text-xs text-gray-500">Total OD Due</p><p className="text-2xl font-bold text-gray-600">{formatLakhs(panelEntries.reduce((s, e) => s + getODAmount(e), 0))}</p></div>
         </div>
 
         {/* Branch-wise breakdown */}
         <div className="bg-white rounded-xl border overflow-hidden mb-6">
           <h3 className="text-sm font-semibold text-gray-700 p-4 border-b">Branch-wise Breakdown</h3>
-          <SortableSection initialKey="recovered" initialDir="desc" render={sort => (
-            <table className="w-full text-sm">
-              <thead className="bg-gray-50 border-b">
-                <tr>
-                  <th className="text-left px-4 py-2">{sort.header("branch", "Branch")}</th>
-                  <th className="text-right px-4 py-2">{sort.header("entries", "Entries")}</th>
-                  <th className="text-right px-4 py-2">{sort.header("recovered", "Recovered")}</th>
-                  <th className="text-right px-4 py-2">{sort.header("waiver", "Waiver")}</th>
-                  <th className="text-right px-4 py-2">{sort.header("groupOD", "Group OD")}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {sort.apply(branchSummary).map(b => (
-                  <tr key={b.branch} className="border-b hover:bg-gray-50 cursor-pointer" onClick={() => { setDrillPanel(null); setDrillBranch(b.branch); }}>
-                    <td className="px-4 py-2 font-medium">{b.branch}</td>
-                    <td className="px-4 py-2 text-right">{b.entries}</td>
-                    <td className={`px-4 py-2 text-right font-medium ${highlightField === "paid" ? "text-teal-700" : ""}`}>{formatINR(b.recovered)}</td>
-                    <td className={`px-4 py-2 text-right font-medium ${highlightField === "waiver" ? "text-amber-700" : ""}`}>{b.waiver > 0 ? formatINR(b.waiver) : "—"}</td>
-                    <td className={`px-4 py-2 text-right font-medium ${highlightField === "groupod" ? "text-gray-700" : ""}`}>{formatINR(b.groupOD)}</td>
+          <PaginatedSortableSection
+            rows={branchSummary}
+            initialKey="recovered" initialDir="desc"
+            pageSize={10} label="branches"
+            render={({ sort, pageRows }) => (
+              <table className="w-full text-sm">
+                <thead className="bg-gray-50 border-b">
+                  <tr>
+                    <th className="text-left px-4 py-2">{sort.header("branch", "Branch")}</th>
+                    <th className="text-right px-4 py-2">{sort.header("entries", "Entries")}</th>
+                    <th className="text-right px-4 py-2">{sort.header("recovered", "Recovered")}</th>
+                    <th className="text-right px-4 py-2">{sort.header("waiver", "Waiver")}</th>
+                    <th className="text-right px-4 py-2">{sort.header("groupOD", "Group OD")}</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          )} />
+                </thead>
+                <tbody>
+                  {pageRows.map(b => (
+                    <tr key={b.branch} className="border-b hover:bg-gray-50 cursor-pointer" onClick={() => { setDrillPanel(null); setDrillBranch(b.branch); }}>
+                      <td className="px-4 py-2 font-medium">{b.branch}</td>
+                      <td className="px-4 py-2 text-right">{b.entries}</td>
+                      <td className={`px-4 py-2 text-right font-medium ${highlightField === "paid" ? "text-teal-700" : ""}`}>{formatINR(b.recovered)}</td>
+                      <td className={`px-4 py-2 text-right font-medium ${highlightField === "waiver" ? "text-amber-700" : ""}`}>{b.waiver > 0 ? formatINR(b.waiver) : "—"}</td>
+                      <td className={`px-4 py-2 text-right font-medium ${highlightField === "groupod" ? "text-gray-700" : ""}`}>{formatINR(b.groupOD)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )} />
         </div>
 
         {/* Recent entries */}
         <div className="bg-white rounded-xl border overflow-hidden">
-          <h3 className="text-sm font-semibold text-gray-700 p-4 border-b">Recent Entries ({Math.min(panelEntries.length, 25)} of {panelEntries.length})</h3>
-          <SortableSection initialKey="date" initialDir="desc" render={sort => (
-            <table className="w-full text-sm">
-              <thead className="bg-gray-50 border-b">
-                <tr>
-                  <th className="text-left px-4 py-2">{sort.header("date", "Date")}</th>
-                  <th className="text-left px-4 py-2">{sort.header("branch", "Branch")}</th>
-                  <th className="text-left px-4 py-2">{sort.header("customerName", "Customer")}</th>
-                  <th className="text-right px-4 py-2">{sort.header("paid", "Paid")}</th>
-                  <th className="text-right px-4 py-2">{sort.header("waiver", "Waiver")}</th>
-                  <th className="text-left px-4 py-2">{sort.header("paymentMode", "Payment Mode")}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {sort.apply(panelEntries.slice(0, 25)).map(e => (
-                  <tr key={e.id} className="border-b">
-                    <td className="px-4 py-2">{formatDateDMY(e.date)}</td>
-                    <td className="px-4 py-2">{e.branch}</td>
-                    <td className="px-4 py-2">{e.customerName} <span className="text-xs text-gray-400">({e.customerId})</span></td>
-                    <td className="px-4 py-2 text-right text-teal-700 font-medium">{formatINR(getEntryPaid(e))}</td>
-                    <td className="px-4 py-2 text-right">{e.waiver > 0 ? <span className="text-amber-600">{formatINR(e.waiver)}</span> : <span className="text-gray-400">—</span>}</td>
-                    <td className="px-4 py-2">{e.ptpPaymentMode || e.paymentMode || "—"}</td>
+          <h3 className="text-sm font-semibold text-gray-700 p-4 border-b">Recent Entries ({panelEntries.length} total)</h3>
+          <PaginatedSortableSection
+            rows={panelEntries}
+            initialKey="date" initialDir="desc"
+            pageSize={10} label="entries"
+            render={({ sort, pageRows }) => (
+              <table className="w-full text-sm">
+                <thead className="bg-gray-50 border-b">
+                  <tr>
+                    <th className="text-left px-4 py-2">{sort.header("date", "Date")}</th>
+                    <th className="text-left px-4 py-2">{sort.header("branch", "Branch")}</th>
+                    <th className="text-left px-4 py-2">{sort.header("customerName", "Customer")}</th>
+                    <th className="text-right px-4 py-2">{sort.header("paid", "Paid")}</th>
+                    <th className="text-right px-4 py-2">{sort.header("waiver", "Waiver")}</th>
+                    <th className="text-left px-4 py-2">{sort.header("paymentMode", "Payment Mode")}</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          )} />
+                </thead>
+                <tbody>
+                  {pageRows.map(e => {
+                    // Show the per-row Waiver only when it's a real authorized
+                    // waiver (form-entered with a real approver). Synthetic
+                    // placeholders from old buggy bulk imports collapse to "—".
+                    const waiverShown = authorizedWaiverOf(e);
+                    return (
+                      <tr key={e.id} className="border-b">
+                        <td className="px-4 py-2">{formatDateDMY(e.date)}</td>
+                        <td className="px-4 py-2">{e.branch}</td>
+                        <td className="px-4 py-2">{e.customerName} <span className="text-xs text-gray-400">({e.customerId})</span></td>
+                        <td className="px-4 py-2 text-right text-teal-700 font-medium">{formatINR(getEntryPaid(e))}</td>
+                        <td className="px-4 py-2 text-right">{waiverShown > 0 ? <span className="text-amber-600">{formatINR(waiverShown)}</span> : <span className="text-gray-400">—</span>}</td>
+                        <td className="px-4 py-2">{e.ptpPaymentMode || e.paymentMode || "—"}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )} />
         </div>
       </div>
     );
@@ -2977,14 +3058,14 @@ function Dashboard({ user, entries, branches, config }) {
   if (drillStaff) {
     const staffEntries = visibleEntries.filter(e => (e.enteredBy || "unknown") === drillStaff.staffId);
     const staffRecovered = staffEntries.reduce((s, e) => s + getEntryPaid(e), 0);
-    const staffWaiver = staffEntries.reduce((s, e) => s + (Number(e.waiver) || 0), 0);
+    const staffWaiver = sumAuthorizedWaiver(staffEntries);
 
     const byMonth = {};
     staffEntries.forEach(e => {
       const m = e.date ? e.date.substring(0, 7) : "Unknown";
       if (!byMonth[m]) byMonth[m] = { month: m, recovered: 0, waiver: 0, count: 0 };
       byMonth[m].recovered += getEntryPaid(e);
-      byMonth[m].waiver += Number(e.waiver) || 0;
+      byMonth[m].waiver += authorizedWaiverOf(e);
       byMonth[m].count += 1;
     });
     const mData = Object.values(byMonth).sort((a, b) => a.month.localeCompare(b.month));
@@ -3017,8 +3098,12 @@ function Dashboard({ user, entries, branches, config }) {
           </div>
         )}
         <div className="bg-white rounded-xl border overflow-hidden">
-          <h3 className="text-sm font-semibold text-gray-700 p-4 border-b">Recent Entries</h3>
-          <SortableSection initialKey="date" initialDir="desc" render={sort => (
+          <h3 className="text-sm font-semibold text-gray-700 p-4 border-b">Recent Entries ({staffEntries.length} total)</h3>
+          <PaginatedSortableSection
+            rows={staffEntries}
+            initialKey="date" initialDir="desc"
+            pageSize={10} label="entries"
+            render={({ sort, pageRows }) => (
             <table className="w-full text-sm">
               <thead className="bg-gray-50 border-b">
                 <tr>
@@ -3030,13 +3115,13 @@ function Dashboard({ user, entries, branches, config }) {
                 </tr>
               </thead>
               <tbody>
-                {sort.apply(staffEntries.slice(0, 20)).map(e => (
+                {pageRows.map(e => (
                   <tr key={e.id} className="border-b">
                     <td className="px-4 py-2">{formatDateDMY(e.date)}</td>
                     <td className="px-4 py-2">{e.branch}</td>
                     <td className="px-4 py-2">{e.customerName} <span className="text-xs text-gray-400">({e.customerId})</span></td>
                     <td className="px-4 py-2 text-right text-teal-700 font-medium">{formatINR(getEntryPaid(e))}</td>
-                    <td className="px-4 py-2 text-right">{e.waiver > 0 ? <span className="text-amber-600">{formatINR(e.waiver)}</span> : <span className="text-gray-400">—</span>}</td>
+                    <td className="px-4 py-2 text-right">{authorizedWaiverOf(e) > 0 ? <span className="text-amber-600">{formatINR(authorizedWaiverOf(e))}</span> : <span className="text-gray-400">—</span>}</td>
                   </tr>
                 ))}
               </tbody>
@@ -3050,14 +3135,14 @@ function Dashboard({ user, entries, branches, config }) {
   if (drillBranch) {
     const branchEntries = visibleEntries.filter(e => e.branch === drillBranch);
     const branchRecovered = branchEntries.reduce((s, e) => s + getEntryPaid(e), 0);
-    const branchWaiver = branchEntries.reduce((s, e) => s + (Number(e.waiver) || 0), 0);
+    const branchWaiver = sumAuthorizedWaiver(branchEntries);
 
     const byMonth = {};
     branchEntries.forEach(e => {
       const m = e.date ? e.date.substring(0, 7) : "Unknown";
       if (!byMonth[m]) byMonth[m] = { month: m, recovered: 0, waiver: 0, count: 0 };
       byMonth[m].recovered += getEntryPaid(e);
-      byMonth[m].waiver += Number(e.waiver) || 0;
+      byMonth[m].waiver += authorizedWaiverOf(e);
       byMonth[m].count += 1;
     });
     const mData = Object.values(byMonth).sort((a, b) => a.month.localeCompare(b.month));
@@ -3091,8 +3176,12 @@ function Dashboard({ user, entries, branches, config }) {
         )}
         {/* Recent entries */}
         <div className="bg-white rounded-xl border overflow-hidden">
-          <h3 className="text-sm font-semibold text-gray-700 p-4 border-b">Recent Entries</h3>
-          <SortableSection initialKey="date" initialDir="desc" render={sort => (
+          <h3 className="text-sm font-semibold text-gray-700 p-4 border-b">Recent Entries ({branchEntries.length} total)</h3>
+          <PaginatedSortableSection
+            rows={branchEntries}
+            initialKey="date" initialDir="desc"
+            pageSize={10} label="entries"
+            render={({ sort, pageRows }) => (
             <table className="w-full text-sm">
               <thead className="bg-gray-50 border-b">
                 <tr>
@@ -3103,12 +3192,12 @@ function Dashboard({ user, entries, branches, config }) {
                 </tr>
               </thead>
               <tbody>
-                {sort.apply(branchEntries.slice(0, 20)).map(e => (
+                {pageRows.map(e => (
                   <tr key={e.id} className="border-b">
                     <td className="px-4 py-2">{formatDateDMY(e.date)}</td>
                     <td className="px-4 py-2">{e.customerName} <span className="text-xs text-gray-400">({e.customerId})</span></td>
                     <td className="px-4 py-2 text-right text-teal-700 font-medium">{formatINR(getEntryPaid(e))}</td>
-                    <td className="px-4 py-2 text-right">{e.waiver > 0 ? <span className="text-amber-600">{formatINR(e.waiver)}</span> : <span className="text-gray-400">—</span>}</td>
+                    <td className="px-4 py-2 text-right">{authorizedWaiverOf(e) > 0 ? <span className="text-amber-600">{formatINR(authorizedWaiverOf(e))}</span> : <span className="text-gray-400">—</span>}</td>
                   </tr>
                 ))}
               </tbody>
@@ -3691,18 +3780,34 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
         const odType = (r["OD Type"] || r.odType || "Group OD").trim();
         const selfOdAmountDue = num(r["Self OD Amount Due"] || r.selfOdAmountDue);
         const selfOdPaidAmount = num(r["Self OD Paid"] || r.selfOdPaidAmount);
-        const selfOdWaiver = num(r["Self OD Waiver"] || r.selfOdWaiver) || Math.max(0, selfOdAmountDue - selfOdPaidAmount);
         const groupOdAmount = num(r["Group OD Amount Due"] || r["Group OD Amount"] || r.groupOdAmount);
         const numberOfCustomers = num(r["No. of Customers"] || r["No. of Customers in Group"] || r.numberOfCustomers) || 1;
         const customerShare = num(r["Customer Share (Auto)"] || r["Customer Share"]) || (numberOfCustomers > 0 ? Math.round(groupOdAmount / numberOfCustomers) : 0);
         const groupOdPaidAmount = num(r["Group OD Paid"] || r.groupOdPaidAmount);
-        const groupOdWaiver = num(r["Group OD Waiver"] || r.groupOdWaiver) || Math.max(0, customerShare - groupOdPaidAmount);
 
-        // Check for explicit Total Paid / Total Waiver columns first
-        const totalPaidAmount = num(r["Total Paid"] || r.totalPaidAmount) || ((odType === "Self OD" ? selfOdPaidAmount : 0) + groupOdPaidAmount);
-        const totalWaiver = num(r["Total Waiver"] || r.waiver) || ((odType === "Self OD" ? selfOdWaiver : 0) + groupOdWaiver);
-
+        // Waiver inputs from CSV. Read-only — the parser must NOT infer
+        // waiver from underpayment (paid < due). A waiver only exists when
+        // (a) the CSV explicitly carries a non-zero waiver column, AND
+        // (b) the row carries an "Approval Subject" or "Waiver Approver"
+        // value to evidence the authorization. Otherwise default to 0.
+        // This prevents phantom waivers from inflating dashboard totals
+        // when collectors uploaded shortfalls without intending a waiver.
         const approvalSubject = (r["Approval Subject"] || r["Waiver Approval Subject"] || "").trim();
+        const waiverApproverRaw = (r["Waiver Approver"] || "").trim();
+        const hasApprovalEvidence = approvalSubject.length > 0 || waiverApproverRaw.length > 0;
+        const selfOdWaiverInput = num(r["Self OD Waiver"] || r.selfOdWaiver);
+        const groupOdWaiverInput = num(r["Group OD Waiver"] || r.groupOdWaiver);
+        const selfOdWaiver = hasApprovalEvidence ? selfOdWaiverInput : 0;
+        const groupOdWaiver = hasApprovalEvidence ? groupOdWaiverInput : 0;
+
+        // Total Paid keeps its existing behavior. Total Waiver follows the
+        // same authorization rule — explicit "Total Waiver" column only
+        // counts when there's approval evidence; otherwise 0.
+        const totalPaidAmount = num(r["Total Paid"] || r.totalPaidAmount) || ((odType === "Self OD" ? selfOdPaidAmount : 0) + groupOdPaidAmount);
+        const totalWaiverRaw = num(r["Total Waiver"] || r.waiver);
+        const totalWaiver = hasApprovalEvidence
+          ? (totalWaiverRaw || ((odType === "Self OD" ? selfOdWaiver : 0) + groupOdWaiver))
+          : 0;
         const recordedByRaw = (r["Recorded By"] || r["Entered By"] || r.recordedBy || "").trim();
         // Match recorded-by name to an actual user ID
         const matchedUser = recordedByRaw ? users.find(u =>
