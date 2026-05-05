@@ -2093,7 +2093,10 @@ app.get("/api/od/disbursements", (req, res) => {
     const product = String(req.query.product || "").trim().toLowerCase();
     const category = String(req.query.category || "").trim().toLowerCase();
     const status = String(req.query.status || "").trim().toLowerCase(); // '' | active | closed | pending
-    const limit = Math.min(50000, Math.max(100, parseInt(req.query.limit || "10000", 10)));
+    // Default `recent` limit raised to 50000 so a wide date range (or
+    // unfiltered "All branches" download) doesn't silently drop rows.
+    // The hard cap of 50000 still protects against absurd payloads.
+    const limit = Math.min(50000, Math.max(100, parseInt(req.query.limit || "50000", 10)));
 
     const MONTHS = { jan: "01", feb: "02", mar: "03", apr: "04", may: "05", jun: "06",
                      jul: "07", aug: "08", sep: "09", oct: "10", nov: "11", dec: "12" };
@@ -2233,8 +2236,12 @@ app.get("/api/od/disbursements", (req, res) => {
         closed: closedCount,
         pending: pendingCount,
       },
-      byBranch: toSorted(branchAgg, { limit: 30 }),
-      byProduct: toSorted(productAgg, { limit: 30 }),
+      // Return ALL branches and products (no cap). The frontend uses
+      // these for dropdown options, so capping at 30 silently hides
+      // branches/products that fall outside the top-by-amount slice.
+      // Visual charts (e.g. "Top 15 branches") slice on the client side.
+      byBranch: toSorted(branchAgg),
+      byProduct: toSorted(productAgg),
       byCategory: [...categoryAgg.values()].sort((a, b) => b.total - a.total),
       byMonth,
       recent,

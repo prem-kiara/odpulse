@@ -553,7 +553,16 @@ export default function ReportsAnalytics({ user }) {
       fetch("/api/od/disbursements?category=individual").then(r => r.json()).catch(() => ({ byProduct: [] })),
     ]).then(([all, group, individual]) => {
       if (cancelled) return;
-      setBranchOptions((all.byBranch || []).map(b => b.key).filter(Boolean));
+      // Branch dropdown — full universe of branches in the dataset, sorted
+      // alphabetically so the user can scan/find easily. byBranch from the
+      // API is no longer capped (was top 30 — silently hid branches outside
+      // that slice from the dropdown).
+      setBranchOptions(
+        (all.byBranch || [])
+          .map(b => b.key)
+          .filter(Boolean)
+          .sort((a, b) => a.localeCompare(b))
+      );
       setProductsByCategory({
         "":           (all.byProduct        || []).map(p => p.key).filter(Boolean),
         group:        (group.byProduct      || []).map(p => p.key).filter(Boolean),
