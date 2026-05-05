@@ -2907,8 +2907,23 @@ function Dashboard({ user, entries, branches, config }) {
     // Staff breakdown
     const byStaff = {};
     visibleEntries.forEach(e => {
-      const staffName = e.enteredByName || e.enteredBy || "Unknown";
-      const staffId = e.enteredBy || "unknown";
+      // Staff Summary attribution rule:
+      //   1. collectorStaffName  — set on Cash payments via the form; this
+      //      is the field officer who physically received the money. Use it.
+      //   2. enteredByName       — recorded-by name from the form / bulk
+      //      CSV's "Recorded By" column. Use it ONLY if it's a real name
+      //      (not the placeholder "Bulk Upload" the parser writes when
+      //      "Recorded By" was empty in the CSV).
+      //   3. Otherwise → SKIP this entry entirely. Branch-attributed bulk
+      //      uploads with no individual collector don't belong in the
+      //      Staff Summary; per-staff totals should reflect only what a
+      //      named officer actually collected.
+      const collector = String(e.collectorStaffName || "").trim();
+      const recordedBy = String(e.enteredByName || "").trim();
+      const isPlaceholder = recordedBy === "" || recordedBy === "Bulk Upload";
+      const staffName = collector || (isPlaceholder ? "" : recordedBy);
+      if (!staffName) return; // No real staff attribution — exclude from summary.
+      const staffId = e.collectorStaffId || e.enteredBy || staffName;
       if (!byStaff[staffId]) byStaff[staffId] = { staffId, staff: staffName, recovered: 0, waiver: 0, groupOD: 0, count: 0 };
       byStaff[staffId].recovered += getEntryPaid(e);
       byStaff[staffId].waiver += authorizedWaiverOf(e);
