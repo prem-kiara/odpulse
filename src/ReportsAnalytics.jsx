@@ -18,7 +18,7 @@
 //   7. Recent Disbursements table (top 200, searchable + sortable)
 //   8. Reports — Export only (PDF / CSV)
 
-import React, { useState, useMemo, useEffect, useCallback } from "react";
+import React, { useState, useMemo, useEffect, useCallback, useRef } from "react";
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   PieChart, Pie, Cell, Legend, LineChart, Line,
@@ -446,8 +446,11 @@ export default function ReportsAnalytics({ user }) {
   // Filter state — applied separately so users can edit without firing fetches
   const [fromDate, setFromDate] = useState(monthsAgoISO(6));
   const [toDate, setToDate] = useState(todayISO());
-  const [branchFilter, setBranchFilter] = useState("");
-  const [productFilter, setProductFilter] = useState("");
+  // Branch and Product filters are MULTI-select. Empty array = no filter
+  // (all branches / all products). The previous single-select strings
+  // are gone — every dependent path that used them is updated below.
+  const [branchFilter, setBranchFilter] = useState([]);   // string[]
+  const [productFilter, setProductFilter] = useState([]); // string[]
   const [categoryFilter, setCategoryFilter] = useState(""); // "" | "group" | "individual"
   // Filters are reactive — every change triggers a debounced refetch (no
   // Apply button). The 250ms debounce on the date input prevents spamming
@@ -462,6 +465,11 @@ export default function ReportsAnalytics({ user }) {
   const [search, setSearch] = useState("");
   const [sortKey, setSortKey] = useState("disbursement_date_iso");
   const [sortDir, setSortDir] = useState("desc");
+  // Status filter local to the table — lets the user narrow rows to
+  // Active / Closed / Pending without leaving the current view (e.g.
+  // they can be in the Principal Outstanding view AND filter to
+  // closed-only). "" = no filter.
+  const [tableStatusFilter, setTableStatusFilter] = useState("");
 
   // Selected KPI view — controls which focused detail section is shown below
   // the KPI cards. "overview" = full layout (trend + branch + product +
@@ -488,6 +496,26 @@ export default function ReportsAnalytics({ user }) {
   // Static so the user can always switch between any branch.
   const [branchOptions, setBranchOptions] = useState([]);
 
+  // Refs to the multi-select <details> dropdowns so we can close them when
+  // the user clicks anywhere outside. Native <details> only closes when
+  // <summary> is clicked again — that's annoying for picker UIs.
+  const branchDetailsRef = useRef(null);
+  const productDetailsRef = useRef(null);
+  useEffect(() => {
+    const handleOutside = (e) => {
+      if (branchDetailsRef.current && branchDetailsRef.current.open
+          && !branchDetailsRef.current.contains(e.target)) {
+        branchDetailsRef.current.removeAttribute("open");
+      }
+      if (productDetailsRef.current && productDetailsRef.current.open
+          && !productDetailsRef.current.contains(e.target)) {
+        productDetailsRef.current.removeAttribute("open");
+      }
+    };
+    document.addEventListener("mousedown", handleOutside);
+    return () => document.removeEventListener("mousedown", handleOutside);
+  }, []);
+
   // Product dropdown options — always returns the rollup labels for the
   // current category. Group → 4 group labels. Individual → 12 category
   // labels. All → union of all 16 buckets (rendered as optgroups in the
@@ -510,16 +538,22 @@ export default function ReportsAnalytics({ user }) {
       const p = new URLSearchParams();
       if (fromDate) p.set("from", fromDate);
       if (toDate)   p.set("to", toDate);
-      if (branchFilter) p.set("branch", branchFilter);
-      // Active group labels (Group: OLD-JLG/JLG/VM-JLG/VM-GOLDJLG;
-      // Individual: KMCL_STBL/KMCL_PL/.../SSS) aren't real product codes —
-      // the API only accepts a single exact code. When the user picks a
-      // bucket label, skip the product param so the API returns ALL
-      // products for the current branch/date/category, then we filter the
-      // response client-side below.
-      if (productFilter && !isActiveGroupLabel(productFilter, categoryFilter)) {
-        p.set("product", productFilter);
+      // Multi-select branch — server accepts a comma-separated list.
+      if (branchFilter.length > 0) p.set("branch", branchFilter.join(","));
+      // Multi-select product. Active group labels (OLD-JLG, KMCL_STBL, etc.)
+      // aren't real product codes; the API only matches raw codes. So we
+      // expand any selected bucket label into its underlying raw codes
+      // before sending. Real raw codes pass through unchanged.
+      const expandedProducts = [];
+      for (const p2 of productFilter) {
+        if (isActiveGroupLabel(p2, categoryFilter)) {
+          const map = getActiveProductMap(categoryFilter);
+          if (map && map[p2]) expandedProducts.push(...map[p2]);
+        } else {
+          expandedProducts.push(p2);
+        }
       }
+      if (expandedProducts.length > 0) p.set("product", expandedProducts.join(","));
       if (categoryFilter) p.set("category", categoryFilter);
       if (view === "active" || view === "closed" || view === "pending") {
         p.set("status", view);
@@ -578,11 +612,15 @@ export default function ReportsAnalytics({ user }) {
   // category=group) so a Group Loan group label like "OLD-JLG" survives
   // category re-toggles within Group, but clears when switching to All /
   // Individual where group labels aren't options.
+  // When the user switches Loan Category, drop any selected products that
+  // no longer appear in the new category's option list. Multi-select
+  // version: filter the array instead of clearing the whole thing, so
+  // valid selections that survive the toggle stay intact.
   useEffect(() => {
-    if (!productFilter) return;
-    if (productOptions.length && !productOptions.includes(productFilter)) {
-      setProductFilter("");
-    }
+    if (productFilter.length === 0) return;
+    if (productOptions.length === 0) return;
+    const valid = productFilter.filter(p => productOptions.includes(p));
+    if (valid.length !== productFilter.length) setProductFilter(valid);
   }, [productOptions, productFilter]);
 
   // Sync the table sort to whichever KPI/view is selected, so the data the
@@ -593,6 +631,8 @@ export default function ReportsAnalytics({ user }) {
       case "amount":
       case "avgTicket":
         setSortKey("loan_amount"); setSortDir("desc"); break;
+      case "principal":
+        setSortKey("principal_outstanding"); setSortDir("desc"); break;
       case "branch":
         setSortKey("branch"); setSortDir("asc"); break;
       case "product":
@@ -613,51 +653,17 @@ export default function ReportsAnalytics({ user }) {
   const handlePresetThisYear = () => { setFromDate(startOfYearISO()); setToDate(todayISO()); };
 
   // ── derived ──
-  const apiSummary = data?.summary || { count: 0, totalAmount: 0, avgTicket: 0, customerCount: 0, active: 0, closed: 0, pending: 0 };
+  const apiSummary = data?.summary || { count: 0, totalAmount: 0, avgTicket: 0, customerCount: 0, active: 0, closed: 0, pending: 0, principalOutstanding: 0 };
   const byBranch = data?.byBranch || [];
   const byProduct = data?.byProduct || [];
   const byCategory = data?.byCategory || [];
   const byMonth = data?.byMonth || [];
   const recent = data?.recent || [];
 
-  // KPI summary — when a category bucket label (Group or Individual) is
-  // selected, recompute KPIs client-side. Total count and amount come from
-  // byProduct (server-side aggregated, not capped) — accurate. Status splits
-  // (active/closed/pending) and customer count come from the recent array
-  // (capped at 10,000) which is an accepted approximation per spec. For all
-  // other states (no bucket selected, or category=All), use the
-  // server-aggregated summary as-is.
-  const summary = useMemo(() => {
-    const productMap = getActiveProductMap(categoryFilter);
-    if (!productMap || !isActiveGroupLabel(productFilter, categoryFilter)) {
-      return apiSummary;
-    }
-    const codes = new Set(productMap[productFilter] || []);
-    // Accurate count + total from server-aggregated byProduct.
-    let total = 0, count = 0;
-    for (const p of byProduct) {
-      if (codes.has(p.key)) {
-        total += Number(p.total) || 0;
-        count += Number(p.count) || 0;
-      }
-    }
-    // Status splits + unique customers from recent (best-effort).
-    const rows = recent.filter(r => codes.has(r.product_name));
-    let customers = new Set(), active = 0, closed = 0, pending = 0;
-    for (const r of rows) {
-      if (r.customer_number) customers.add(r.customer_number);
-      if (r.status === "Active")  active++;
-      else if (r.status === "Closed")  closed++;
-      else if (r.status === "Pending") pending++;
-    }
-    return {
-      count,
-      totalAmount: Math.round(total * 100) / 100,
-      avgTicket: count > 0 ? Math.round((total / count) * 100) / 100 : 0,
-      customerCount: customers.size,
-      active, closed, pending,
-    };
-  }, [apiSummary, recent, byProduct, categoryFilter, productFilter]);
+  // KPI summary — server now filters by raw codes (bucket labels are
+  // expanded to their underlying codes before the request), so apiSummary
+  // already reflects the right numbers. No client-side recompute needed.
+  const summary = apiSummary;
 
   const filteredRecent = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -666,16 +672,26 @@ export default function ReportsAnalytics({ user }) {
                        : view === "closed" ? "Closed"
                        : view === "pending" ? "Pending"
                        : null;
-    // Bucket-label filter (client-side). When the user picks a Group or
-    // Individual category bucket, narrow rows to those whose product_name
-    // belongs to that bucket's code list.
-    const _activeMap = getActiveProductMap(categoryFilter);
-    const groupFilterCodes = (_activeMap && isActiveGroupLabel(productFilter, categoryFilter))
-      ? new Set(_activeMap[productFilter] || [])
-      : null;
+    // Bucket / branch / product filtering is now done server-side (the
+    // fetchData expands bucket labels into raw codes before the request),
+    // so the recent array is already narrowed correctly. Only status,
+    // search, and the principal-focused-view filter happen here.
+    //
+    // Principal Outstanding view: hide rows that contribute zero to the
+    // displayed total. Closed loans have principal_outstanding = 0 by
+    // design (they no longer appear in pool_snapshots), so listing them
+    // here with "—" is noise. The aggregated stats above the table still
+    // come from the server's authoritative summary, unchanged.
+    const principalOnly = view === "principal";
+    // Local table-level status filter. AND-combines with the view-driven
+    // statusFilter — if a view like "active" is selected AND the user
+    // picks "closed" in the table dropdown, no rows match (correct: those
+    // are mutually exclusive).
+    const tableStatusValue = tableStatusFilter || null;
     let arr = recent.filter(r => {
+      if (principalOnly && (Number(r.principal_outstanding) || 0) <= 0) return false;
       if (statusFilter && r.status !== statusFilter) return false;
-      if (groupFilterCodes && !groupFilterCodes.has(r.product_name)) return false;
+      if (tableStatusValue && r.status !== tableStatusValue) return false;
       if (q) {
         return (r.customer_name || "").toLowerCase().includes(q) ||
                (r.loan_account_no || "").toLowerCase().includes(q) ||
@@ -693,7 +709,7 @@ export default function ReportsAnalytics({ user }) {
       return sortDir === "asc" ? cmp : -cmp;
     });
     return arr;
-  }, [recent, search, sortKey, sortDir, view, productFilter, categoryFilter]);
+  }, [recent, search, sortKey, sortDir, view, productFilter, categoryFilter, tableStatusFilter]);
 
   const handleSort = (key) => {
     if (sortKey === key) setSortDir(d => d === "asc" ? "desc" : "asc");
@@ -706,8 +722,55 @@ export default function ReportsAnalytics({ user }) {
   const recentPg = usePagination(filteredRecent, 10);
 
   // ── exports ──
-  const exportRowsForCSV = () =>
-    filteredRecent.map((r) => ({
+  // The page fetches `recent` with a default 5000-row cap to keep page
+  // loads snappy. Exports need the full dataset (up to the hard 50000
+  // cap), so each export function re-fetches with limit=50000 against
+  // the same filter set, then maps the result. This isolates the slow
+  // case to the moment the user clicks Export, not every page load.
+  const fetchAllForExport = useCallback(async () => {
+    const p = new URLSearchParams();
+    if (fromDate) p.set("from", fromDate);
+    if (toDate)   p.set("to", toDate);
+    if (branchFilter.length > 0) p.set("branch", branchFilter.join(","));
+    const expandedProducts = [];
+    for (const p2 of productFilter) {
+      if (isActiveGroupLabel(p2, categoryFilter)) {
+        const map = getActiveProductMap(categoryFilter);
+        if (map && map[p2]) expandedProducts.push(...map[p2]);
+      } else {
+        expandedProducts.push(p2);
+      }
+    }
+    if (expandedProducts.length > 0) p.set("product", expandedProducts.join(","));
+    if (categoryFilter) p.set("category", categoryFilter);
+    if (view === "active" || view === "closed" || view === "pending") p.set("status", view);
+    p.set("limit", "50000");
+    try {
+      const res = await fetch(`/api/od/disbursements?${p.toString()}`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      let arr = json.recent || [];
+      // Apply the same client-side filters (search, table-status, principal-only)
+      const q = search.trim().toLowerCase();
+      if (view === "principal") arr = arr.filter(r => (Number(r.principal_outstanding) || 0) > 0);
+      if (tableStatusFilter) arr = arr.filter(r => r.status === tableStatusFilter);
+      if (q) {
+        arr = arr.filter(r =>
+          (r.customer_name || "").toLowerCase().includes(q) ||
+          (r.loan_account_no || "").toLowerCase().includes(q) ||
+          (r.customer_number || "").toLowerCase().includes(q) ||
+          (r.branch || "").toLowerCase().includes(q) ||
+          (r.product_name || "").toLowerCase().includes(q));
+      }
+      return arr;
+    } catch (e) {
+      console.warn("Export re-fetch failed, falling back to in-memory rows:", e);
+      return filteredRecent;
+    }
+  }, [fromDate, toDate, branchFilter, productFilter, categoryFilter, view, search, tableStatusFilter, filteredRecent]);
+
+  const exportRowsForCSV = (rows) =>
+    (rows || filteredRecent).map((r) => ({
       LoanAccount: r.loan_account_no || "",
       CustomerID: r.customer_number || "",
       CustomerName: r.customer_name || "",
@@ -716,15 +779,23 @@ export default function ReportsAnalytics({ user }) {
       Category: r.loan_category || "",
       DisbursementDate: r.disbursement_date_iso || "",
       LoanAmount: r.loan_amount || 0,
+      PrincipalOutstanding: r.principal_outstanding || 0,
       Status: r.status || "",
     }));
 
-  const handleExportCSV = () => downloadCSV(exportRowsForCSV(), `disbursements-${todayISO()}.csv`);
-  const handleExportExcel = () => downloadCSV(exportRowsForCSV(), `disbursements-${todayISO()}.xls`);
-  const handleExportPDF = () => {
+  const handleExportCSV = async () => {
+    const all = await fetchAllForExport();
+    downloadCSV(exportRowsForCSV(all), `disbursements-${todayISO()}.csv`);
+  };
+  const handleExportExcel = async () => {
+    const all = await fetchAllForExport();
+    downloadCSV(exportRowsForCSV(all), `disbursements-${todayISO()}.xls`);
+  };
+  const handleExportPDF = async () => {
+    const all = await fetchAllForExport();
     const w = window.open("", "_blank", "width=900,height=700");
     if (!w) return;
-    const rowsHtml = filteredRecent
+    const rowsHtml = all
       .map(r =>
         `<tr><td>${r.disbursement_date_iso || ""}</td><td>${r.customer_name || ""}</td><td>${r.loan_account_no || ""}</td><td>${r.branch || ""}</td><td>${r.product_name || ""}</td><td>${r.loan_category || ""}</td><td>${formatINR(r.loan_amount)}</td><td>${r.status || ""}</td></tr>`
       ).join("");
@@ -739,7 +810,7 @@ export default function ReportsAnalytics({ user }) {
         th{background:#f3f4f6;font-weight:600}
       </style></head><body>
       <h1>Disbursement Analytics</h1>
-      <div>Period: ${fromDate} → ${toDate}${branchFilter ? ` · Branch: ${branchFilter}` : ""}${productFilter ? ` · Product: ${productFilter}` : ""}${categoryFilter ? ` · Category: ${categoryFilter}` : ""} · Generated: ${new Date().toLocaleString()}</div>
+      <div>Period: ${fromDate} → ${toDate}${branchFilter.length > 0 ? ` · Branch: ${branchFilter.length === 1 ? branchFilter[0] : `${branchFilter.length} branches`}` : ""}${productFilter.length > 0 ? ` · Product: ${productFilter.length === 1 ? productFilter[0] : `${productFilter.length} products`}` : ""}${categoryFilter ? ` · Category: ${categoryFilter}` : ""} · Generated: ${new Date().toLocaleString()}</div>
       <h2>Summary</h2>
       <table><tr>
         <th>Total Disbursements</th><td>${formatNum(summary.count)}</td>
@@ -750,9 +821,9 @@ export default function ReportsAnalytics({ user }) {
         <th>Active</th><td>${formatNum(summary.active)}</td>
         <th>Closed</th><td>${formatNum(summary.closed)}</td>
         <th>Pending</th><td>${formatNum(summary.pending)}</td>
-        <th></th><td></td>
+        <th>Principal Outstanding</th><td>${formatINR(summary.principalOutstanding || 0)}</td>
       </tr></table>
-      <h2>Disbursements (showing ${filteredRecent.length})</h2>
+      <h2>Disbursements (showing ${all.length})</h2>
       <table>
         <thead><tr><th>Date</th><th>Customer</th><th>Loan A/C</th><th>Branch</th><th>Product</th><th>Category</th><th>Amount</th><th>Status</th></tr></thead>
         <tbody>${rowsHtml}</tbody>
@@ -887,37 +958,95 @@ export default function ReportsAnalytics({ user }) {
             <label className="text-[11px] text-gray-500 mb-1 block flex items-center gap-1">
               <Building2 size={11} /> Branch
             </label>
-            <select value={branchFilter} onChange={e => setBranchFilter(e.target.value)}
-              className="w-full border rounded-lg px-3 py-1.5 text-sm bg-white">
-              <option value="">All branches</option>
-              {branchOptions.map(b => <option key={b} value={b}>{b}</option>)}
-            </select>
+            {/* Multi-select branch dropdown — pick any number of branches.
+                Empty selection = all branches. Uses native details/summary
+                with a click-outside handler (see useEffect above) that
+                auto-closes the panel when the user clicks anywhere else. */}
+            <details ref={branchDetailsRef} className="relative w-full">
+              <summary className="list-none w-full px-3 py-1.5 border rounded-lg text-sm bg-white cursor-pointer flex items-center justify-between hover:border-teal-400">
+                <span className="truncate">
+                  {branchFilter.length === 0
+                    ? "All branches"
+                    : branchFilter.length === 1
+                      ? branchFilter[0]
+                      : `${branchFilter.length} branches selected`}
+                </span>
+                <ChevronDown size={12} className="text-gray-400" />
+              </summary>
+              <div className="absolute z-20 mt-1 w-full max-h-72 overflow-y-auto bg-white border rounded-lg shadow-lg p-2">
+                <div className="flex justify-between items-center pb-1.5 mb-1.5 border-b">
+                  <button type="button" onClick={() => setBranchFilter([...branchOptions])}
+                    className="text-[11px] text-teal-700 hover:underline">Select all</button>
+                  <button type="button" onClick={() => setBranchFilter([])}
+                    className="text-[11px] text-gray-500 hover:underline">Clear</button>
+                </div>
+                {branchOptions.length === 0 ? (
+                  <div className="text-xs text-gray-400 px-1 py-2">No branches available.</div>
+                ) : branchOptions.map(b => (
+                  <label key={b} className="flex items-center gap-2 px-1.5 py-1 hover:bg-teal-50 rounded cursor-pointer text-xs">
+                    <input type="checkbox" checked={branchFilter.includes(b)}
+                      onChange={() => setBranchFilter(prev => prev.includes(b) ? prev.filter(x => x !== b) : [...prev, b])}
+                      className="accent-teal-600" />
+                    <span className="flex-1 truncate">{b}</span>
+                  </label>
+                ))}
+              </div>
+            </details>
           </div>
           <div>
             <label className="text-[11px] text-gray-500 mb-1 block flex items-center gap-1">
               <Package size={11} /> Product
             </label>
-            <select value={productFilter} onChange={e => setProductFilter(e.target.value)}
-              className="w-full border rounded-lg px-3 py-1.5 text-sm bg-white">
-              <option value="">All products</option>
-              {/* When categoryFilter is "" (All), split the 16 buckets into
-                  optgroups so the user can visually distinguish Group from
-                  Individual buckets while still picking from a single flat
-                  list. For Group / Individual category modes we render a
-                  plain list of just that mapping's labels. */}
-              {categoryFilter === "" ? (
-                <>
-                  <optgroup label="Group Loan">
-                    {GROUP_LOAN_GROUPS.map(p => <option key={`g-${p}`} value={p}>{p}</option>)}
-                  </optgroup>
-                  <optgroup label="Individual Loan">
-                    {INDIVIDUAL_LOAN_GROUPS.map(p => <option key={`i-${p}`} value={p}>{p}</option>)}
-                  </optgroup>
-                </>
-              ) : (
-                productOptions.map(p => <option key={p} value={p}>{p}</option>)
-              )}
-            </select>
+            {/* Multi-select product dropdown — pick any number of products
+                or buckets. When Category=All, the list is split into Group
+                and Individual sections via grouped headers. Empty selection
+                = all products. Auto-closes on click-outside (see useEffect). */}
+            <details ref={productDetailsRef} className="relative w-full">
+              <summary className="list-none w-full px-3 py-1.5 border rounded-lg text-sm bg-white cursor-pointer flex items-center justify-between hover:border-teal-400">
+                <span className="truncate">
+                  {productFilter.length === 0
+                    ? "All products"
+                    : productFilter.length === 1
+                      ? productFilter[0]
+                      : `${productFilter.length} products selected`}
+                </span>
+                <ChevronDown size={12} className="text-gray-400" />
+              </summary>
+              <div className="absolute z-20 mt-1 w-full max-h-72 overflow-y-auto bg-white border rounded-lg shadow-lg p-2">
+                <div className="flex justify-between items-center pb-1.5 mb-1.5 border-b">
+                  <button type="button" onClick={() => {
+                    const all = categoryFilter === ""
+                      ? [...GROUP_LOAN_GROUPS, ...INDIVIDUAL_LOAN_GROUPS]
+                      : [...productOptions];
+                    setProductFilter(all);
+                  }} className="text-[11px] text-teal-700 hover:underline">Select all</button>
+                  <button type="button" onClick={() => setProductFilter([])}
+                    className="text-[11px] text-gray-500 hover:underline">Clear</button>
+                </div>
+                {(() => {
+                  const renderItem = (p) => (
+                    <label key={p} className="flex items-center gap-2 px-1.5 py-1 hover:bg-teal-50 rounded cursor-pointer text-xs">
+                      <input type="checkbox" checked={productFilter.includes(p)}
+                        onChange={() => setProductFilter(prev => prev.includes(p) ? prev.filter(x => x !== p) : [...prev, p])}
+                        className="accent-teal-600" />
+                      <span className="flex-1 truncate">{p}</span>
+                    </label>
+                  );
+                  if (categoryFilter === "") return (
+                    <>
+                      <div className="text-[10px] uppercase text-gray-400 tracking-wide px-1.5 mt-1 mb-0.5">Group Loan</div>
+                      {GROUP_LOAN_GROUPS.map(renderItem)}
+                      <div className="text-[10px] uppercase text-gray-400 tracking-wide px-1.5 mt-2 mb-0.5">Individual Loan</div>
+                      {INDIVIDUAL_LOAN_GROUPS.map(renderItem)}
+                    </>
+                  );
+                  if (productOptions.length === 0) {
+                    return <div className="text-xs text-gray-400 px-1 py-2">No products available.</div>;
+                  }
+                  return productOptions.map(renderItem);
+                })()}
+              </div>
+            </details>
           </div>
           <div>
             <label className="text-[11px] text-gray-500 mb-1 block">Category</label>
@@ -948,7 +1077,7 @@ export default function ReportsAnalytics({ user }) {
       </div>
 
       {/* 3. KPI cards — clickable, switch the focused detail view below */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+      <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
         <SummaryCard icon={Activity} label="Total Disbursements" value={formatNum(summary.count)}
           accent="teal" hint="Click to see all disbursement records"
           onClick={() => setKpiView("count")} active={view === "count"} />
@@ -961,6 +1090,13 @@ export default function ReportsAnalytics({ user }) {
         <SummaryCard icon={Users} label="Unique Customers" value={formatNum(summary.customerCount)}
           accent="amber" hint="Click to see customer-grouped list"
           onClick={() => setKpiView("customers")} active={view === "customers"} />
+        {/* Principal Outstanding — current portfolio principal from latest
+            pool snapshot per loan, filtered by branch / product / category
+            just like the other tiles. Closed loans contribute 0. Clicking
+            switches to the principal-focused detail view below. */}
+        <SummaryCard icon={Wallet} label="Principal Outstanding" value={formatINR(summary.principalOutstanding || 0)}
+          accent="rose" hint="Click to see the loans contributing to this principal"
+          onClick={() => setKpiView("principal")} active={view === "principal"} />
       </div>
 
       {/* View-switcher strip — additional non-KPI views */}
@@ -974,6 +1110,7 @@ export default function ReportsAnalytics({ user }) {
           ["product", "By Product"],
           ["amount", "By Amount"],
           ["avgTicket", "Avg Ticket"],
+          ["principal", "Principal Outstanding"],
           ["customers", "By Customer"],
           ["active", "Active"],
           ["closed", "Closed"],
@@ -1035,6 +1172,56 @@ export default function ReportsAnalytics({ user }) {
           <p className="text-[11px] text-gray-500">Sample size = total disbursements matching the current filters. The recent-disbursements table below shows individual ticket sizes — click a column header to sort.</p>
         </SectionCard>
       )}
+
+      {/* Focused view — Principal Outstanding details: stats strip + the
+          recent-disbursements table below (already sorted by principal
+          desc via the view-sort sync useEffect). Loans with zero
+          outstanding (closed) are hidden in the count/avg, but kept in
+          the recent table since users may want to see them. */}
+      {view === "principal" && (() => {
+        const positives = recent.filter(r => Number(r.principal_outstanding) > 0);
+        const totalPrincipal = Number(summary.principalOutstanding) || 0;
+        const positiveCount = positives.length;
+        const avgPrincipal = positiveCount > 0
+          ? totalPrincipal / positiveCount
+          : 0;
+        const maxPrincipal = positives.reduce(
+          (m, r) => Math.max(m, Number(r.principal_outstanding) || 0), 0);
+        const minPrincipal = positives.reduce(
+          (m, r) => {
+            const v = Number(r.principal_outstanding) || 0;
+            return (m === null || v < m) ? v : m;
+          }, null) || 0;
+        return (
+          <SectionCard
+            title="Principal Outstanding — current portfolio"
+            subtitle={`${formatINR(totalPrincipal)} across ${formatNum(positiveCount)} loans with positive principal (latest pool snapshot, ${recent.length} loans in current filter)`}
+          >
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+              <div className="bg-rose-50 border border-rose-200 rounded-lg p-3">
+                <p className="text-[11px] text-rose-700">Total Outstanding</p>
+                <p className="text-sm font-bold text-rose-700">{formatINR(totalPrincipal)}</p>
+              </div>
+              <div className="bg-gray-50 border rounded-lg p-3">
+                <p className="text-[11px] text-gray-500">Loans with Principal</p>
+                <p className="text-sm font-bold">{formatNum(positiveCount)}</p>
+              </div>
+              <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-3">
+                <p className="text-[11px] text-emerald-700">Average Principal</p>
+                <p className="text-sm font-bold text-emerald-700">{formatINR(Math.round(avgPrincipal))}</p>
+              </div>
+              <div className="bg-indigo-50 border border-indigo-200 rounded-lg p-3">
+                <p className="text-[11px] text-indigo-700">Range</p>
+                <p className="text-sm font-bold text-indigo-700">{formatINR(minPrincipal)} – {formatINR(maxPrincipal)}</p>
+              </div>
+            </div>
+            <p className="text-[11px] text-gray-500">
+              Closed loans (those with a foreclosure record) contribute Rs. 0 here even when their disbursement appears below.
+              The Recent Disbursements table is sorted by principal outstanding (descending) — click any column header to override.
+            </p>
+          </SectionCard>
+        );
+      })()}
 
       {/* Focused view — Customer-grouped list (sortable + paginated) */}
       {view === "customers" && (
@@ -1243,14 +1430,33 @@ export default function ReportsAnalytics({ user }) {
              : view === "pending" ? "Pending / No-Snapshot Disbursements"
              : view === "customers" ? "Recent Disbursements (per-customer view shown above)"
              : view === "amount" ? "Disbursements (sorted by amount)"
+             : view === "principal" ? "Loans with Principal Outstanding"
              : "Recent Disbursements"}
-        subtitle={`Showing ${filteredRecent.length} of ${recent.length} disbursements${view === "active" || view === "closed" || view === "pending" ? ` filtered to ${view}` : ""}`}
+        subtitle={`Showing ${filteredRecent.length} of ${recent.length} disbursements${
+          view === "active" || view === "closed" || view === "pending" ? ` filtered to ${view}`
+          : view === "principal" ? " — closed loans (principal = 0) hidden"
+          : ""}`}
         action={
-          <div className="relative">
-            <Search size={12} className="absolute left-2 top-2 text-gray-400" />
-            <input value={search} onChange={e => setSearch(e.target.value)}
-              placeholder="Search name / loan / branch…"
-              className="border rounded-md pl-7 pr-2 py-1 text-xs w-56" />
+          <div className="flex items-center gap-2">
+            {/* Status filter — works in any view, AND-combines with the
+                view-driven status (when one is set). "All" clears it. */}
+            <select
+              value={tableStatusFilter}
+              onChange={e => setTableStatusFilter(e.target.value)}
+              className="border rounded-md px-2 py-1 text-xs bg-white"
+              title="Filter rows by status"
+            >
+              <option value="">All statuses</option>
+              <option value="Active">Active</option>
+              <option value="Closed">Closed</option>
+              <option value="Pending">Pending</option>
+            </select>
+            <div className="relative">
+              <Search size={12} className="absolute left-2 top-2 text-gray-400" />
+              <input value={search} onChange={e => setSearch(e.target.value)}
+                placeholder="Search name / loan / branch…"
+                className="border rounded-md pl-7 pr-2 py-1 text-xs w-56" />
+            </div>
           </div>
         }
       >
@@ -1265,12 +1471,13 @@ export default function ReportsAnalytics({ user }) {
                 <SortHeader sortKey="product_name" currentKey={sortKey} currentDir={sortDir} onSort={handleSort}>Product</SortHeader>
                 <SortHeader sortKey="loan_category" currentKey={sortKey} currentDir={sortDir} onSort={handleSort}>Category</SortHeader>
                 <SortHeader sortKey="loan_amount" currentKey={sortKey} currentDir={sortDir} onSort={handleSort} align="right">Amount</SortHeader>
+                <SortHeader sortKey="principal_outstanding" currentKey={sortKey} currentDir={sortDir} onSort={handleSort} align="right">Principal Out.</SortHeader>
                 <SortHeader sortKey="status" currentKey={sortKey} currentDir={sortDir} onSort={handleSort}>Status</SortHeader>
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-100">
               {filteredRecent.length === 0 ? (
-                <tr><td colSpan={8} className="px-3 py-6 text-center text-gray-400">No disbursements match the current filters.</td></tr>
+                <tr><td colSpan={9} className="px-3 py-6 text-center text-gray-400">No disbursements match the current filters.</td></tr>
               ) : (
                 recentPg.pageRows.map((r) => (
                   <tr key={r.loan_account_no} className="hover:bg-gray-50">
@@ -1309,6 +1516,9 @@ export default function ReportsAnalytics({ user }) {
                       }`}>{r.loan_category || "—"}</span>
                     </td>
                     <td className="px-3 py-2 text-right font-semibold">{formatINR(r.loan_amount)}</td>
+                    <td className={`px-3 py-2 text-right font-medium ${(Number(r.principal_outstanding) || 0) > 0 ? "text-rose-700" : "text-gray-400"}`}>
+                      {(Number(r.principal_outstanding) || 0) > 0 ? formatINR(r.principal_outstanding) : "—"}
+                    </td>
                     <td className="px-3 py-2">
                       <span className={`text-[10px] px-1.5 py-0.5 rounded ${
                         r.status === "Closed" ? "bg-gray-200 text-gray-700"
