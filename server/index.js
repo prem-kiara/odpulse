@@ -2227,8 +2227,11 @@ app.get("/api/od/disbursements", (req, res) => {
           EXISTS(SELECT 1 FROM foreclosure_snapshots f WHERE f.loan_account_no = c.loan_account_no) AS is_closed,
           CASE WHEN lp.loan_account_no IS NULL THEN 0 ELSE 1 END AS is_active,
           COALESCE(lp.principal_outstanding, 0) AS principal_outstanding,
+          COALESCE(lp.interest_outstanding, 0) AS interest_outstanding,
           COALESCE(lp.principal_overdue, 0) AS principal_overdue,
-          COALESCE(lp.interest_overdue, 0) AS interest_overdue
+          COALESCE(lp.interest_overdue, 0) AS interest_overdue,
+          COALESCE(lp.overdue_days, 0) AS overdue_days,
+          COALESCE(lp.account_dpd_classification, '') AS account_dpd_classification
         FROM customers c
         LEFT JOIN pool_snapshots lp
           ON lp.loan_account_no = c.loan_account_no
@@ -2255,7 +2258,12 @@ app.get("/api/od/disbursements", (req, res) => {
           isIndividual: cat.includes("INDIVIDUAL"),
           amountN: Number(r.loan_amount) || 0,
           principalN: Number(r.principal_outstanding) || 0,
+          interestOutN: Number(r.interest_outstanding) || 0,
+          principalOverdueN: Number(r.principal_overdue) || 0,
+          interestOverdueN: Number(r.interest_overdue) || 0,
           overdueN: (Number(r.principal_overdue) || 0) + (Number(r.interest_overdue) || 0),
+          overdueDays: Number(r.overdue_days) || 0,
+          dpdClass: r.account_dpd_classification || '',
         });
       }
       _disbursementsRowsCache = rows;
@@ -2339,6 +2347,13 @@ app.get("/api/od/disbursements", (req, res) => {
           disbursement_date_iso: r.iso,
           loan_amount: r.amountN,
           principal_outstanding: r.principalN,
+          interest_outstanding: r.interestOutN,
+          arrear_amount: r.principalN + r.interestOutN,
+          principal_overdue: r.principalOverdueN,
+          interest_overdue: r.interestOverdueN,
+          overdue_amount: r.overdueN,
+          overdue_days: r.overdueDays,
+          account_dpd_classification: r.dpdClass,
           status: rowStatus,
         });
       }
