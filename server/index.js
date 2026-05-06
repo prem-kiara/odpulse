@@ -2226,7 +2226,9 @@ app.get("/api/od/disbursements", (req, res) => {
           c.disbursement_date, c.loan_amount,
           EXISTS(SELECT 1 FROM foreclosure_snapshots f WHERE f.loan_account_no = c.loan_account_no) AS is_closed,
           CASE WHEN lp.loan_account_no IS NULL THEN 0 ELSE 1 END AS is_active,
-          COALESCE(lp.principal_outstanding, 0) AS principal_outstanding
+          COALESCE(lp.principal_outstanding, 0) AS principal_outstanding,
+          COALESCE(lp.principal_overdue, 0) AS principal_overdue,
+          COALESCE(lp.interest_overdue, 0) AS interest_overdue
         FROM customers c
         LEFT JOIN pool_snapshots lp
           ON lp.loan_account_no = c.loan_account_no
@@ -2253,6 +2255,7 @@ app.get("/api/od/disbursements", (req, res) => {
           isIndividual: cat.includes("INDIVIDUAL"),
           amountN: Number(r.loan_amount) || 0,
           principalN: Number(r.principal_outstanding) || 0,
+          overdueN: (Number(r.principal_overdue) || 0) + (Number(r.interest_overdue) || 0),
         });
       }
       _disbursementsRowsCache = rows;
@@ -2269,6 +2272,8 @@ app.get("/api/od/disbursements", (req, res) => {
     let totalCount = 0;
     let totalAmount = 0;
     let totalPrincipalOutstanding = 0;
+    let totalOverdueAmount = 0;
+    let overdueCount = 0;
     const customerSet = new Set();
     let activeCount = 0;
     let closedCount = 0;
@@ -2309,6 +2314,7 @@ app.get("/api/od/disbursements", (req, res) => {
       totalCount += 1;
       totalAmount += r.amountN;
       totalPrincipalOutstanding += r.principalN;
+      if (r.overdueN > 0) { totalOverdueAmount += r.overdueN; overdueCount += 1; }
       if (r.customer_number) customerSet.add(r.customer_number);
 
       // Status (foreclosed-wins)
@@ -2366,6 +2372,9 @@ app.get("/api/od/disbursements", (req, res) => {
         // Total current principal outstanding across the filtered set,
         // sourced from the latest pool_snapshots row per loan.
         principalOutstanding: Math.round(totalPrincipalOutstanding * 100) / 100,
+        // Overdue loans count and total overdue amount (principal + interest overdue)
+        overdue: overdueCount,
+        overdueAmount: Math.round(totalOverdueAmount * 100) / 100,
       },
       // Return ALL branches and products (no cap). The frontend uses
       // these for dropdown options, so capping at 30 silently hides
