@@ -1593,9 +1593,8 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
   };
 
   // Auto-fill Amount Due with the customer's Foreclosure amount as soon as the
-  // OD Snapshot resolves. Waiver starts equal to foreclosure (= full waive if
-  // nothing paid); it then auto-adjusts whenever Paid Amount changes so that
-  // Waiver = Amount Due − Paid. Both fields remain fully editable.
+  // OD Snapshot resolves. Waiver is no longer collected on Individual OD —
+  // the operator just records what was paid; any shortfall stays on the loan.
   useEffect(() => {
     const fcl = Number(odSnap?.foreclosureValue) || 0;
     if (fcl <= 0) return;
@@ -1604,22 +1603,7 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
       setAmountDue(String(Math.round(fcl)));
       setAutoFilledFields(prev => { const n = new Set(prev); n.add("amountDue"); return n; });
     }
-    // Only auto-fill Waiver if user hasn't overridden it.
-    if (!waiverInput || autoFilledFields.has("waiver")) {
-      const paidNum = Number(paidAmount) || 0;
-      setWaiverInput(String(Math.max(0, Math.round(fcl) - paidNum)));
-      setAutoFilledFields(prev => { const n = new Set(prev); n.add("waiver"); return n; });
-    }
   }, [odSnap?.foreclosureValue]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // When Paid Amount changes, re-sync Waiver = Amount Due − Paid (only if
-  // Waiver is still in auto mode — user override takes precedence).
-  useEffect(() => {
-    if (!autoFilledFields.has("waiver")) return;
-    const due = Number(amountDue) || 0;
-    const paidNum = Number(paidAmount) || 0;
-    setWaiverInput(String(Math.max(0, due - paidNum)));
-  }, [paidAmount, amountDue]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const isPtpFuture = (() => {
     if (!ptpDate) return false;
@@ -1629,7 +1613,8 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
 
   const due = Number(amountDue) || 0;
   const paid = isPtpFuture ? 0 : (Number(paidAmount) || 0);
-  const waiver = isPtpFuture ? 0 : (Number(waiverInput) || 0);
+  // Waiver removed from Individual OD entry form — always 0 for these entries.
+  const waiver = 0;
 
   const isValidDate = (dateStr) => { const d = new Date(dateStr); return d instanceof Date && !isNaN(d); };
 
@@ -1646,7 +1631,6 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
     if (paymentMode === "Cash" && !isPtpFuture && !depositBank) { alert("Please select the Bank where the cash was deposited."); return; }
     if (paymentMode === "Cash" && ptpDate && !isValidDate(ptpDate)) { alert("Please enter a valid PTP date."); return; }
     if (paymentMode === "Cash" && ptpDate && !ptpTime) { alert("Please enter PTP time."); return; }
-    if (!isPtpFuture && waiver > 0 && !approvalEmailSubject.trim()) { alert("Waiver detected. Please enter the approval email subject line."); return; }
 
     // Only match against OTHER Individual OD entries — a same-day Group OD
     // payment by this customer is allowed and must not trigger the warning.
@@ -1670,7 +1654,8 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
       smaBucket: smaBucket || "",
       amountDue: due,
       paidAmount: isPtpFuture ? 0 : paid,
-      waiver: isPtpFuture ? 0 : waiver,
+      // Waiver removed from Individual OD — always 0.
+      waiver: 0,
       totalPaidAmount: isPtpFuture ? 0 : paid,
       paymentMode,
       upiReference: paymentMode === "UPI" ? upiReference.trim() : "",
@@ -1687,16 +1672,12 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
       ptpPaidDate: null,
       ptpPaymentRef: null,
       ptpReminderSent: false,
-      waiverApproval: (!isPtpFuture && waiver > 0) ? { approverName: user.name, emailSubject: approvalEmailSubject.trim(), approvalDate: date } : null,
+      // Waiver removed from Individual OD — no approval payload.
+      waiverApproval: null,
       enteredBy: user.id, enteredByName: user.name,
     };
 
-    if (waiver > 0) {
-      setPendingEntry(entry);
-      setShowWaiverModal(true);
-    } else {
-      saveIndivEntry(entry);
-    }
+    saveIndivEntry(entry);
   };
 
   const saveIndivEntry = (entry) => {
@@ -2098,52 +2079,25 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
           </label>
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Paid Amount {isPtpFuture ? "" : "*"}</label>
-            {isPtpFuture ? (
-              <div>
-                <input readOnly value="Payment pending (PTP)"
-                  className="w-full px-3 py-2 border border-orange-300 rounded-lg bg-orange-50 text-orange-700 font-medium cursor-not-allowed" />
-                <p className="text-xs text-orange-600 mt-1 flex items-center gap-1"><Clock size={10} /> PTP is in the future — payment will be recorded later</p>
-              </div>
-            ) : (
-              <input type="number" min="0" value={paidAmount} onChange={e => setPaidAmount(e.target.value)}
-                className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500" placeholder="e.g. 10000" />
-            )}
-          </div>
-          <div>
-            <label className="flex items-center gap-1 text-sm font-medium text-gray-700 mb-1">
-              Waiver Amount {autoFilledFields.has("waiver") && <span className="text-indigo-600 text-xs font-normal whitespace-nowrap">● auto (Amount Due − Paid)</span>}
-            </label>
-            <input type="number" min="0" value={waiverInput}
-              onChange={e => handleAutoFilledChange("waiver", setWaiverInput, e.target.value)}
-              className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500 ${autoFilledFields.has("waiver") ? "bg-indigo-50 border-indigo-200" : (waiver > 0 ? "bg-amber-50 border-amber-300" : "")}`}
-              placeholder="0 (leave blank if none)" />
-            {waiver > 0 && <p className="text-xs text-amber-600 mt-1 font-medium">Approval required</p>}
-          </div>
-        </div>
-        {waiver > 0 && (
-          <div className="mt-4 p-4 bg-amber-50 rounded-lg border border-amber-200">
-            <div className="flex items-center gap-2 mb-2">
-              <AlertTriangle size={16} className="text-amber-600" />
-              <p className="text-sm font-semibold text-amber-800">Waiver of {formatINR(waiver)} requires approval</p>
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">Paid Amount {isPtpFuture ? "" : "*"}</label>
+          {isPtpFuture ? (
+            <div>
+              <input readOnly value="Payment pending (PTP)"
+                className="w-full px-3 py-2 border border-orange-300 rounded-lg bg-orange-50 text-orange-700 font-medium cursor-not-allowed" />
+              <p className="text-xs text-orange-600 mt-1 flex items-center gap-1"><Clock size={10} /> PTP is in the future — payment will be recorded later</p>
             </div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">Approval Email Subject *</label>
-            <input type="text" value={approvalEmailSubject} onChange={e => setApprovalEmailSubject(e.target.value)}
-              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-amber-500 focus:border-amber-500" placeholder="e.g. OD Waiver Approval - Branch Name - Customer Name" />
-          </div>
-        )}
+          ) : (
+            <input type="number" min="0" value={paidAmount} onChange={e => setPaidAmount(e.target.value)}
+              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500" placeholder="e.g. 10000" />
+          )}
+        </div>
       </div>
 
       <button onClick={handleSave}
         className="w-full py-3 bg-indigo-600 text-white rounded-xl font-semibold hover:bg-indigo-700 transition-colors flex items-center justify-center gap-2 shadow-lg shadow-indigo-200">
         <Save size={18} /> Save Entry
       </button>
-
-      {showWaiverModal && (
-        <WaiverApprovalModal waiverAmount={waiver} onConfirm={handleWaiverConfirm} onCancel={() => { setShowWaiverModal(false); setPendingEntry(null); }} />
-      )}
     </div>
   );
 }

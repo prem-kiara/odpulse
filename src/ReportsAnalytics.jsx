@@ -409,7 +409,10 @@ function CustomerListView({ recent, summary, custSortKey, custSortDir, handleCus
   const pg = usePagination(arr, 10);
 
   return (
-    <SectionCard title="Unique Customers" subtitle={`${formatNum(summary.customerCount)} distinct customer IDs across the filtered disbursements`}>
+    <SectionCard
+      title="Total Disbursements per Customer"
+      subtitle={`${formatNum(summary.count)} disbursements across ${formatNum(summary.customerCount)} unique customers — sortable by Loans or Total Disbursed`}
+    >
       <div className="overflow-x-auto rounded-lg border">
         <table className="w-full text-xs">
           <thead className="bg-gray-50">
@@ -555,7 +558,7 @@ export default function ReportsAnalytics({ user }) {
       }
       if (expandedProducts.length > 0) p.set("product", expandedProducts.join(","));
       if (categoryFilter) p.set("category", categoryFilter);
-      if (view === "active" || view === "closed" || view === "pending") {
+      if (view === "active" || view === "closed" || view === "pending" || view === "overdue") {
         p.set("status", view);
       }
       const res = await fetch(`/api/od/disbursements?${p.toString()}`);
@@ -633,6 +636,8 @@ export default function ReportsAnalytics({ user }) {
         setSortKey("loan_amount"); setSortDir("desc"); break;
       case "principal":
         setSortKey("principal_outstanding"); setSortDir("desc"); break;
+      case "overdue":
+        setSortKey("overdue_amount"); setSortDir("desc"); break;
       case "branch":
         setSortKey("branch"); setSortDir("asc"); break;
       case "product":
@@ -691,7 +696,14 @@ export default function ReportsAnalytics({ user }) {
     let arr = recent.filter(r => {
       if (principalOnly && (Number(r.principal_outstanding) || 0) <= 0) return false;
       if (statusFilter && r.status !== statusFilter) return false;
-      if (tableStatusValue && r.status !== tableStatusValue) return false;
+      // Overdue is an attribute (not a mutually-exclusive status), so the
+      // dropdown's "Overdue" choice filters by overdue_amount > 0 instead
+      // of comparing r.status. Active/Closed/Pending still compare directly.
+      if (tableStatusValue === "Overdue") {
+        if ((Number(r.overdue_amount) || 0) <= 0) return false;
+      } else if (tableStatusValue && r.status !== tableStatusValue) {
+        return false;
+      }
       if (q) {
         return (r.customer_name || "").toLowerCase().includes(q) ||
                (r.loan_account_no || "").toLowerCase().includes(q) ||
@@ -769,6 +781,10 @@ export default function ReportsAnalytics({ user }) {
     }
   }, [fromDate, toDate, branchFilter, productFilter, categoryFilter, view, search, tableStatusFilter, filteredRecent]);
 
+  // Export schema mirrors the on-screen table: every column the user sees
+  // in Recent Disbursements / Overdue Accounts ends up in the download.
+  // Numeric fields are exported as raw numbers so spreadsheets can total
+  // them; date is the parsed ISO string for cross-system compatibility.
   const exportRowsForCSV = (rows) =>
     (rows || filteredRecent).map((r) => ({
       LoanAccount: r.loan_account_no || "",
@@ -780,6 +796,13 @@ export default function ReportsAnalytics({ user }) {
       DisbursementDate: r.disbursement_date_iso || "",
       LoanAmount: r.loan_amount || 0,
       PrincipalOutstanding: r.principal_outstanding || 0,
+      InterestOutstanding: r.interest_outstanding || 0,
+      ForeclosureAmount: r.arrear_amount || 0,
+      PrincipalOverdue: r.principal_overdue || 0,
+      InterestOverdue: r.interest_overdue || 0,
+      OverdueAmount: r.overdue_amount || 0,
+      DPDDays: r.overdue_days || 0,
+      DPDClassification: r.account_dpd_classification || "",
       Status: r.status || "",
     }));
 
@@ -795,10 +818,36 @@ export default function ReportsAnalytics({ user }) {
     const all = await fetchAllForExport();
     const w = window.open("", "_blank", "width=900,height=700");
     if (!w) return;
+    // Same column set as the on-screen Recent Disbursements table so the
+    // printed report matches what the user is looking at — Principal Out,
+    // Overdue, DPD Days, DPD Class included.
     const rowsHtml = all
-      .map(r =>
-        `<tr><td>${r.disbursement_date_iso || ""}</td><td>${r.customer_name || ""}</td><td>${r.loan_account_no || ""}</td><td>${r.branch || ""}</td><td>${r.product_name || ""}</td><td>${r.loan_category || ""}</td><td>${formatINR(r.loan_amount)}</td><td>${r.status || ""}</td></tr>`
-      ).join("");
+      .map(r => {
+        const dpdClass = r.account_dpd_classification || "";
+        const principalOut = Number(r.principal_outstanding) || 0;
+        const interestOut  = Number(r.interest_outstanding) || 0;
+        const arrearAmt    = Number(r.arrear_amount) || 0;
+        const overdueAmt   = Number(r.overdue_amount) || 0;
+        const dpdDays      = Number(r.overdue_days) || 0;
+        return (
+          `<tr>` +
+          `<td>${r.disbursement_date_iso || ""}</td>` +
+          `<td>${r.customer_name || ""}</td>` +
+          `<td>${r.loan_account_no || ""}</td>` +
+          `<td>${r.branch || ""}</td>` +
+          `<td>${r.product_name || ""}</td>` +
+          `<td>${r.loan_category || ""}</td>` +
+          `<td style="text-align:right">${formatINR(r.loan_amount)}</td>` +
+          `<td style="text-align:right">${principalOut > 0 ? formatINR(principalOut) : "—"}</td>` +
+          `<td style="text-align:right">${interestOut > 0 ? formatINR(interestOut) : "—"}</td>` +
+          `<td style="text-align:right">${arrearAmt > 0 ? formatINR(arrearAmt) : "—"}</td>` +
+          `<td style="text-align:right">${overdueAmt > 0 ? formatINR(overdueAmt) : "—"}</td>` +
+          `<td style="text-align:right">${dpdDays > 0 ? dpdDays : "—"}</td>` +
+          `<td>${dpdClass || "—"}</td>` +
+          `<td>${r.status || ""}</td>` +
+          `</tr>`
+        );
+      }).join("");
     w.document.write(`
       <!doctype html><html><head><title>Disbursement Report — ${todayISO()}</title>
       <style>
@@ -821,11 +870,31 @@ export default function ReportsAnalytics({ user }) {
         <th>Active</th><td>${formatNum(summary.active)}</td>
         <th>Closed</th><td>${formatNum(summary.closed)}</td>
         <th>Pending</th><td>${formatNum(summary.pending)}</td>
+        <th>Overdue</th><td>${formatNum(summary.overdue || 0)}</td>
+      </tr><tr>
         <th>Principal Outstanding</th><td>${formatINR(summary.principalOutstanding || 0)}</td>
+        <th>Overdue Amount</th><td>${formatINR(summary.overdueAmount || 0)}</td>
+        <th></th><td></td>
+        <th></th><td></td>
       </tr></table>
       <h2>Disbursements (showing ${all.length})</h2>
       <table>
-        <thead><tr><th>Date</th><th>Customer</th><th>Loan A/C</th><th>Branch</th><th>Product</th><th>Category</th><th>Amount</th><th>Status</th></tr></thead>
+        <thead><tr>
+          <th>Date</th>
+          <th>Customer</th>
+          <th>Loan A/C</th>
+          <th>Branch</th>
+          <th>Product</th>
+          <th>Category</th>
+          <th style="text-align:right">Amount</th>
+          <th style="text-align:right">Principal Out.</th>
+          <th style="text-align:right">Interest Out.</th>
+          <th style="text-align:right">Foreclosure Amount</th>
+          <th style="text-align:right">Overdue</th>
+          <th style="text-align:right">DPD Days</th>
+          <th>DPD Class</th>
+          <th>Status</th>
+        </tr></thead>
         <tbody>${rowsHtml}</tbody>
       </table>
       <script>window.onload=()=>window.print()</script>
@@ -1079,7 +1148,7 @@ export default function ReportsAnalytics({ user }) {
       {/* 3. KPI cards — clickable, switch the focused detail view below */}
       <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
         <SummaryCard icon={Activity} label="Total Disbursements" value={formatNum(summary.count)}
-          accent="teal" hint="Click to see all disbursement records"
+          accent="teal" hint={`Click to see per-customer breakdown · across ${formatNum(summary.customerCount)} customers`}
           onClick={() => setKpiView("count")} active={view === "count"} />
         <SummaryCard icon={Wallet} label="Total Amount" value={formatINR(summary.totalAmount)}
           accent="indigo" hint="Click to see amount breakdown"
@@ -1115,6 +1184,7 @@ export default function ReportsAnalytics({ user }) {
           ["active", "Active"],
           ["closed", "Closed"],
           ["pending", "Pending"],
+          ["overdue", "Overdue"],
         ].map(([k, label]) => (
           <button key={k} onClick={() => setView(k)}
             className={`text-[11px] px-2.5 py-1 border rounded-md ${view === k ? "bg-teal-600 text-white border-teal-700" : "bg-white text-gray-700 hover:bg-gray-100"}`}>
@@ -1124,9 +1194,9 @@ export default function ReportsAnalytics({ user }) {
       </div>
 
       {/* 4. Status split — clickable. Visible on Overview AND on the
-          active / closed / pending focused views (so user can re-toggle). */}
-      {(view === "overview" || view === "active" || view === "closed" || view === "pending") && (
-        <div className="grid grid-cols-3 gap-3">
+          active / closed / pending / overdue focused views. */}
+      {(view === "overview" || view === "active" || view === "closed" || view === "pending" || view === "overdue") && (
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
           <button type="button" onClick={() => setKpiView("active")}
             className={`bg-emerald-50 border rounded-xl p-3 text-center cursor-pointer hover:shadow-md transition-shadow ${view === "active" ? "border-emerald-500 ring-2 ring-emerald-500 shadow-md" : "border-emerald-200"}`}>
             <p className="text-[11px] text-emerald-700 uppercase tracking-wide">Active</p>
@@ -1144,6 +1214,15 @@ export default function ReportsAnalytics({ user }) {
             <p className="text-[11px] text-amber-700 uppercase tracking-wide">Pending / No-Snapshot</p>
             <p className="text-2xl font-extrabold text-amber-700">{formatNum(summary.pending)}</p>
             <p className="text-[10px] text-gray-500">Customer master only</p>
+          </button>
+          {/* 4th tile — Overdue. Counts loans whose latest pool snapshot
+              has principal_overdue + interest_overdue > 0. Click to filter
+              the Recent Disbursements table to those accounts. */}
+          <button type="button" onClick={() => setKpiView("overdue")}
+            className={`bg-rose-50 border rounded-xl p-3 text-center cursor-pointer hover:shadow-md transition-shadow ${view === "overdue" ? "border-rose-500 ring-2 ring-rose-500 shadow-md" : "border-rose-200"}`}>
+            <p className="text-[11px] text-rose-700 uppercase tracking-wide">Overdue</p>
+            <p className="text-2xl font-extrabold text-rose-700">{formatNum(summary.overdue || 0)}</p>
+            <p className="text-[10px] text-gray-500">{formatINR(summary.overdueAmount || 0)} due across these</p>
           </button>
         </div>
       )}
@@ -1223,8 +1302,12 @@ export default function ReportsAnalytics({ user }) {
         );
       })()}
 
-      {/* Focused view — Customer-grouped list (sortable + paginated) */}
-      {view === "customers" && (
+      {/* Focused view — Customer-grouped list (sortable + paginated). Used
+          by both the dedicated "By Customer" view AND the Total
+          Disbursements ("count") view, so the user always sees who owns
+          how many loans + their cumulative amount when drilling into
+          either tile. */}
+      {(view === "customers" || view === "count") && (
         <CustomerListView
           recent={recent}
           summary={summary}
@@ -1428,12 +1511,15 @@ export default function ReportsAnalytics({ user }) {
         title={view === "active" ? "Active Disbursements"
              : view === "closed" ? "Closed Disbursements"
              : view === "pending" ? "Pending / No-Snapshot Disbursements"
+             : view === "overdue" ? "Overdue Accounts"
              : view === "customers" ? "Recent Disbursements (per-customer view shown above)"
+             : view === "count" ? "All Disbursement Records (per-customer summary above)"
              : view === "amount" ? "Disbursements (sorted by amount)"
              : view === "principal" ? "Loans with Principal Outstanding"
              : "Recent Disbursements"}
         subtitle={`Showing ${filteredRecent.length} of ${recent.length} disbursements${
           view === "active" || view === "closed" || view === "pending" ? ` filtered to ${view}`
+          : view === "overdue" ? " — only loans with principal_overdue + interest_overdue > 0"
           : view === "principal" ? " — closed loans (principal = 0) hidden"
           : ""}`}
         action={
@@ -1450,6 +1536,7 @@ export default function ReportsAnalytics({ user }) {
               <option value="Active">Active</option>
               <option value="Closed">Closed</option>
               <option value="Pending">Pending</option>
+              <option value="Overdue">Overdue</option>
             </select>
             <div className="relative">
               <Search size={12} className="absolute left-2 top-2 text-gray-400" />
@@ -1472,12 +1559,17 @@ export default function ReportsAnalytics({ user }) {
                 <SortHeader sortKey="loan_category" currentKey={sortKey} currentDir={sortDir} onSort={handleSort}>Category</SortHeader>
                 <SortHeader sortKey="loan_amount" currentKey={sortKey} currentDir={sortDir} onSort={handleSort} align="right">Amount</SortHeader>
                 <SortHeader sortKey="principal_outstanding" currentKey={sortKey} currentDir={sortDir} onSort={handleSort} align="right">Principal Out.</SortHeader>
+                <SortHeader sortKey="interest_outstanding" currentKey={sortKey} currentDir={sortDir} onSort={handleSort} align="right">Interest Out.</SortHeader>
+                <SortHeader sortKey="arrear_amount" currentKey={sortKey} currentDir={sortDir} onSort={handleSort} align="right">Foreclosure Amount</SortHeader>
+                <SortHeader sortKey="overdue_amount" currentKey={sortKey} currentDir={sortDir} onSort={handleSort} align="right">Overdue</SortHeader>
+                <SortHeader sortKey="overdue_days" currentKey={sortKey} currentDir={sortDir} onSort={handleSort} align="right">DPD Days</SortHeader>
+                <SortHeader sortKey="account_dpd_classification" currentKey={sortKey} currentDir={sortDir} onSort={handleSort}>DPD Class</SortHeader>
                 <SortHeader sortKey="status" currentKey={sortKey} currentDir={sortDir} onSort={handleSort}>Status</SortHeader>
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-100">
               {filteredRecent.length === 0 ? (
-                <tr><td colSpan={9} className="px-3 py-6 text-center text-gray-400">No disbursements match the current filters.</td></tr>
+                <tr><td colSpan={14} className="px-3 py-6 text-center text-gray-400">No disbursements match the current filters.</td></tr>
               ) : (
                 recentPg.pageRows.map((r) => (
                   <tr key={r.loan_account_no} className="hover:bg-gray-50">
@@ -1518,6 +1610,35 @@ export default function ReportsAnalytics({ user }) {
                     <td className="px-3 py-2 text-right font-semibold">{formatINR(r.loan_amount)}</td>
                     <td className={`px-3 py-2 text-right font-medium ${(Number(r.principal_outstanding) || 0) > 0 ? "text-rose-700" : "text-gray-400"}`}>
                       {(Number(r.principal_outstanding) || 0) > 0 ? formatINR(r.principal_outstanding) : "—"}
+                    </td>
+                    {/* Interest Outstanding — accumulated interest balance
+                        from the latest pool snapshot. */}
+                    <td className={`px-3 py-2 text-right font-medium ${(Number(r.interest_outstanding) || 0) > 0 ? "text-indigo-700" : "text-gray-400"}`}>
+                      {(Number(r.interest_outstanding) || 0) > 0 ? formatINR(r.interest_outstanding) : "—"}
+                    </td>
+                    {/* Foreclosure Amount = Principal Outstanding + Interest Outstanding. */}
+                    <td className={`px-3 py-2 text-right font-semibold ${(Number(r.arrear_amount) || 0) > 0 ? "text-gray-900" : "text-gray-400"}`}>
+                      {(Number(r.arrear_amount) || 0) > 0 ? formatINR(r.arrear_amount) : "—"}
+                    </td>
+                    <td className={`px-3 py-2 text-right font-medium ${(Number(r.overdue_amount) || 0) > 0 ? "text-amber-700" : "text-gray-400"}`}>
+                      {(Number(r.overdue_amount) || 0) > 0 ? formatINR(r.overdue_amount) : "—"}
+                    </td>
+                    {/* DPD Days — number of days the loan has been overdue. */}
+                    <td className={`px-3 py-2 text-right font-medium ${(Number(r.overdue_days) || 0) > 0 ? "text-rose-700" : "text-gray-400"}`}>
+                      {(Number(r.overdue_days) || 0) > 0 ? formatNum(r.overdue_days) : "—"}
+                    </td>
+                    {/* Account DPD classification — bucket label from the
+                        pool snapshot (Regular / SMA-0 / SMA-1 / SMA-2 / NPA). */}
+                    <td className="px-3 py-2">
+                      {r.account_dpd_classification ? (
+                        <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${
+                          r.account_dpd_classification === "NPA" ? "bg-red-100 text-red-700"
+                          : r.account_dpd_classification === "SMA-2" ? "bg-orange-100 text-orange-700"
+                          : r.account_dpd_classification === "SMA-1" ? "bg-amber-100 text-amber-700"
+                          : r.account_dpd_classification === "SMA-0" ? "bg-yellow-100 text-yellow-700"
+                          : "bg-emerald-100 text-emerald-700"
+                        }`}>{r.account_dpd_classification}</span>
+                      ) : <span className="text-gray-400">—</span>}
                     </td>
                     <td className="px-3 py-2">
                       <span className={`text-[10px] px-1.5 py-0.5 rounded ${
