@@ -99,3 +99,4 @@ odpulse/
 ## License
 
 Internal use — proprietary.
+# auto-deploy enabled
