@@ -59,15 +59,90 @@ function writeBranchesAtomic(branchesFile, branches) {
 // `branchRegistry` Set so subsequent rows in the same file skip the
 // disk write. The on-disk write is atomic (temp file + rename). Empty
 // branch names are silently ignored. Errors surface to the caller.
+//
+// TYPO PROTECTION: every auto-added branch is logged AND also appended to
+// branches-autoadded-audit.json so admins can review what showed up. If a
+// near-duplicate of an existing branch is detected (e.g. "Mahasaman" when
+// "Mahasamam" exists), the row is added (so ingest doesn't fail) but
+// FLAGGED for admin review in branches-pending-review.json. The dropdown
+// keeps the new branch visible, but admins can see what to merge.
 function addBranchIfMissing(branchesFile, branch, branchRegistry) {
   if (!branch) return;
-  const key = String(branch).toLowerCase();
+  const trimmed = String(branch).trim();
+  if (!trimmed) return;
+  // Trailing-space / case-variant detection — these are almost certainly
+  // typos rather than genuinely new branches.
+  if (trimmed !== String(branch)) {
+    console.warn(`[branches] auto-add SUSPICIOUS: input "${branch}" has surrounding whitespace; using "${trimmed}"`);
+  }
+  const key = trimmed.toLowerCase();
   if (branchRegistry.has(key)) return;
   branchRegistry.add(key);
   const existing = readBranches(branchesFile);
-  // Re-check on disk in case another writer beat us here — still cheap.
   if (existing.some(b => String(b).toLowerCase() === key)) return;
-  writeBranchesAtomic(branchesFile, existing.concat(branch));
+
+  // Fuzzy near-duplicate detection: collapse non-letter chars + lowercase,
+  // then compare. "Mahasamam" vs "Mahasaman" → both → "mahasamam" / "mahasaman"
+  // — Levenshtein distance 1. Flag pairs with distance ≤ 2 on names ≥ 4 chars.
+  const norm = (s) => String(s).toLowerCase().replace(/[^a-z0-9]/g, "");
+  const ntrimmed = norm(trimmed);
+  function lev(a, b) {
+    if (a === b) return 0;
+    if (!a.length) return b.length;
+    if (!b.length) return a.length;
+    const v = new Array(b.length + 1).fill(0).map((_, i) => i);
+    for (let i = 0; i < a.length; i++) {
+      let prev = i + 1;
+      for (let j = 0; j < b.length; j++) {
+        const cost = a[i] === b[j] ? 0 : 1;
+        const cur = Math.min(v[j + 1] + 1, prev + 1, v[j] + cost);
+        v[j] = prev;
+        prev = cur;
+      }
+      v[b.length] = prev;
+    }
+    return v[b.length];
+  }
+  let nearMatch = null;
+  if (ntrimmed.length >= 4) {
+    for (const b of existing) {
+      const nb = norm(b);
+      if (!nb) continue;
+      const d = lev(ntrimmed, nb);
+      if (d > 0 && d <= 2) { nearMatch = b; break; }
+    }
+  }
+  if (nearMatch) {
+    console.warn(`[branches] auto-add NEAR-DUPLICATE: "${trimmed}" looks similar to existing "${nearMatch}" — flagging for admin review`);
+    try {
+      const reviewFile = branchesFile.replace(/branches\.json$/, "branches-pending-review.json");
+      let review = [];
+      try { review = JSON.parse(fs.readFileSync(reviewFile, "utf8")); } catch {}
+      review.unshift({
+        ts: new Date().toISOString(),
+        added: trimmed,
+        similarTo: nearMatch,
+        action: "auto-added",
+      });
+      fs.writeFileSync(reviewFile, JSON.stringify(review.slice(0, 1000), null, 2), "utf8");
+    } catch (e) {
+      console.warn(`[branches] couldn't write review file: ${e.message}`);
+    }
+  }
+
+  console.log(`[branches] auto-add: "${trimmed}"${nearMatch ? ` (NEAR "${nearMatch}" — review)` : ""}`);
+  writeBranchesAtomic(branchesFile, existing.concat(trimmed));
+
+  // Also write to an audit log of every auto-added branch.
+  try {
+    const auditFile = branchesFile.replace(/branches\.json$/, "branches-autoadded-audit.json");
+    let audit = [];
+    try { audit = JSON.parse(fs.readFileSync(auditFile, "utf8")); } catch {}
+    audit.unshift({ ts: new Date().toISOString(), branch: trimmed, nearMatch });
+    fs.writeFileSync(auditFile, JSON.stringify(audit.slice(0, 5000), null, 2), "utf8");
+  } catch (e) {
+    console.warn(`[branches] couldn't write audit file: ${e.message}`);
+  }
 }
 
 // Validate required headers exist (case-insensitive, trim-insensitive).

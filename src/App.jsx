@@ -5,6 +5,7 @@ import { CustomerInfoPanel, DataUploadPage, CollectionDashboard } from "./OdInsi
 import ReportsAnalytics from "./ReportsAnalytics.jsx";
 import { SortableSection, PaginatedSortableSection } from "./tableSort.jsx";
 import { usePagination, PaginationBar } from "./Pagination";
+import { enqueueEntry, enqueueEntryUpdate, enqueueEntryDelete, listQueuedEntries, drainEntryQueue, listDeadLetters } from "./entryQueue";
 
 // ─── Constants & Helpers ────────────────────────────────────────────────────
 const COLORS = ["#0f766e", "#06b6d4", "#8b5cf6", "#f59e0b", "#ef4444", "#10b981", "#ec4899", "#6366f1", "#14b8a6", "#f97316"];
@@ -71,6 +72,99 @@ const formatDateDMY = (isoDate) => {
 
 // ─── API + localStorage helpers ────────────────────────────────────────────
 const API_BASE = "/api";
+
+// Persist a single OD entry to the server. Returns:
+//   { ok: true }                                    — server accepted
+//   { ok: false, queued: true, reason }            — server unreachable; entry was
+//                                                    persisted to IndexedDB and will
+//                                                    auto-retry on the next app load
+//   { ok: false, queued: false, reason }           — server rejected with a 4xx
+//                                                    (validation error); needs user
+//                                                    correction before re-save
+async function persistEntry(entry) {
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 10000);
+    const res = await fetch(`${API_BASE}/entries/append`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(entry),
+      signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+    if (res.ok) return { ok: true };
+    if (res.status >= 400 && res.status < 500) {
+      let serverMsg = "";
+      try {
+        const body = await res.json();
+        serverMsg = body?.error || body?.errors?.join(" ") || "";
+      } catch {}
+      return { ok: false, queued: false, reason: serverMsg || `Server rejected entry (HTTP ${res.status}).` };
+    }
+    await enqueueEntry(entry, `HTTP ${res.status}`);
+    return { ok: false, queued: true, reason: `Server error ${res.status} — entry safely saved offline and will sync when the server recovers.` };
+  } catch (err) {
+    try { await enqueueEntry(entry, err?.message || String(err)); } catch {}
+    return { ok: false, queued: true, reason: "Couldn't reach the server. Entry was saved offline and will sync automatically when connectivity returns." };
+  }
+}
+
+// Update an existing entry on the server. Same offline-queue fallback pattern
+// as persistEntry. Replaces the "POST the entire entries array" anti-pattern
+// in handlePTPPayment / Records edits which silently lost updates on network
+// blips and clobbered concurrent edits from other users.
+async function persistEntryUpdate(entryId, patch, enteredBy) {
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 10000);
+    const res = await fetch(`${API_BASE}/entries/${encodeURIComponent(entryId)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+      signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+    if (res.ok) return { ok: true };
+    if (res.status === 404) {
+      // Already gone — treat as success.
+      return { ok: true, missing: true };
+    }
+    if (res.status >= 400 && res.status < 500) {
+      let serverMsg = "";
+      try { const body = await res.json(); serverMsg = body?.error || body?.errors?.join(" ") || ""; } catch {}
+      return { ok: false, queued: false, reason: serverMsg || `Server rejected update (HTTP ${res.status}).` };
+    }
+    await enqueueEntryUpdate(entryId, patch, enteredBy, `HTTP ${res.status}`);
+    return { ok: false, queued: true, reason: `Server error ${res.status} — change saved offline and will sync when the server recovers.` };
+  } catch (err) {
+    try { await enqueueEntryUpdate(entryId, patch, enteredBy, err?.message || String(err)); } catch {}
+    return { ok: false, queued: true, reason: "Couldn't reach the server. Change saved offline and will sync automatically when connectivity returns." };
+  }
+}
+
+// Delete an entry on the server. Same offline-queue fallback.
+async function persistEntryDelete(entryId, enteredBy) {
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 10000);
+    const res = await fetch(`${API_BASE}/entries/${encodeURIComponent(entryId)}`, {
+      method: "DELETE",
+      signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+    if (res.ok || res.status === 404) return { ok: true };
+    if (res.status >= 400 && res.status < 500) {
+      let serverMsg = "";
+      try { const body = await res.json(); serverMsg = body?.error || ""; } catch {}
+      return { ok: false, queued: false, reason: serverMsg || `Server rejected delete (HTTP ${res.status}).` };
+    }
+    await enqueueEntryDelete(entryId, enteredBy, `HTTP ${res.status}`);
+    return { ok: false, queued: true, reason: `Server error ${res.status} — deletion saved offline and will sync when the server recovers.` };
+  } catch (err) {
+    try { await enqueueEntryDelete(entryId, enteredBy, err?.message || String(err)); } catch {}
+    return { ok: false, queued: true, reason: "Couldn't reach the server. Deletion saved offline and will sync automatically when connectivity returns." };
+  }
+}
 
 // ─── DPD classification (client-side, derived from overdue days) ───────────
 // Single source of truth so Group OD + Individual OD forms stay consistent,
@@ -160,8 +254,23 @@ const DEFAULT_BRANCHES = [
   "Gobichettipalayam", "Paramathivelur", "Tiruchengode", "Kattuputhur", "Kulithalai",
   "Rasipuram", "Ambai", "Alangulam", "Surandai", "Tenkasi", "Eral", "Tuticorin",
   "Palayamkottai", "Rajapalayam", "Sanakarankovil", "Srivilliputhur", "Periyakulam",
-  "Chinnamanur", "Kariyapatti", "RR Nagar", "Thirupuvanam", "Valayankulam", "Checkanurani"
+  "Chinnamanur", "Kariyapatti", "RR Nagar", "Thirupuvanam", "Valayankulam", "Checkanurani",
+  "mahashemam"
 ];
+
+// Branches allowed to save entries WITHOUT entering the "OD Amount Due"
+// amount. Deliberate carve-out kept small and explicit. Other validations
+// remain unchanged for these branches.
+//
+// Stored as lowercase. Matched case-insensitively via
+// isBranchDueOptional() — so "mahashemam", "Mahashemam", "MAHASHEMAM" all
+// bypass the Due requirement. This is intentional: production data has
+// historically used "Mahashemam" (uppercase) for the Aadhaar-only bulk
+// upload flow, and the user-facing canonical form is now "mahashemam"
+// (lowercase). Both work.
+const BRANCHES_WITHOUT_DUE_REQUIRED = new Set(["mahashemam"]);
+const isBranchDueOptional = (branch) =>
+  BRANCHES_WITHOUT_DUE_REQUIRED.has(String(branch || "").trim().toLowerCase());
 const DEFAULT_USERS = [
   { id: "admin", username: "admin", password: "admin123", role: "admin", name: "Administrator", branch: "Head Office", active: true, mustChangePassword: false },
   { id: "u_vijila", username: "vijila", password: "Dhanam@123", role: "staff", name: "Vijila", branch: "", active: true, mustChangePassword: true },
@@ -412,6 +521,8 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
   const [ptpTime, setPtpTime] = useState("");
   const [showWaiverModal, setShowWaiverModal] = useState(false);
   const [pendingEntry, setPendingEntry] = useState(null);
+  // Disable Save button while the POST to /entries/append is in flight.
+  const [saving, setSaving] = useState(false);
   // Payment-mode specific tracking:
   //   Cash mode → collectorStaffId + depositBank
   //   UPI mode  → transactionId + narration  (in addition to existing upiReference)
@@ -588,8 +699,18 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
     if (!loanAccountNo.trim()) { alert("Please enter loan account number."); return; }
     if (numCust <= 0) { alert("Please enter the total number of customers in the group."); return; }
     if (groupSizeExceeded) { alert(`Group Size (${numCust}) cannot exceed the actual number of members in this group (${maxGroupSize}).`); return; }
-    if (groupOdDue <= 0) { alert("Please enter Group OD Amount Due."); return; }
+    // OD Amount Due is OPTIONAL for branches in BRANCHES_WITHOUT_DUE_REQUIRED
+    // (e.g. mahashemam — matched case-insensitively). All other validations remain unchanged.
+    if (groupOdDue <= 0 && !isBranchDueOptional(branch)) {
+      alert("Please enter Group OD Amount Due."); return;
+    }
     if (!isPtpFuture && groupOdPaid < 0) { alert("Paid Amount cannot be negative."); return; }
+    // Even for Due-optional branches, the entry must record either a payment
+    // (Paid > 0) OR a PTP date. Otherwise the entry is meaningless and would
+    // pollute reports with empty ₹0/₹0 rows.
+    if (isBranchDueOptional(branch) && groupOdDue <= 0 && groupOdPaid <= 0 && !isPtpFuture) {
+      alert("Please enter a Paid Amount (or set a PTP date). Entries with zero amount due AND zero paid amount cannot be saved."); return;
+    }
     if (!paymentMode) { alert("Please select a Payment Mode."); return; }
     if (paymentMode === "UPI" && !upiReference.trim()) { alert("Please enter UPI Transaction Reference."); return; }
     if (paymentMode === "UPI" && !transactionId.trim()) { alert("Please enter the Transaction ID."); return; }
@@ -665,17 +786,22 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
     return d instanceof Date && !isNaN(d);
   };
 
-  const saveEntry = (entry) => {
+  const saveEntry = async (entry) => {
+    if (saving) return;
+    setSaving(true);
+    const result = await persistEntry(entry);
+    if (!result.ok && !result.queued) {
+      setSaving(false);
+      alert(`Save failed: ${result.reason}\n\nThe entry has NOT been saved. Please correct and try again.`);
+      return;
+    }
+    if (!result.ok && result.queued) {
+      alert(`${result.reason}\n\nYou can keep working — the entry will sync automatically when the server is reachable again.`);
+    }
+
     const updated = [entry, ...entries];
     setEntries(updated);
-    // Save to localStorage only (don't fire full-array POST to server)
     localStorage.setItem(STORAGE_KEYS.entries, JSON.stringify(updated));
-    // Use append endpoint for server (avoids duplicate from full-array sync)
-    fetch(`${API_BASE}/entries/append`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(entry),
-    }).catch(err => console.warn("[API append]", err.message));
 
     // Create persistent PTP notification if PTP is pending
     if (entry.ptpStatus === "pending" && entry.ptpDate) {
@@ -712,12 +838,13 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
     setPhone(""); setAadhaar(""); setAadhaarEditable(true);
     setAutoFilledFields(new Set()); setLookupStatus(""); setCustomerMatches([]);
     setCustomerCenters([]); setMemberArrearOverride(0); setMemberAlreadyCollected(0);
+    setSaving(false);
     setPage("records");
   };
 
-  const handleWaiverConfirm = (approval) => {
+  const handleWaiverConfirm = async (approval) => {
     if (pendingEntry) {
-      saveEntry({ ...pendingEntry, waiverApproval: approval });
+      await saveEntry({ ...pendingEntry, waiverApproval: approval });
       setPendingEntry(null);
       setShowWaiverModal(false);
     }
@@ -1237,7 +1364,7 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
                 state and save flow remain unchanged — only manual editing is
                 disabled. */}
             <input type="number" min="0" value={groupOdAmount} readOnly tabIndex={-1}
-              className="w-full px-3 py-2 border rounded-lg bg-gray-50 text-gray-800 font-medium cursor-default focus:outline-none"
+              className="no-spinner w-full px-3 py-2 border rounded-lg bg-gray-50 text-gray-800 font-medium cursor-default focus:outline-none"
               placeholder="Click a closed member above to populate" />
           </div>
           <div>
@@ -1258,7 +1385,7 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
                   setNumberOfCustomers(v);
                 }
               }}
-              className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500 ${groupSizeExceeded ? "border-red-400 bg-red-50" : ""}`}
+              className={`no-spinner w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500 ${groupSizeExceeded ? "border-red-400 bg-red-50" : ""}`}
               placeholder="e.g. 4" />
             {groupSizeExceeded && (
               <p className="text-xs text-red-600 mt-1">Cannot exceed {maxGroupSize} members in this group.</p>
@@ -1391,7 +1518,7 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
               </div>
             ) : (
               <input type="number" min="0" value={groupOdPaidAmount} onChange={e => setGroupOdPaidAmount(e.target.value)}
-                className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="e.g. 2000" />
+                className="no-spinner w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="e.g. 2000" />
             )}
           </div>
           <div>
@@ -1429,8 +1556,9 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
       </div>
 
       <button onClick={handleSave}
-        className="w-full py-3 bg-teal-600 text-white rounded-xl font-semibold hover:bg-teal-700 transition-colors flex items-center justify-center gap-2 shadow-lg shadow-teal-200">
-        <Save size={18} /> Save Entry
+        disabled={saving}
+        className={`w-full py-3 rounded-xl font-semibold flex items-center justify-center gap-2 shadow-lg shadow-teal-200 transition-colors ${saving ? "bg-teal-300 text-white cursor-not-allowed" : "bg-teal-600 text-white hover:bg-teal-700"}`}>
+        {saving ? (<><Activity size={18} className="animate-spin" /> Saving…</>) : (<><Save size={18} /> Save Entry</>)}
       </button>
 
       {showWaiverModal && (
@@ -1463,6 +1591,8 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
   const [waiverInput, setWaiverInput] = useState("");
   const [showWaiverModal, setShowWaiverModal] = useState(false);
   const [pendingEntry, setPendingEntry] = useState(null);
+  // Disable Save button while POST is in-flight; same pattern as Group OD.
+  const [saving, setSaving] = useState(false);
   // Payment-mode specific tracking (same pattern as Group OD form).
   const [collectorStaffId, setCollectorStaffId] = useState("");
   const [depositBank, setDepositBank] = useState("");
@@ -1622,8 +1752,17 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
     if (!branch) { alert("Please select a branch."); return; }
     if (!customerName.trim()) { alert("Please enter customer name."); return; }
     if (!loanAccountNo.trim()) { alert("Please enter loan account number."); return; }
-    if (due <= 0) { alert("Please enter OD Amount Due."); return; }
+    // OD Amount Due is OPTIONAL for branches in BRANCHES_WITHOUT_DUE_REQUIRED
+    // (e.g. mahashemam — matched case-insensitively). Every other validation still applies.
+    if (due <= 0 && !isBranchDueOptional(branch)) {
+      alert("Please enter OD Amount Due."); return;
+    }
     if (!isPtpFuture && paid < 0) { alert("Paid Amount cannot be negative."); return; }
+    // Even for Due-optional branches, require a real recovery signal: either
+    // Paid > 0 OR a PTP date. Prevents empty 0/0 entries.
+    if (isBranchDueOptional(branch) && due <= 0 && paid <= 0 && !isPtpFuture) {
+      alert("Please enter a Paid Amount (or set a PTP date). Entries with zero amount due AND zero paid amount cannot be saved."); return;
+    }
     if (!paymentMode) { alert("Please select a Payment Mode."); return; }
     if (paymentMode === "UPI" && !upiReference.trim()) { alert("Please enter UPI Transaction Reference."); return; }
     if (paymentMode === "UPI" && !transactionId.trim()) { alert("Please enter the Transaction ID."); return; }
@@ -1680,15 +1819,21 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
     saveIndivEntry(entry);
   };
 
-  const saveIndivEntry = (entry) => {
+  const saveIndivEntry = async (entry) => {
+    if (saving) return;
+    setSaving(true);
+    const result = await persistEntry(entry);
+    if (!result.ok && !result.queued) {
+      setSaving(false);
+      alert(`Save failed: ${result.reason}\n\nThe entry has NOT been saved. Please correct and try again.`);
+      return;
+    }
+    if (!result.ok && result.queued) {
+      alert(`${result.reason}\n\nYou can keep working — the entry will sync automatically when the server is reachable again.`);
+    }
     const updated = [entry, ...entries];
     setEntries(updated);
     localStorage.setItem(STORAGE_KEYS.entries, JSON.stringify(updated));
-    fetch(`${API_BASE}/entries/append`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(entry),
-    }).catch(err => console.warn("[API append]", err.message));
 
     if (entry.ptpStatus === "pending" && entry.ptpDate) {
       const existingNotifs = loadData(STORAGE_KEYS.notifications, []);
@@ -1719,12 +1864,13 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
     setSmaBucket(""); setPhone(""); setAadhaar(""); setAadhaarEditable(true);
     setAutoFilledFields(new Set()); setLookupStatus(""); setCustomerMatches([]);
     setIndivCenters([]);
+    setSaving(false);
     setPage("ind_records");
   };
 
-  const handleWaiverConfirm = (approval) => {
+  const handleWaiverConfirm = async (approval) => {
     if (pendingEntry) {
-      saveIndivEntry({ ...pendingEntry, waiverApproval: approval });
+      await saveIndivEntry({ ...pendingEntry, waiverApproval: approval });
       setPendingEntry(null);
       setShowWaiverModal(false);
     }
@@ -1983,7 +2129,7 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
                 or backend lookup. The setAmountDue() call paths still fire
                 programmatically — only manual editing is disabled. */}
             <input type="number" min="0" value={amountDue} readOnly tabIndex={-1}
-              className={`w-full px-3 py-2 border rounded-lg cursor-default focus:outline-none ${autoFilledFields.has("amountDue") ? "bg-indigo-50 border-indigo-200 text-indigo-900 font-medium" : "bg-gray-50 text-gray-800 font-medium"}`}
+              className={`no-spinner w-full px-3 py-2 border rounded-lg cursor-default focus:outline-none ${autoFilledFields.has("amountDue") ? "bg-indigo-50 border-indigo-200 text-indigo-900 font-medium" : "bg-gray-50 text-gray-800 font-medium"}`}
               placeholder="Will populate from customer lookup / foreclosure value" />
           </div>
           <div>
@@ -2089,14 +2235,15 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
             </div>
           ) : (
             <input type="number" min="0" value={paidAmount} onChange={e => setPaidAmount(e.target.value)}
-              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500" placeholder="e.g. 10000" />
+              className="no-spinner w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-indigo-500" placeholder="e.g. 10000" />
           )}
         </div>
       </div>
 
       <button onClick={handleSave}
-        className="w-full py-3 bg-indigo-600 text-white rounded-xl font-semibold hover:bg-indigo-700 transition-colors flex items-center justify-center gap-2 shadow-lg shadow-indigo-200">
-        <Save size={18} /> Save Entry
+        disabled={saving}
+        className={`w-full py-3 rounded-xl font-semibold flex items-center justify-center gap-2 shadow-lg shadow-indigo-200 transition-colors ${saving ? "bg-indigo-300 text-white cursor-not-allowed" : "bg-indigo-600 text-white hover:bg-indigo-700"}`}>
+        {saving ? (<><Activity size={18} className="animate-spin" /> Saving…</>) : (<><Save size={18} /> Save Entry</>)}
       </button>
     </div>
   );
@@ -2156,7 +2303,7 @@ function PTPPaymentModal({ entry, onSave, onCancel }) {
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Paid Amount *</label>
             <input type="number" min="0" value={paidAmount} onChange={e => setPaidAmount(e.target.value)}
-              className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="Enter amount paid" />
+              className="no-spinner w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="Enter amount paid" />
             {paid > 0 && paid < customerShare && (
               <p className="text-xs text-amber-600 mt-1">Waiver of {formatINR(waiver)} will be applied</p>
             )}
@@ -2209,13 +2356,27 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
     return Object.entries(map).map(([value, label]) => ({ value, label })).sort((a, b) => a.label.localeCompare(b.label));
   }, [entries, odTypeFilter]);
 
-  const handlePTPPayment = (paymentData) => {
+  const handlePTPPayment = async (paymentData) => {
     if (!ptpPaymentEntry) return;
+    const enteredBy = ptpPaymentEntry.enteredBy || user?.id || null;
+
+    // Send the PATCH to the server first (with offline-queue fallback). This
+    // replaces the old "POST entire entries array" pattern which silently lost
+    // PTP-payment updates on network blips and clobbered concurrent edits.
+    const result = await persistEntryUpdate(ptpPaymentEntry.id, paymentData, enteredBy);
+    if (!result.ok && !result.queued) {
+      alert(`Update failed: ${result.reason}\n\nThe PTP payment has NOT been recorded.`);
+      return;
+    }
+    if (!result.ok && result.queued) {
+      console.warn("[handlePTPPayment] queued for retry:", result.reason);
+    }
+
     const updated = entries.map(e =>
       e.id === ptpPaymentEntry.id ? { ...e, ...paymentData } : e
     );
     setEntries(updated);
-    saveData(STORAGE_KEYS.entries, updated);
+    localStorage.setItem(STORAGE_KEYS.entries, JSON.stringify(updated));
 
     // Clear persistent PTP notifications for this entry
     const updatedNotifs = notifications.filter(n => !(n.entryId === ptpPaymentEntry.id && n.type === "ptp_pending"));
@@ -2303,11 +2464,30 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
 
   const canDelete = user.role === "admin" || config.allowStaffDelete;
 
-  const handleDelete = (id) => {
+  const handleDelete = async (id) => {
     if (!confirm("Delete this entry?")) return;
+    // Find the user-id this entry was attributed to so the offline queue can
+    // scope drains per-user on shared devices.
+    const target = entries.find(e => e && e.id === id);
+    const enteredBy = target?.enteredBy || user?.id || null;
+
+    // Try the server FIRST. If it succeeds we trust the result and update
+    // local state. If it fails transiently we still update local state and
+    // queue the delete for later — the user shouldn't see the entry come back
+    // on reload. If it fails permanently (4xx) we leave local state alone and
+    // surface the error.
+    const result = await persistEntryDelete(id, enteredBy);
+    if (!result.ok && !result.queued) {
+      alert(`Delete failed: ${result.reason}\n\nThe entry was NOT deleted on the server.`);
+      return;
+    }
+    if (!result.ok && result.queued) {
+      // Queued — proceed with optimistic local removal; queue will catch up.
+      console.warn("[handleDelete] queued for retry:", result.reason);
+    }
     const updated = entries.filter(e => e.id !== id);
     setEntries(updated);
-    saveData(STORAGE_KEYS.entries, updated);
+    localStorage.setItem(STORAGE_KEYS.entries, JSON.stringify(updated));
   };
 
   const totalRecovered = visibleEntries.reduce((s, e) => s + getPaid(e), 0);
@@ -3433,6 +3613,55 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
   // decides per-row whether to include anyway or skip.
   //   { type, newRows, dupRows, onCommit }  — onCommit(includedDupes) does the insert.
   const [pendingDuplicates, setPendingDuplicates] = useState(null);
+  // Duplicate-user detector (Bug #14). When admin opens the "Duplicate Users"
+  // tab we load potential dupes from the server; each group lets admin pick
+  // a canonical user and merge the others into it (re-attributing all their
+  // entries, then deactivating the duplicates).
+  const [dupUserGroups, setDupUserGroups] = useState(null); // null = not loaded
+  const [dupUserLoading, setDupUserLoading] = useState(false);
+  const [dupUserMerging, setDupUserMerging] = useState(false);
+
+  const refreshDuplicateUsers = async () => {
+    setDupUserLoading(true);
+    try {
+      const r = await fetch(`${API_BASE}/admin/duplicate-users`);
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const data = await r.json();
+      setDupUserGroups(data.groups || []);
+    } catch (e) {
+      alert(`Couldn't load duplicates: ${e.message}`);
+      setDupUserGroups([]);
+    } finally {
+      setDupUserLoading(false);
+    }
+  };
+
+  const mergeUsers = async (canonicalId, duplicateId, dupName, canonName) => {
+    if (!confirm(`Merge "${dupName}" into "${canonName}"?\n\n• All entries attributed to "${dupName}" will be re-attributed to "${canonName}".\n• "${dupName}" will be marked inactive (kept for audit; can be reactivated).\n\nThis cannot be easily undone. Proceed?`)) return;
+    setDupUserMerging(true);
+    try {
+      const r = await fetch(`${API_BASE}/admin/merge-users`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ canonicalId, duplicateId }),
+      });
+      if (!r.ok) {
+        let msg = `HTTP ${r.status}`;
+        try { const b = await r.json(); msg = b?.error || msg; } catch {}
+        throw new Error(msg);
+      }
+      const result = await r.json();
+      alert(`Merge complete. Re-attributed ${result.touched} field(s) and deactivated "${dupName}".\n\nReload the page to see fresh data.`);
+      // Refresh the duplicate list and the users list
+      await refreshDuplicateUsers();
+      const freshUsers = await fetchAPI("users", []);
+      if (freshUsers) setUsers(freshUsers);
+    } catch (e) {
+      alert(`Merge failed: ${e.message}`);
+    } finally {
+      setDupUserMerging(false);
+    }
+  };
 
   // Strict duplicate rule: two entries are duplicates iff they share the same
   // (date, loanAccountNo). Rows without a loanAccountNo (e.g. Mahashemam) are
@@ -3951,7 +4180,7 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
     <div>
       <h2 className="text-xl font-bold text-gray-900 mb-4 flex items-center gap-2"><Settings size={22} className="text-teal-600" /> Admin Panel</h2>
       <div className="flex flex-wrap gap-2 mb-6">
-        {[{ key: "users", icon: Users, label: "Users" }, { key: "branches", icon: GitBranch, label: "Branches" }, { key: "bulk", icon: Upload, label: "Bulk Upload" }, { key: "settings", icon: Settings, label: "Settings" }].map(t => (
+        {[{ key: "users", icon: Users, label: "Users" }, { key: "duplicates", icon: UserPlus, label: "Duplicate Users" }, { key: "branches", icon: GitBranch, label: "Branches" }, { key: "bulk", icon: Upload, label: "Bulk Upload" }, { key: "settings", icon: Settings, label: "Settings" }].map(t => (
           <button key={t.key} onClick={() => setTab(t.key)}
             className={`flex items-center gap-1.5 px-4 py-2 rounded-lg text-sm font-medium transition-colors ${tab === t.key ? "bg-teal-600 text-white" : "bg-white text-gray-600 border hover:bg-gray-50"}`}>
             <t.icon size={16} /> {t.label}
@@ -4022,6 +4251,76 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
               </table>
             )} />
           </div>
+        </div>
+      )}
+
+      {tab === "duplicates" && (
+        <div className="bg-white rounded-xl border p-5">
+          <div className="flex items-center justify-between mb-4">
+            <div>
+              <h3 className="font-semibold text-gray-800">Duplicate User Accounts</h3>
+              <p className="text-xs text-gray-500 mt-1">Detects users with near-identical names (e.g. "Padmapriya" vs "Padmapriya M"). Pick a canonical account; merging re-attributes entries and deactivates the duplicate.</p>
+            </div>
+            <button onClick={refreshDuplicateUsers}
+              disabled={dupUserLoading}
+              className={`px-4 py-2 rounded-lg text-sm font-medium ${dupUserLoading ? "bg-gray-200 text-gray-500 cursor-not-allowed" : "bg-teal-600 text-white hover:bg-teal-700"}`}>
+              {dupUserLoading ? "Scanning…" : (dupUserGroups === null ? "Scan for Duplicates" : "Re-scan")}
+            </button>
+          </div>
+
+          {dupUserGroups === null && (
+            <div className="text-sm text-gray-500 py-8 text-center border-2 border-dashed rounded-lg">
+              Click "Scan for Duplicates" to detect potential duplicate user accounts.
+            </div>
+          )}
+          {dupUserGroups !== null && dupUserGroups.length === 0 && (
+            <div className="text-sm text-green-700 bg-green-50 border border-green-200 rounded-lg p-4 flex items-center gap-2">
+              <CheckCircle size={18} className="text-green-600" /> No duplicate user accounts found.
+            </div>
+          )}
+          {dupUserGroups !== null && dupUserGroups.length > 0 && (
+            <div className="space-y-4">
+              {dupUserGroups.map((g) => (
+                <div key={g.key} className="border rounded-lg p-4 bg-amber-50/30">
+                  <div className="text-xs text-gray-500 uppercase tracking-wide mb-2">Match key: <span className="font-mono text-gray-700">{g.key}</span></div>
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="text-left text-xs uppercase text-gray-500 border-b">
+                        <th className="py-2">Name</th>
+                        <th className="py-2">Username</th>
+                        <th className="py-2">Role</th>
+                        <th className="py-2">Branch</th>
+                        <th className="py-2">Active</th>
+                        <th className="py-2 text-right">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {g.users.map((u, i) => (
+                        <tr key={u.id} className="border-b last:border-0">
+                          <td className="py-2 font-medium text-gray-800">{u.name || "—"}</td>
+                          <td className="py-2 text-gray-600">{u.username || "—"}</td>
+                          <td className="py-2 text-gray-600">{u.role || "—"}</td>
+                          <td className="py-2 text-gray-600">{u.branch || "—"}</td>
+                          <td className="py-2">{u.active === false ? <span className="text-red-600 text-xs">Inactive</span> : <span className="text-green-700 text-xs">Active</span>}</td>
+                          <td className="py-2 text-right">
+                            {i === 0 ? (
+                              <span className="text-xs text-teal-700 font-semibold uppercase">Canonical</span>
+                            ) : (
+                              <button onClick={() => mergeUsers(g.users[0].id, u.id, u.name, g.users[0].name)}
+                                disabled={dupUserMerging || u.active === false}
+                                className={`text-xs px-3 py-1 rounded ${dupUserMerging || u.active === false ? "bg-gray-200 text-gray-400 cursor-not-allowed" : "bg-red-600 text-white hover:bg-red-700"}`}>
+                                Merge into "{g.users[0].name}"
+                              </button>
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
@@ -4520,12 +4819,37 @@ export default function App() {
       // ── Entries ──
       let allEntries;
       if (apiAvailable && apiEntries !== null) {
-        // API is the source of truth — always use server data
         allEntries = apiEntries;
         localStorage.setItem(STORAGE_KEYS.entries, JSON.stringify(allEntries));
       } else {
         allEntries = loadData(STORAGE_KEYS.entries, []);
       }
+
+      // ── Drain the offline entry queue ──
+      try {
+        const drainResult = await drainEntryQueue(API_BASE, user?.id);
+        if (drainResult.succeeded > 0) {
+          const seenIds = new Set(allEntries.map(e => e.id));
+          allEntries = [...drainResult.drained.filter(e => !seenIds.has(e.id)), ...allEntries];
+          localStorage.setItem(STORAGE_KEYS.entries, JSON.stringify(allEntries));
+          console.log(`[entryQueue] Synced ${drainResult.succeeded} previously-queued entries.`);
+        }
+        if (drainResult.failed > 0) {
+          console.warn(`[entryQueue] ${drainResult.failed} queued entries could not be synced this cycle.`);
+        }
+        const stillQueued = await listQueuedEntries();
+        if (stillQueued.length > 0) {
+          const seenIds = new Set(allEntries.map(e => e.id));
+          const pending = stillQueued.map(q => q.entry).filter(e => e && !seenIds.has(e.id));
+          if (pending.length > 0) {
+            allEntries = [...pending, ...allEntries];
+            console.log(`[entryQueue] ${pending.length} entries still pending offline.`);
+          }
+        }
+      } catch (e) {
+        console.warn("[entryQueue] Drain skipped:", e?.message);
+      }
+
       setEntries(allEntries);
 
       // ── Notifications ──
@@ -4538,6 +4862,13 @@ export default function App() {
     };
 
     initData();
+    const onOnline = () => {
+      drainEntryQueue(API_BASE, user?.id)
+        .then(r => { if (r.succeeded > 0) console.log(`[entryQueue] Online-drain synced ${r.succeeded} entries (creates+updates+deletes).`); })
+        .catch(() => {});
+    };
+    window.addEventListener("online", onOnline);
+    return () => window.removeEventListener("online", onOnline);
   }, []);
 
   const handleLogin = (u) => { setUser(u); setPage("dashboard"); };

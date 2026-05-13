@@ -8,3 +8,17 @@ body {
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
+
+/* Hide the spinner / step arrows on <input type="number"> fields that opt
+   into the `no-spinner` class. Used by Paid Amount inputs in both OD entry
+   forms because the up/down arrows aren't useful for currency entry — the
+   user types the amount directly. */
+input.no-spinner::-webkit-outer-spin-button,
+input.no-spinner::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input.no-spinner {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}

@@ -28,7 +28,8 @@ const DEFAULT_BRANCHES = [
   "Gobichettipalayam", "Paramathivelur", "Tiruchengode", "Kattuputhur", "Kulithalai",
   "Rasipuram", "Ambai", "Alangulam", "Surandai", "Tenkasi", "Eral", "Tuticorin",
   "Palayamkottai", "Rajapalayam", "Sanakarankovil", "Srivilliputhur", "Periyakulam",
-  "Chinnamanur", "Kariyapatti", "RR Nagar", "Thirupuvanam", "Valayankulam", "Checkanurani"
+  "Chinnamanur", "Kariyapatti", "RR Nagar", "Thirupuvanam", "Valayankulam", "Checkanurani",
+  "mahashemam"
 ];
 
 const DEFAULT_USERS = [
@@ -75,6 +76,51 @@ loadJSON("users.json", DEFAULT_USERS);
 loadJSON("branches.json", DEFAULT_BRANCHES);
 loadJSON("config.json", DEFAULT_CONFIG);
 loadJSON("notifications.json", []);
+
+// ─── One-time branch migrations ────────────────────────────────────────────
+// Ensures specific branches exist on every server startup, even on
+// already-deployed installations where branches.json was created before
+// these branches were added to DEFAULT_BRANCHES. Idempotent — only writes
+// if the branch is genuinely missing.
+(function ensureSeedBranches() {
+  // Canonical form is lowercase. Case-insensitive presence check so existing
+  // "Mahashemam" (uppercase, from earlier prod data) is recognised and NOT
+  // duplicated.
+  const REQUIRED = ["mahashemam"];
+  try {
+    const current = loadJSON("branches.json", DEFAULT_BRANCHES);
+    const lowerSet = new Set(current.map(b => String(b).trim().toLowerCase()));
+    let changed = false;
+    const added = [];
+
+    // One-time typo cleanup: remove "Mahasamam" (the misspelling that was
+    // briefly seeded). Safe to run on every boot — no-op if absent.
+    const typoIdx = current.findIndex(b => String(b).trim().toLowerCase() === "mahasamam");
+    if (typoIdx !== -1) {
+      current.splice(typoIdx, 1);
+      lowerSet.delete("mahasamam");
+      changed = true;
+      console.log(`[startup] branches.json: removed obsolete branch "Mahasamam" (typo cleanup)`);
+    }
+
+    for (const b of REQUIRED) {
+      if (!lowerSet.has(b.toLowerCase())) {
+        current.push(b);
+        lowerSet.add(b.toLowerCase());
+        changed = true;
+        added.push(b);
+      }
+    }
+    if (changed) {
+      saveJSON("branches.json", current);
+      if (added.length > 0) {
+        console.log(`[startup] branches.json: added missing branches → ${added.join(", ")}`);
+      }
+    }
+  } catch (e) {
+    console.warn("[startup] ensureSeedBranches failed:", e?.message);
+  }
+})();
 
 // ─── Middleware ──────────────────────────────────────────────────────────────
 app.use(cors());
@@ -138,14 +184,104 @@ app.get("/api/health", (req, res) => {
   });
 });
 
+// Audit log for every entry save/delete/update attempt — successful or failed.
+// Helps trace missing or mutated entries. Logs to entries-audit.json with
+// monthly rotation: once a month rolls over, the previous month is moved to
+// entries-audit-YYYY-MM.json. Prevents the audit log from growing unbounded
+// while keeping history available for forensics.
+//
+// op: "create" | "delete" | "update"
+// status: "ok" | "rejected" | "not-found"
+function auditEntrySave(entryOrInfo, status, reason, op) {
+  try {
+    const operation = op || "create";
+    const e = entryOrInfo || {};
+    // Monthly rotation: if today's month differs from the first log entry's
+    // month, archive the current file and start fresh.
+    const log = loadJSON("entries-audit.json", []);
+    const todayYM = new Date().toISOString().slice(0, 7); // YYYY-MM
+    if (log.length > 0 && typeof log[0]?.ts === "string") {
+      const firstYM = log[0].ts.slice(0, 7);
+      if (firstYM !== todayYM) {
+        try {
+          saveJSON(`entries-audit-${firstYM}.json`, log);
+          console.log(`[AUDIT] Rotated entries-audit.json → entries-audit-${firstYM}.json (${log.length} records)`);
+          log.length = 0;
+        } catch (rErr) {
+          console.error("[AUDIT] Rotation failed:", rErr?.message);
+        }
+      }
+    }
+    log.unshift({
+      ts: new Date().toISOString(),
+      op: operation,
+      status,
+      reason: reason || null,
+      id: e.id || null,
+      date: e.date || null,
+      odType: e.odType || null,
+      loanAccountNo: e.loanAccountNo || null,
+      customerName: e.customerName || null,
+      branch: e.branch || null,
+      amountDue: e.amountDue ?? null,
+      paidAmount: e.paidAmount ?? e.groupOdPaidAmount ?? null,
+      enteredBy: e.enteredBy || null,
+      enteredByName: e.enteredByName || null,
+    });
+    // Hard cap to prevent runaway growth between rotations.
+    saveJSON("entries-audit.json", log.slice(0, 20000));
+  } catch (e) {
+    console.error("[AUDIT] Failed to write audit log:", e?.message);
+  }
+}
+
 // POST /api/entries/append — append a single entry (used by frontend on save)
 app.post("/api/entries/append", async (req, res) => {
+  const entry = req.body;
+
+  // Validation: reject obviously bad payloads with a clear 400.
+  const errors = [];
+  if (!entry || typeof entry !== "object") errors.push("Request body must be a JSON entry object.");
+  if (entry && !entry.id) errors.push("Missing 'id' on entry.");
+  if (entry && !entry.date) errors.push("Missing 'date' on entry.");
+  if (entry && !entry.loanAccountNo) errors.push("Missing 'loanAccountNo' on entry.");
+  if (entry && !entry.branch) errors.push("Missing 'branch' on entry.");
+  if (entry && !entry.odType) errors.push("Missing 'odType' on entry.");
+  if (entry && !entry.enteredBy) errors.push("Missing 'enteredBy' on entry.");
+  // Numeric type validation — must coerce cleanly to a finite number ≥ 0 if
+  // present. Catches strings like "abc" before they corrupt downstream math.
+  const numericFields = ["amountDue", "paidAmount", "groupOdAmount", "groupOdPaidAmount",
+                         "customerShare", "waiver", "totalPaidAmount", "selfOdAmountDue",
+                         "selfOdPaidAmount", "selfOdWaiver"];
+  if (entry && typeof entry === "object") {
+    for (const f of numericFields) {
+      if (entry[f] === undefined || entry[f] === null || entry[f] === "") continue;
+      const v = Number(entry[f]);
+      if (!Number.isFinite(v) || v < 0) {
+        errors.push(`Field '${f}' must be a non-negative number, got ${JSON.stringify(entry[f])}.`);
+      }
+    }
+  }
+  if (errors.length > 0) {
+    auditEntrySave(entry, "rejected", errors.join("; "), "create");
+    console.warn(`[ENTRY append] REJECTED — ${errors.join("; ")}`);
+    return res.status(400).json({ ok: false, error: errors.join(" "), errors });
+  }
+
   const entries = loadJSON("entries.json", []);
-  entries.unshift(req.body);
+
+  // Idempotency: if the same id already exists, treat as success without duplicating.
+  if (entries.some(e => e && e.id === entry.id)) {
+    auditEntrySave(entry, "ok", "duplicate-id (treated as already-saved)", "create");
+    return res.json({ ok: true, count: entries.length, duplicate: true });
+  }
+
+  entries.unshift(entry);
   saveJSON("entries.json", entries);
+  auditEntrySave(entry, "ok", null, "create");
+  console.log(`[ENTRY append] OK — ${entry.odType} loan=${entry.loanAccountNo} by=${entry.enteredByName || entry.enteredBy} amt=${entry.paidAmount ?? entry.groupOdPaidAmount ?? 0}`);
 
   // If this is a PTP entry, send an immediate email notification
-  const entry = req.body;
   if (entry.ptpStatus === "pending" && entry.ptpDate) {
     const subject = `OD Pulse - New PTP Entry: ${entry.customerName} (${entry.customerId}) - ${formatDMY(entry.ptpDate)}`;
     const html = `
@@ -176,6 +312,180 @@ app.post("/api/entries/append", async (req, res) => {
   }
 
   res.json({ ok: true, count: entries.length });
+});
+
+// GET /api/entries/audit?limit=200&status=&loan=&op= — view audit log
+// (Admin-facing; used to trace missing/mutated entries.)
+app.get("/api/entries/audit", (req, res) => {
+  const limit = Math.min(2000, Math.max(1, parseInt(req.query.limit || "200", 10)));
+  const status = String(req.query.status || "").trim().toLowerCase();
+  const op = String(req.query.op || "").trim().toLowerCase(); // create|delete|update
+  const loan = String(req.query.loan || "").trim();
+  let log = loadJSON("entries-audit.json", []);
+  if (status) log = log.filter(e => String(e.status || "").toLowerCase() === status);
+  if (op)     log = log.filter(e => String(e.op || "create").toLowerCase() === op);
+  if (loan)   log = log.filter(e => String(e.loanAccountNo || "").includes(loan));
+  res.json({ total: log.length, returning: Math.min(log.length, limit), entries: log.slice(0, limit) });
+});
+
+// DELETE /api/entries/:id — single-entry delete with idempotency + audit.
+// Replaces the older client-side "POST the entire array" pattern which had a
+// last-write-wins race condition across users.
+app.delete("/api/entries/:id", (req, res) => {
+  const id = String(req.params.id || "").trim();
+  if (!id) {
+    auditEntrySave({ id: req.params.id }, "rejected", "Missing id", "delete");
+    return res.status(400).json({ ok: false, error: "Entry id is required." });
+  }
+  const entries = loadJSON("entries.json", []);
+  const idx = entries.findIndex(e => e && e.id === id);
+  if (idx === -1) {
+    auditEntrySave({ id }, "not-found", "No entry with that id", "delete");
+    return res.status(404).json({ ok: false, error: "Entry not found.", id });
+  }
+  const removed = entries[idx];
+  entries.splice(idx, 1);
+  saveJSON("entries.json", entries);
+  auditEntrySave({ ...removed }, "ok", null, "delete");
+  console.log(`[ENTRY delete] OK — ${removed.odType} loan=${removed.loanAccountNo} by=${removed.enteredByName || removed.enteredBy}`);
+  res.json({ ok: true, deleted: id, count: entries.length });
+});
+
+// PATCH /api/entries/:id — merge fields into an existing entry. Returns 404
+// if no match. Used by the PTP-payment recording flow and the Records page
+// edit flow. Replaces the "POST entire array" pattern.
+app.patch("/api/entries/:id", (req, res) => {
+  const id = String(req.params.id || "").trim();
+  const patch = req.body;
+  if (!id) {
+    auditEntrySave({ id: req.params.id }, "rejected", "Missing id", "update");
+    return res.status(400).json({ ok: false, error: "Entry id is required." });
+  }
+  if (!patch || typeof patch !== "object") {
+    auditEntrySave({ id }, "rejected", "Body must be a JSON patch object", "update");
+    return res.status(400).json({ ok: false, error: "Request body must be a JSON object." });
+  }
+  // Don't allow id-changes via PATCH — the URL is authoritative.
+  if ("id" in patch && patch.id !== id) {
+    auditEntrySave({ id }, "rejected", "Patch tried to change id", "update");
+    return res.status(400).json({ ok: false, error: "Cannot change entry id." });
+  }
+  // Same numeric type checks as POST /append.
+  const numericFields = ["amountDue", "paidAmount", "groupOdAmount", "groupOdPaidAmount",
+                         "customerShare", "waiver", "totalPaidAmount", "selfOdAmountDue",
+                         "selfOdPaidAmount", "selfOdWaiver"];
+  for (const f of numericFields) {
+    if (patch[f] === undefined || patch[f] === null || patch[f] === "") continue;
+    const v = Number(patch[f]);
+    if (!Number.isFinite(v) || v < 0) {
+      auditEntrySave({ id }, "rejected", `Bad ${f}: ${JSON.stringify(patch[f])}`, "update");
+      return res.status(400).json({ ok: false, error: `Field '${f}' must be a non-negative number.` });
+    }
+  }
+  const entries = loadJSON("entries.json", []);
+  const idx = entries.findIndex(e => e && e.id === id);
+  if (idx === -1) {
+    auditEntrySave({ id }, "not-found", "No entry with that id", "update");
+    return res.status(404).json({ ok: false, error: "Entry not found.", id });
+  }
+  const before = entries[idx];
+  const after = { ...before, ...patch, id }; // id pinned
+  entries[idx] = after;
+  saveJSON("entries.json", entries);
+  auditEntrySave({ ...after }, "ok", `patched keys: ${Object.keys(patch).join(",")}`, "update");
+  console.log(`[ENTRY patch] OK — ${after.odType} loan=${after.loanAccountNo} fields=${Object.keys(patch).length}`);
+  res.json({ ok: true, entry: after });
+});
+
+// GET /api/admin/duplicate-users — detect users with near-identical names.
+// Heuristic: normalize by lowercasing and stripping non-word chars, then
+// group by normalized form. Any group with 2+ ids is a candidate duplicate.
+// Also flags names that differ only in a trailing single-letter token (e.g.
+// "Padmapriya" vs "Padmapriya M").
+app.get("/api/admin/duplicate-users", (req, res) => {
+  const users = loadJSON("users.json", []);
+  const norm = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const byNorm = new Map();
+  for (const u of users) {
+    const k = norm(u.name);
+    if (!k) continue;
+    if (!byNorm.has(k)) byNorm.set(k, []);
+    byNorm.get(k).push(u);
+  }
+  // Plus: trailing-single-letter pattern. "padmapriyam" → group with "padmapriya".
+  for (const u of users) {
+    const k = norm(u.name);
+    if (k.length > 2) {
+      const trimmed = k.replace(/[a-z]$/, "");
+      if (trimmed && trimmed !== k && byNorm.has(trimmed)) {
+        const group = byNorm.get(trimmed);
+        if (!group.some(g => g.id === u.id)) group.push(u);
+      }
+    }
+  }
+  const dupes = [];
+  for (const [k, group] of byNorm.entries()) {
+    if (group.length >= 2) {
+      // De-dupe by id within the group
+      const seen = new Set();
+      const uniqGroup = group.filter(g => { if (seen.has(g.id)) return false; seen.add(g.id); return true; });
+      if (uniqGroup.length >= 2) dupes.push({ key: k, users: uniqGroup });
+    }
+  }
+  res.json({ count: dupes.length, groups: dupes });
+});
+
+// POST /api/admin/merge-users — merge a duplicate user into a canonical one.
+// Body: { canonicalId, duplicateId }
+// Effect: every entry where enteredBy === duplicateId is re-attributed to
+// canonicalId (and enteredByName is updated to the canonical's name). The
+// duplicate user is marked active:false. Idempotent on repeat calls.
+app.post("/api/admin/merge-users", (req, res) => {
+  const { canonicalId, duplicateId } = req.body || {};
+  if (!canonicalId || !duplicateId) {
+    return res.status(400).json({ ok: false, error: "canonicalId and duplicateId are required." });
+  }
+  if (canonicalId === duplicateId) {
+    return res.status(400).json({ ok: false, error: "canonicalId and duplicateId must differ." });
+  }
+  const users = loadJSON("users.json", []);
+  const canonical = users.find(u => u.id === canonicalId);
+  const duplicate = users.find(u => u.id === duplicateId);
+  if (!canonical) return res.status(404).json({ ok: false, error: "Canonical user not found." });
+  if (!duplicate) return res.status(404).json({ ok: false, error: "Duplicate user not found." });
+
+  // Re-attribute entries
+  const entries = loadJSON("entries.json", []);
+  let touched = 0;
+  for (const e of entries) {
+    if (e && e.enteredBy === duplicateId) {
+      e.enteredBy = canonicalId;
+      e.enteredByName = canonical.name || canonical.username || canonicalId;
+      touched += 1;
+    }
+    if (e && e.collectorStaffId === duplicateId) {
+      e.collectorStaffId = canonicalId;
+      e.collectorStaffName = canonical.name || canonical.username || canonicalId;
+      touched += 1;
+    }
+  }
+  saveJSON("entries.json", entries);
+
+  // Mark duplicate inactive
+  duplicate.active = false;
+  duplicate.mergedInto = canonicalId;
+  duplicate.mergedAt = new Date().toISOString();
+  saveJSON("users.json", users);
+
+  // Audit
+  auditEntrySave(
+    { id: `merge-${duplicateId}-into-${canonicalId}`, enteredByName: duplicate.name, enteredBy: duplicateId },
+    "ok",
+    `Re-attributed ${touched} field(s) from ${duplicate.name} → ${canonical.name}; duplicate deactivated`,
+    "update"
+  );
+  console.log(`[MERGE USERS] ${duplicate.name} (${duplicateId}) → ${canonical.name} (${canonicalId}); touched ${touched} entry field(s)`);
+  res.json({ ok: true, touched, deactivated: duplicateId });
 });
 
 // Manual PTP reminder trigger

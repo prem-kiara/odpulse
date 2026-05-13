@@ -318,14 +318,17 @@ export function CustomerInfoPanel({ loanAccountNo, customerId, compact = false, 
         </div>
       )}
 
-      {/* ── All Active Loans for this Customer ─────────────────────────────
+      {/* ── All Loans for this Customer ─────────────────────────────────────
          Shown below the single-loan OD Snapshot. Skipped in compact mode and
-         when there is only one loan (the one already shown above). */}
+         when there is only one loan (the one already shown above). Note: the
+         heading deliberately says "All Loans" (not "Active") because closed/
+         foreclosed loans are listed here too, each marked with a CLOSED badge
+         — the previous "All Active Loans" heading was misleading. */}
       {!compact && otherLoans.length > 0 && (
         <div className="bg-white rounded-lg p-3 border border-teal-100">
           <div className="flex items-center justify-between mb-2">
             <div className="text-xs font-semibold text-teal-800 uppercase tracking-wide">
-              All Active Loans for this Customer ({otherLoans.length})
+              All Loans for this Customer ({otherLoans.length})
             </div>
             <span className="text-[10px] text-gray-400">Click a loan to see full details</span>
           </div>
