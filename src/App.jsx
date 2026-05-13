@@ -5,6 +5,7 @@ import { CustomerInfoPanel, DataUploadPage, CollectionDashboard } from "./OdInsi
 import ReportsAnalytics from "./ReportsAnalytics.jsx";
 import { SortableSection, PaginatedSortableSection } from "./tableSort.jsx";
 import { usePagination, PaginationBar } from "./Pagination";
+import { enqueueEntry, listQueuedEntries, drainEntryQueue } from "./entryQueue";
 
 // ─── Constants & Helpers ────────────────────────────────────────────────────
 const COLORS = ["#0f766e", "#06b6d4", "#8b5cf6", "#f59e0b", "#ef4444", "#10b981", "#ec4899", "#6366f1", "#14b8a6", "#f97316"];
@@ -71,6 +72,69 @@ const formatDateDMY = (isoDate) => {
 
 // ─── API + localStorage helpers ────────────────────────────────────────────
 const API_BASE = "/api";
+
+// Persist a single OD entry to the server. Returns:
+//   { ok: true }                                    — server accepted (or duplicate)
+//   { ok: false, queued: true, reason }            — server unreachable; entry was
+//                                                    persisted to IndexedDB and will
+//                                                    auto-retry on the next app load
+//   { ok: false, queued: false, reason }           — server rejected with a 4xx
+//                                                    (validation error); needs user
+//                                                    correction before re-save
+//
+// IMPORTANT: this function never throws and never silently drops an entry. Every
+// save attempt either lands on the server or is queued for retry. This replaces
+// the old fire-and-forget `fetch(...).catch(console.warn)` pattern that was
+// silently losing entries when the network blipped during save.
+async function persistEntry(entry) {
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 10000); // 10s timeout
+    const res = await fetch(`${API_BASE}/entries/append`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(entry),
+      signal: ctrl.signal,
+    });
+    clearTimeout(timer);
+    if (res.ok) return { ok: true };
+
+    // 400 from the server = validation failure on the entry payload. This is
+    // NOT a transient error; queuing won't help (the server will reject again
+    // on retry). Tell the user instead so they can fix the entry.
+    if (res.status >= 400 && res.status < 500) {
+      let serverMsg = "";
+      try {
+        const body = await res.json();
+        serverMsg = body?.error || body?.errors?.join(" ") || "";
+      } catch {}
+      return { ok: false, queued: false, reason: serverMsg || `Server rejected entry (HTTP ${res.status}).` };
+    }
+
+    // 5xx — transient. Queue and retry later.
+    await enqueueEntry(entry, `HTTP ${res.status}`);
+    return { ok: false, queued: true, reason: `Server error ${res.status} — entry safely saved offline and will sync when the server recovers.` };
+  } catch (err) {
+    // Network failure, timeout, browser offline, etc. Queue for retry.
+    try {
+      await enqueueEntry(entry, err?.message || String(err));
+    } catch (qErr) {
+      // IndexedDB itself failed (rare). Last-resort: save into localStorage's
+      // pending bucket so we at least keep the data somewhere reachable.
+      try {
+        const PENDING_KEY = "odpulse_pending_entries_fallback";
+        const cur = JSON.parse(localStorage.getItem(PENDING_KEY) || "[]");
+        cur.unshift(entry);
+        localStorage.setItem(PENDING_KEY, JSON.stringify(cur));
+      } catch {}
+    }
+    return {
+      ok: false,
+      queued: true,
+      reason: "Couldn't reach the server. Entry was saved offline and will sync automatically when connectivity returns.",
+    };
+  }
+}
 
 // ─── DPD classification (client-side, derived from overdue days) ───────────
 // Single source of truth so Group OD + Individual OD forms stay consistent,
@@ -412,6 +476,11 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
   const [ptpTime, setPtpTime] = useState("");
   const [showWaiverModal, setShowWaiverModal] = useState(false);
   const [pendingEntry, setPendingEntry] = useState(null);
+  // Disable the Save button while the POST to /entries/append is in flight.
+  // Prevents double-submits AND lets us show a spinner so users wait for the
+  // server's acknowledgement (rather than the form clearing optimistically
+  // before the entry is actually persisted).
+  const [saving, setSaving] = useState(false);
   // Payment-mode specific tracking:
   //   Cash mode → collectorStaffId + depositBank
   //   UPI mode  → transactionId + narration  (in addition to existing upiReference)
@@ -665,17 +734,32 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
     return d instanceof Date && !isNaN(d);
   };
 
-  const saveEntry = (entry) => {
+  const saveEntry = async (entry) => {
+    if (saving) return; // guard against double-click
+    setSaving(true);
+
+    // Persist to the server first (with offline queue fallback) so the entry
+    // is never silently lost. Only update local state and navigate AFTER we
+    // know the entry is safely on the server or in the retry queue.
+    const result = await persistEntry(entry);
+
+    if (!result.ok && !result.queued) {
+      // Server rejected the entry (validation error). Don't add to local state
+      // or clear the form — let the user correct and re-submit.
+      setSaving(false);
+      alert(`Save failed: ${result.reason}\n\nThe entry has NOT been saved. Please correct and try again.`);
+      return;
+    }
+
+    if (!result.ok && result.queued) {
+      // Couldn't reach the server but the entry is safely queued offline.
+      // Inform the user so they don't think their entry was processed live.
+      alert(`${result.reason}\n\nYou can keep working — the entry will sync automatically when the server is reachable again.`);
+    }
+
     const updated = [entry, ...entries];
     setEntries(updated);
-    // Save to localStorage only (don't fire full-array POST to server)
     localStorage.setItem(STORAGE_KEYS.entries, JSON.stringify(updated));
-    // Use append endpoint for server (avoids duplicate from full-array sync)
-    fetch(`${API_BASE}/entries/append`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(entry),
-    }).catch(err => console.warn("[API append]", err.message));
 
     // Create persistent PTP notification if PTP is pending
     if (entry.ptpStatus === "pending" && entry.ptpDate) {
@@ -712,12 +796,13 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
     setPhone(""); setAadhaar(""); setAadhaarEditable(true);
     setAutoFilledFields(new Set()); setLookupStatus(""); setCustomerMatches([]);
     setCustomerCenters([]); setMemberArrearOverride(0); setMemberAlreadyCollected(0);
+    setSaving(false);
     setPage("records");
   };
 
-  const handleWaiverConfirm = (approval) => {
+  const handleWaiverConfirm = async (approval) => {
     if (pendingEntry) {
-      saveEntry({ ...pendingEntry, waiverApproval: approval });
+      await saveEntry({ ...pendingEntry, waiverApproval: approval });
       setPendingEntry(null);
       setShowWaiverModal(false);
     }
@@ -1429,8 +1514,9 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
       </div>
 
       <button onClick={handleSave}
-        className="w-full py-3 bg-teal-600 text-white rounded-xl font-semibold hover:bg-teal-700 transition-colors flex items-center justify-center gap-2 shadow-lg shadow-teal-200">
-        <Save size={18} /> Save Entry
+        disabled={saving}
+        className={`w-full py-3 rounded-xl font-semibold flex items-center justify-center gap-2 shadow-lg shadow-teal-200 transition-colors ${saving ? "bg-teal-300 text-white cursor-not-allowed" : "bg-teal-600 text-white hover:bg-teal-700"}`}>
+        {saving ? (<><Activity size={18} className="animate-spin" /> Saving…</>) : (<><Save size={18} /> Save Entry</>)}
       </button>
 
       {showWaiverModal && (
@@ -1463,6 +1549,8 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
   const [waiverInput, setWaiverInput] = useState("");
   const [showWaiverModal, setShowWaiverModal] = useState(false);
   const [pendingEntry, setPendingEntry] = useState(null);
+  // Disable Save button while POST is in-flight; same pattern as Group OD.
+  const [saving, setSaving] = useState(false);
   // Payment-mode specific tracking (same pattern as Group OD form).
   const [collectorStaffId, setCollectorStaffId] = useState("");
   const [depositBank, setDepositBank] = useState("");
@@ -1680,15 +1768,29 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
     saveIndivEntry(entry);
   };
 
-  const saveIndivEntry = (entry) => {
+  const saveIndivEntry = async (entry) => {
+    if (saving) return; // guard against double-click
+    setSaving(true);
+
+    // Synchronously persist via /entries/append; falls back to the IndexedDB
+    // retry queue if the server is unreachable. The form is NOT cleared and
+    // the user is NOT navigated away until we know the entry is either on
+    // the server or queued offline. Replaces the old fire-and-forget pattern
+    // that was silently dropping entries on network blips.
+    const result = await persistEntry(entry);
+
+    if (!result.ok && !result.queued) {
+      setSaving(false);
+      alert(`Save failed: ${result.reason}\n\nThe entry has NOT been saved. Please correct and try again.`);
+      return;
+    }
+    if (!result.ok && result.queued) {
+      alert(`${result.reason}\n\nYou can keep working — the entry will sync automatically when the server is reachable again.`);
+    }
+
     const updated = [entry, ...entries];
     setEntries(updated);
     localStorage.setItem(STORAGE_KEYS.entries, JSON.stringify(updated));
-    fetch(`${API_BASE}/entries/append`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(entry),
-    }).catch(err => console.warn("[API append]", err.message));
 
     if (entry.ptpStatus === "pending" && entry.ptpDate) {
       const existingNotifs = loadData(STORAGE_KEYS.notifications, []);
@@ -1719,12 +1821,13 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
     setSmaBucket(""); setPhone(""); setAadhaar(""); setAadhaarEditable(true);
     setAutoFilledFields(new Set()); setLookupStatus(""); setCustomerMatches([]);
     setIndivCenters([]);
+    setSaving(false);
     setPage("ind_records");
   };
 
-  const handleWaiverConfirm = (approval) => {
+  const handleWaiverConfirm = async (approval) => {
     if (pendingEntry) {
-      saveIndivEntry({ ...pendingEntry, waiverApproval: approval });
+      await saveIndivEntry({ ...pendingEntry, waiverApproval: approval });
       setPendingEntry(null);
       setShowWaiverModal(false);
     }
@@ -2095,8 +2198,9 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
       </div>
 
       <button onClick={handleSave}
-        className="w-full py-3 bg-indigo-600 text-white rounded-xl font-semibold hover:bg-indigo-700 transition-colors flex items-center justify-center gap-2 shadow-lg shadow-indigo-200">
-        <Save size={18} /> Save Entry
+        disabled={saving}
+        className={`w-full py-3 rounded-xl font-semibold flex items-center justify-center gap-2 shadow-lg shadow-indigo-200 transition-colors ${saving ? "bg-indigo-300 text-white cursor-not-allowed" : "bg-indigo-600 text-white hover:bg-indigo-700"}`}>
+        {saving ? (<><Activity size={18} className="animate-spin" /> Saving…</>) : (<><Save size={18} /> Save Entry</>)}
       </button>
     </div>
   );
@@ -4520,6 +4624,46 @@ export default function App() {
       } else {
         allEntries = loadData(STORAGE_KEYS.entries, []);
       }
+
+      // ── Drain the offline entry queue ──
+      // Any entries that failed to POST last time (network blip during save,
+      // server briefly down, etc.) live in IndexedDB. Try to send them now.
+      // On success, prepend them to `allEntries` so they show up immediately.
+      // On failure they stay in the queue and we try again next load.
+      try {
+        const drainResult = await drainEntryQueue(API_BASE);
+        if (drainResult.succeeded > 0) {
+          // Merge drained entries on top — they're newer than the API copy.
+          // De-dupe by id so we don't get duplicate rows if API already has them.
+          const seenIds = new Set(allEntries.map(e => e.id));
+          const merged = [
+            ...drainResult.drained.filter(e => !seenIds.has(e.id)),
+            ...allEntries,
+          ];
+          allEntries = merged;
+          localStorage.setItem(STORAGE_KEYS.entries, JSON.stringify(allEntries));
+          console.log(`[entryQueue] Synced ${drainResult.succeeded} previously-queued entries to server.`);
+        }
+        if (drainResult.failed > 0) {
+          console.warn(`[entryQueue] ${drainResult.failed} queued entries could not be synced this cycle.`);
+        }
+        // Also surface any queued-but-not-yet-synced entries optimistically so
+        // the user can see their work even before the next successful drain.
+        const stillQueued = await listQueuedEntries();
+        if (stillQueued.length > 0) {
+          const seenIds = new Set(allEntries.map(e => e.id));
+          const pending = stillQueued
+            .map(q => q.entry)
+            .filter(e => e && !seenIds.has(e.id));
+          if (pending.length > 0) {
+            allEntries = [...pending, ...allEntries];
+            console.log(`[entryQueue] ${pending.length} entries still pending offline.`);
+          }
+        }
+      } catch (e) {
+        console.warn("[entryQueue] Drain skipped:", e?.message);
+      }
+
       setEntries(allEntries);
 
       // ── Notifications ──
@@ -4532,6 +4676,17 @@ export default function App() {
     };
 
     initData();
+
+    // Retry drain whenever the browser regains connectivity. Field staff on
+    // mobile data hop between cells; this lets queued entries upload the
+    // moment connectivity is back, without waiting for a page reload.
+    const onOnline = () => {
+      drainEntryQueue(API_BASE)
+        .then(r => { if (r.succeeded > 0) console.log(`[entryQueue] Online-drain synced ${r.succeeded} entries.`); })
+        .catch(() => {});
+    };
+    window.addEventListener("online", onOnline);
+    return () => window.removeEventListener("online", onOnline);
   }, []);
 
   const handleLogin = (u) => { setUser(u); setPage("dashboard"); };

@@ -138,14 +138,69 @@ app.get("/api/health", (req, res) => {
   });
 });
 
+// Audit log for every entry-save attempt — successful or failed. Helps trace
+// missing entries (e.g. user swears they saved it but it doesn't appear).
+function auditEntrySave(entry, status, reason) {
+  try {
+    const log = loadJSON("entries-audit.json", []);
+    log.unshift({
+      ts: new Date().toISOString(),
+      status,                                  // "ok" | "rejected"
+      reason: reason || null,                  // human-readable failure reason
+      id: entry?.id || null,
+      date: entry?.date || null,
+      odType: entry?.odType || null,
+      loanAccountNo: entry?.loanAccountNo || null,
+      customerName: entry?.customerName || null,
+      branch: entry?.branch || null,
+      amountDue: entry?.amountDue ?? null,
+      paidAmount: entry?.paidAmount ?? entry?.groupOdPaidAmount ?? null,
+      enteredBy: entry?.enteredBy || null,
+      enteredByName: entry?.enteredByName || null,
+    });
+    // Keep the audit file from growing unbounded — last 10k attempts.
+    saveJSON("entries-audit.json", log.slice(0, 10000));
+  } catch (e) {
+    console.error("[AUDIT] Failed to write audit log:", e?.message);
+  }
+}
+
 // POST /api/entries/append — append a single entry (used by frontend on save)
 app.post("/api/entries/append", async (req, res) => {
+  const entry = req.body;
+
+  // ── Validation: reject obviously bad payloads with a clear 400 ───────────
+  // Without this, malformed entries were being silently accepted (or worse,
+  // dropped on the client side because the client thought the save succeeded).
+  const errors = [];
+  if (!entry || typeof entry !== "object") errors.push("Request body must be a JSON entry object.");
+  if (entry && !entry.id) errors.push("Missing 'id' on entry.");
+  if (entry && !entry.date) errors.push("Missing 'date' on entry.");
+  if (entry && !entry.loanAccountNo) errors.push("Missing 'loanAccountNo' on entry.");
+  if (entry && !entry.branch) errors.push("Missing 'branch' on entry.");
+  if (entry && !entry.odType) errors.push("Missing 'odType' on entry.");
+  if (entry && !entry.enteredBy) errors.push("Missing 'enteredBy' on entry.");
+  if (errors.length > 0) {
+    auditEntrySave(entry, "rejected", errors.join("; "));
+    console.warn(`[ENTRY append] REJECTED — ${errors.join("; ")}`);
+    return res.status(400).json({ ok: false, error: errors.join(" "), errors });
+  }
+
   const entries = loadJSON("entries.json", []);
-  entries.unshift(req.body);
+
+  // Idempotency: if the same id already exists, treat as success without duplicating.
+  // This protects against retries from the client-side offline queue.
+  if (entries.some(e => e && e.id === entry.id)) {
+    auditEntrySave(entry, "ok", "duplicate-id (treated as already-saved)");
+    return res.json({ ok: true, count: entries.length, duplicate: true });
+  }
+
+  entries.unshift(entry);
   saveJSON("entries.json", entries);
+  auditEntrySave(entry, "ok", null);
+  console.log(`[ENTRY append] OK — ${entry.odType} loan=${entry.loanAccountNo} by=${entry.enteredByName || entry.enteredBy} amt=${entry.paidAmount ?? entry.groupOdPaidAmount ?? 0}`);
 
   // If this is a PTP entry, send an immediate email notification
-  const entry = req.body;
   if (entry.ptpStatus === "pending" && entry.ptpDate) {
     const subject = `OD Pulse - New PTP Entry: ${entry.customerName} (${entry.customerId}) - ${formatDMY(entry.ptpDate)}`;
     const html = `
@@ -176,6 +231,18 @@ app.post("/api/entries/append", async (req, res) => {
   }
 
   res.json({ ok: true, count: entries.length });
+});
+
+// GET /api/entries/audit?limit=200&status=&loan=  — view the entries audit log
+// (Admin-facing; used to trace missing entries.)
+app.get("/api/entries/audit", (req, res) => {
+  const limit = Math.min(2000, Math.max(1, parseInt(req.query.limit || "200", 10)));
+  const status = String(req.query.status || "").trim().toLowerCase(); // "ok"|"rejected"|""
+  const loan = String(req.query.loan || "").trim();
+  let log = loadJSON("entries-audit.json", []);
+  if (status) log = log.filter(e => String(e.status || "").toLowerCase() === status);
+  if (loan)   log = log.filter(e => String(e.loanAccountNo || "").includes(loan));
+  res.json({ total: log.length, returning: Math.min(log.length, limit), entries: log.slice(0, limit) });
 });
 
 // Manual PTP reminder trigger
@@ -517,6 +584,7 @@ app.post("/api/od/accrued/upload", requireUploader, uploadField("file"), (req, r
       snapshotDate, branchesFile: BRANCHES_FILE, uploadedBy, filename: req.file.originalname,
     });
     console.log(`[ACCRUED UPLOAD] done in ${Date.now()-t0}ms — ${result.rowCount} rows, col=${result.currentAccruedColumn}`);
+    invalidateDisbursementsCache();
     res.json({ ok: true, snapshotDate, ...result });
   } catch (err) {
     console.error("[ACCRUED UPLOAD] error:", err);
@@ -696,10 +764,16 @@ app.get("/api/od/customer-lookup", (req, res) => {
   if (!customer && !latestPool && !latestAccrued && !latestForeclosure) return res.json({ found: false });
 
   const isClosed = !!latestForeclosure;
-  const principalOutstanding = latestPool?.principal_outstanding ?? 0;
-  const accruedInterest = latestAccrued?.accrued_interest ?? 0;
-  const unpaidInterest = latestPool?.interest_overdue ?? 0; // "Interest OverDue" per user
-  const foreclosureValue = principalOutstanding + accruedInterest + unpaidInterest;
+  // When the loan has been foreclosed, force all OD Snapshot values to zero
+  // even if the pool/accrued snapshots still carry stale balances. This can
+  // happen when the closure happens on day N and the pool report uploaded for
+  // day N+1 hasn't been regenerated yet — the loan is genuinely Closed but
+  // the pool table still shows the pre-closure outstanding balance.
+  // Foreclosed-wins rule applies to MONEY too, not just status.
+  const principalOutstanding = isClosed ? 0 : (latestPool?.principal_outstanding ?? 0);
+  const accruedInterest      = isClosed ? 0 : (latestAccrued?.accrued_interest    ?? 0);
+  const unpaidInterest       = isClosed ? 0 : (latestPool?.interest_overdue       ?? 0); // "Interest OverDue" per user
+  const foreclosureValue     = principalOutstanding + accruedInterest + unpaidInterest;
   // Authoritative status: Closed wins over whatever pool says.
   const loanStatus = isClosed ? "Closed" : (latestPool?.loan_status || "");
 
@@ -2218,7 +2292,17 @@ app.get("/api/od/disbursements", (req, res) => {
       const latestPoolDate = db.prepare(
         `SELECT MAX(snapshot_date) AS d FROM pool_snapshots`
       ).get()?.d || null;
+      const latestAccruedDate = db.prepare(
+        `SELECT MAX(snapshot_date) AS d FROM accrued_snapshots`
+      ).get()?.d || null;
       _lap("MAX(snapshot_date) lookup");
+      // Interest Outstanding semantics — must match the rest of the system
+      // (CustomerInfoPanel / Group OD entry / foreclosure value):
+      //   interest_outstanding = pool.interest_overdue (unpaid)
+      //                          + accrued_snapshots.accrued_interest (accrued)
+      // Reading pool_snapshots.interest_outstanding alone produces a much
+      // smaller number that doesn't reconcile with the OD Snapshot panel.
+      // Same global-max LEFT JOIN pattern keeps this fast.
       const rawRows = db.prepare(`
         SELECT
           c.loan_account_no, c.customer_number, c.customer_name,
@@ -2226,13 +2310,22 @@ app.get("/api/od/disbursements", (req, res) => {
           c.disbursement_date, c.loan_amount,
           EXISTS(SELECT 1 FROM foreclosure_snapshots f WHERE f.loan_account_no = c.loan_account_no) AS is_closed,
           CASE WHEN lp.loan_account_no IS NULL THEN 0 ELSE 1 END AS is_active,
-          COALESCE(lp.principal_outstanding, 0) AS principal_outstanding
+          COALESCE(lp.principal_outstanding, 0) AS principal_outstanding,
+          (COALESCE(lp.interest_overdue, 0) + COALESCE(la.accrued_interest, 0)) AS interest_outstanding,
+          COALESCE(lp.principal_overdue, 0)     AS principal_overdue,
+          COALESCE(lp.interest_overdue, 0)      AS interest_overdue,
+          COALESCE(la.accrued_interest, 0)      AS accrued_interest,
+          COALESCE(lp.overdue_days, 0)          AS overdue_days,
+          COALESCE(lp.account_dpd_classification, '') AS account_dpd_classification
         FROM customers c
         LEFT JOIN pool_snapshots lp
           ON lp.loan_account_no = c.loan_account_no
          AND lp.snapshot_date = ?
+        LEFT JOIN accrued_snapshots la
+          ON la.loan_account_no = c.loan_account_no
+         AND la.snapshot_date = ?
         WHERE COALESCE(c.disbursement_date, '') <> ''
-      `).all(latestPoolDate);
+      `).all(latestPoolDate, latestAccruedDate);
       // Pre-parse / pre-derive everything that's expensive to compute
       // per request: ISO date string, lowercased branch/product, category
       // flags, numeric principal/amount. The aggregation loop below then
@@ -2243,6 +2336,12 @@ app.get("/api/od/disbursements", (req, res) => {
         const iso = parseDate(r.disbursement_date);
         if (!iso) continue;
         const cat = String(r.loan_category || "").toUpperCase();
+        const principalOutN     = Number(r.principal_outstanding) || 0;
+        const interestOutN      = Number(r.interest_outstanding)  || 0;
+        const arrearAmountN     = principalOutN + interestOutN;
+        const principalOverdueN = Number(r.principal_overdue) || 0;
+        const interestOverdueN  = Number(r.interest_overdue)  || 0;
+        const overdueAmountN    = principalOverdueN + interestOverdueN;
         rows.push({
           ...r,
           iso,
@@ -2252,7 +2351,13 @@ app.get("/api/od/disbursements", (req, res) => {
           isGroup: cat.includes("GROUP"),
           isIndividual: cat.includes("INDIVIDUAL"),
           amountN: Number(r.loan_amount) || 0,
-          principalN: Number(r.principal_outstanding) || 0,
+          principalN: principalOutN,
+          interestOutN,
+          arrearAmountN,
+          principalOverdueN,
+          interestOverdueN,
+          overdueAmountN,
+          isOverdue: overdueAmountN > 0,
         });
       }
       _disbursementsRowsCache = rows;
@@ -2269,10 +2374,12 @@ app.get("/api/od/disbursements", (req, res) => {
     let totalCount = 0;
     let totalAmount = 0;
     let totalPrincipalOutstanding = 0;
+    let totalOverdueAmount = 0;
     const customerSet = new Set();
     let activeCount = 0;
     let closedCount = 0;
     let pendingCount = 0;
+    let overdueCount = 0;
     const recent = []; // most recent disbursements for the table view
 
     function bump(map, k, amount, principal) {
@@ -2309,18 +2416,25 @@ app.get("/api/od/disbursements", (req, res) => {
       totalCount += 1;
       totalAmount += r.amountN;
       totalPrincipalOutstanding += r.principalN;
+      if (r.isOverdue) {
+        overdueCount += 1;
+        totalOverdueAmount += r.overdueAmountN;
+      }
       if (r.customer_number) customerSet.add(r.customer_number);
 
-      // Status (foreclosed-wins)
+      // Status (foreclosed-wins). Overdue is an attribute of an Active
+      // loan (it has a current pool snapshot with non-zero overdue), so
+      // it doesn't replace Active/Closed/Pending — it sits alongside.
       const rowStatus = r.is_closed ? "Closed" : r.is_active ? "Active" : "Pending";
       if (r.is_closed) closedCount += 1;
       else if (r.is_active) activeCount += 1;
       else pendingCount += 1;
 
       // Status filter — applied AFTER counting so summary numbers stay correct.
-      if (status === "active" && rowStatus !== "Active") continue;
-      if (status === "closed" && rowStatus !== "Closed") continue;
+      if (status === "active"  && rowStatus !== "Active")  continue;
+      if (status === "closed"  && rowStatus !== "Closed")  continue;
       if (status === "pending" && rowStatus !== "Pending") continue;
+      if (status === "overdue" && !r.isOverdue) continue;
 
       if (recent.length < limit) {
         recent.push({
@@ -2333,6 +2447,13 @@ app.get("/api/od/disbursements", (req, res) => {
           disbursement_date_iso: r.iso,
           loan_amount: r.amountN,
           principal_outstanding: r.principalN,
+          interest_outstanding: r.interestOutN,
+          arrear_amount: r.arrearAmountN,
+          principal_overdue: r.principalOverdueN,
+          interest_overdue: r.interestOverdueN,
+          overdue_amount: r.overdueAmountN,
+          overdue_days: r.overdue_days,
+          account_dpd_classification: r.account_dpd_classification || "",
           status: rowStatus,
         });
       }
@@ -2366,6 +2487,11 @@ app.get("/api/od/disbursements", (req, res) => {
         // Total current principal outstanding across the filtered set,
         // sourced from the latest pool_snapshots row per loan.
         principalOutstanding: Math.round(totalPrincipalOutstanding * 100) / 100,
+        // Overdue accounts = those with principal_overdue + interest_overdue > 0
+        // in the latest pool snapshot. overdueAmount is the sum of those
+        // two columns across the filtered set. Closed loans contribute 0.
+        overdue: overdueCount,
+        overdueAmount: Math.round(totalOverdueAmount * 100) / 100,
       },
       // Return ALL branches and products (no cap). The frontend uses
       // these for dropdown options, so capping at 30 silently hides
@@ -2866,9 +2992,17 @@ app.get("/api/customers/loans", (req, res) => {
       })
       .map(r => {
         const isClosed = !!r.fc_snapshot_date;
-        const po = Number(r.principal_outstanding) || 0;
-        const ai = Number(r.accrued_interest) || 0;
-        const ui = Number(r.interest_overdue) || 0;
+        // Foreclosed-wins rule applies to MONEY too: when the loan is in
+        // foreclosure_snapshots, force outstanding/interest/accrued/foreclosure
+        // values to 0 even if the pool table still carries stale balances.
+        // This happens when closure occurs on day N and the pool report from
+        // day N+1 hasn't been regenerated against the latest closures yet.
+        const poRaw = Number(r.principal_outstanding) || 0;
+        const aiRaw = Number(r.accrued_interest) || 0;
+        const uiRaw = Number(r.interest_overdue) || 0;
+        const po = isClosed ? 0 : poRaw;
+        const ai = isClosed ? 0 : aiRaw;
+        const ui = isClosed ? 0 : uiRaw;
         return {
           loanAccountNo: r.loan_account_no || "",
           customerNumber: r.customer_number || "",
@@ -2882,16 +3016,16 @@ app.get("/api/customers/loans", (req, res) => {
           disbursementDate: r.disbursement_date || "",
           lastPaymentDate: r.last_payment_date || "",
           principalOutstanding: po,
-          interestOutstanding: Number(r.interest_outstanding) || 0,
-          principalOverdue: Number(r.principal_overdue) || 0,
+          interestOutstanding: isClosed ? 0 : (Number(r.interest_outstanding) || 0),
+          principalOverdue:    isClosed ? 0 : (Number(r.principal_overdue)    || 0),
           interestOverdue: ui,
-          currentOD: Number(r.current_od) || 0,
-          overdueDays: Number(r.overdue_days) || 0,
-          customerDPD: Number(r.customer_dpd) || 0,
+          currentOD:    isClosed ? 0 : (Number(r.current_od)    || 0),
+          overdueDays:  isClosed ? 0 : (Number(r.overdue_days)  || 0),
+          customerDPD:  isClosed ? 0 : (Number(r.customer_dpd)  || 0),
           // Authoritative loan status — Closed wins over pool's loan_status.
           loanStatus: isClosed ? "Closed" : (r.loan_status || ""),
           isClosed,
-          dpdClassification: r.account_dpd_classification || "",
+          dpdClassification: isClosed ? "" : (r.account_dpd_classification || ""),
           accruedInterest: ai,
           foreclosureValue: po + ui + ai,
           // Closure details (null/empty for active loans).
