@@ -1,46 +1,41 @@
-// FilterSidebar — reusable left-rail filter panel for ODPulse.
+// FilterSidebar — drawer-style reusable filter panel for ODPulse.
+//
+// Renders a compact "Filters" trigger button that opens a slide-over panel
+// from the right edge of the viewport. The panel contains config-driven
+// filter sections: date range, radio, checkbox, multi-select-with-search.
+// Filters auto-apply on every change (no Apply button). A "Clear All"
+// button at the top resets every section.
+//
+// Pages drop <FilterSidebar /> anywhere they want the trigger to appear
+// (typically the page header toolbar). The drawer is portaled to the
+// viewport via fixed positioning so it never disrupts the page layout.
 //
 // Usage:
 //   <FilterSidebar
 //     sections={[
-//       { id: "dateRange", type: "date-range", label: "Date" },
-//       { id: "loanCategory", type: "radio", label: "Loan Category",
-//         options: [
-//           { value: "", label: "All" },
-//           { value: "Group Loan", label: "Group Loan" },
-//           { value: "Individual Loan", label: "Individual Loan" },
-//         ] },
-//       { id: "branch", type: "multi-search", label: "Branch", options: branchList, searchable: true },
-//       { id: "product", type: "multi-search", label: "Product", options: productList, searchable: true },
+//       { id: "dateRange",    type: "date-range", label: "Date" },
+//       { id: "loanCategory", type: "radio",      label: "Loan Category",
+//         options: [{value:"",label:"All"},{value:"group",label:"Group"}] },
+//       { id: "branch",  type: "multi-search", label: "Branch", options: branches, searchable: true },
+//       { id: "product", type: "multi-search", label: "Product", options: products, searchable: true },
 //       { id: "loanStatus", type: "checkbox", label: "Loan Status",
-//         options: ["Active", "Closed", "Pending", "Overdue"] },
-//       { id: "officer", type: "multi-search", label: "Officer", options: officerList, searchable: true },
-//       { id: "paymentStatus", type: "radio", label: "Payment Status",
-//         options: [
-//           { value: "", label: "All" }, { value: "paid", label: "Paid" }, { value: "unpaid", label: "Unpaid" },
-//         ] },
+//         options: ["Active","Closed","Pending","Overdue"] },
 //     ]}
-//     value={filters}                 // current filter state — controlled
-//     onChange={setFilters}           // auto-applied on every change (no Apply button)
+//     value={filters}
+//     onChange={setFilters}
+//     triggerClassName="..."  // optional Tailwind override for the button
 //   />
 //
 // Filter state shape (what `value` looks like):
 //   {
 //     dateRange:     { from: "2026-01-01", to: "2026-12-31" },
-//     loanCategory:  "Group Loan",
+//     loanCategory:  "group",
 //     branch:        ["Annur", "Chinnamanur"],
 //     product:       [],
 //     loanStatus:    ["Active", "Overdue"],
-//     officer:       [],
-//     paymentStatus: "unpaid",
 //   }
-//
-// The parent derives a predicate from `value` and applies it to its data.
-// Use FilterSidebar.makePredicate(sections, value) for a default predicate
-// or build your own — the component is intentionally agnostic about how
-// the filter state maps to row matching.
 
-import React, { useState, useMemo } from "react";
+import React, { useState, useMemo, useEffect } from "react";
 import { Search, X, ChevronDown, ChevronRight, Calendar, Filter as FilterIcon } from "lucide-react";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -62,8 +57,8 @@ function defaultEmpty(section) {
   return "";
 }
 
-// Returns a row predicate that maps each section's filter value to a row check.
-// `rowAccessor[id]` returns the row's value for that section's id (default: row[id]).
+// Returns a row predicate from the current filter state and section schema.
+// Pages can use this for client-side filtering, or build their own.
 FilterSidebar.makePredicate = function makePredicate(sections, value, rowAccessor = {}) {
   return (row) => {
     for (const s of sections) {
@@ -94,18 +89,18 @@ function DateRangeSection({ value, onChange }) {
     <div className="space-y-2">
       <div className="flex items-center gap-2">
         <Calendar size={12} className="text-gray-400" />
-        <span className="text-xs text-gray-500">From</span>
+        <span className="text-xs text-gray-500 w-10">From</span>
         <input type="date" value={v.from || ""}
           onChange={(e) => onChange({ ...v, from: e.target.value })}
-          className="flex-1 px-2 py-1 border rounded text-xs focus:ring-1 focus:ring-teal-500"
+          className="flex-1 px-2 py-1.5 border rounded text-xs focus:ring-1 focus:ring-teal-500"
         />
       </div>
       <div className="flex items-center gap-2">
         <Calendar size={12} className="text-gray-400" />
-        <span className="text-xs text-gray-500">To</span>
+        <span className="text-xs text-gray-500 w-10">To</span>
         <input type="date" value={v.to || ""}
           onChange={(e) => onChange({ ...v, to: e.target.value })}
-          className="flex-1 px-2 py-1 border rounded text-xs focus:ring-1 focus:ring-teal-500"
+          className="flex-1 px-2 py-1.5 border rounded text-xs focus:ring-1 focus:ring-teal-500"
         />
       </div>
     </div>
@@ -119,9 +114,8 @@ function RadioSection({ section, value, onChange }) {
       {(section.options || []).map(opt => {
         const optValue = typeof opt === "object" ? opt.value : opt;
         const optLabel = typeof opt === "object" ? opt.label : opt;
-        const id = `${section.id}-${optValue || "any"}`;
         return (
-          <label key={id} className="flex items-center gap-2 text-sm cursor-pointer hover:bg-gray-50 px-1.5 py-1 rounded">
+          <label key={optValue || "any"} className="flex items-center gap-2 text-sm cursor-pointer hover:bg-gray-50 px-1.5 py-1 rounded">
             <input
               type="radio"
               name={section.id}
@@ -170,7 +164,7 @@ function MultiSearchSection({ section, value, onChange }) {
   const [q, setQ] = useState("");
   const filteredOptions = useMemo(() => {
     const opts = section.options || [];
-    if (!q.trim()) return opts.slice(0, 50); // cap initial render for perf
+    if (!q.trim()) return opts.slice(0, 50);
     const needle = q.trim().toLowerCase();
     return opts.filter(o => {
       const label = typeof o === "object" ? o.label : o;
@@ -189,7 +183,7 @@ function MultiSearchSection({ section, value, onChange }) {
             value={q}
             onChange={(e) => setQ(e.target.value)}
             placeholder={`Search ${section.label.toLowerCase()}…`}
-            className="w-full pl-7 pr-2 py-1 border rounded text-xs focus:ring-1 focus:ring-teal-500"
+            className="w-full pl-7 pr-2 py-1.5 border rounded text-xs focus:ring-1 focus:ring-teal-500"
           />
         </div>
       )}
@@ -235,17 +229,14 @@ function MultiSearchSection({ section, value, onChange }) {
   );
 }
 
-// ─── Section wrapper (collapsible heading) ──────────────────────────────────
-
 function Section({ section, value, onChange, defaultExpanded = true }) {
   const [expanded, setExpanded] = useState(defaultExpanded);
   const isActive = !isEmptyValue(section, value);
-
   return (
     <div className="border-b border-gray-100 last:border-b-0">
       <button
         onClick={() => setExpanded(!expanded)}
-        className="w-full flex items-center justify-between px-3 py-2.5 hover:bg-gray-50 transition-colors"
+        className="w-full flex items-center justify-between px-4 py-2.5 hover:bg-gray-50 transition-colors"
       >
         <span className="text-xs font-semibold text-gray-700 uppercase tracking-wide flex items-center gap-1.5">
           {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
@@ -254,7 +245,7 @@ function Section({ section, value, onChange, defaultExpanded = true }) {
         </span>
       </button>
       {expanded && (
-        <div className="px-3 pb-3">
+        <div className="px-4 pb-3">
           {section.type === "date-range" && <DateRangeSection value={value} onChange={onChange} />}
           {section.type === "radio" && <RadioSection section={section} value={value} onChange={onChange} />}
           {section.type === "checkbox" && <CheckboxSection section={section} value={value} onChange={onChange} />}
@@ -265,20 +256,28 @@ function Section({ section, value, onChange, defaultExpanded = true }) {
   );
 }
 
-// ─── Main component ─────────────────────────────────────────────────────────
+// ─── Main component (drawer with trigger button) ────────────────────────────
 
 export default function FilterSidebar({
   sections = [],
   value = {},
   onChange,
   title = "Filters",
-  className = "",
-  // Mobile: render as a drawer toggled by a top button. Desktop: fixed left rail.
-  mobile = false,
+  triggerLabel = "Filters",
+  triggerClassName = "",
 }) {
-  const [mobileOpen, setMobileOpen] = useState(false);
+  const [open, setOpen] = useState(false);
 
-  // Count of active filters across all sections — shown in the "Clear All" header
+  // Close on ESC for keyboard accessibility.
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e) => { if (e.key === "Escape") setOpen(false); };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [open]);
+
+  // Active filter count — shown as a badge on the trigger button so users
+  // know they've narrowed the data even when the drawer is closed.
   const activeCount = useMemo(() => {
     return sections.reduce((n, s) => n + (isEmptyValue(s, value?.[s.id]) ? 0 : 1), 0);
   }, [sections, value]);
@@ -294,61 +293,83 @@ export default function FilterSidebar({
     onChange(empty);
   };
 
-  const panel = (
-    <div className={`bg-white border border-gray-200 rounded-lg ${className}`}>
-      <div className="flex items-center justify-between px-3 py-2.5 border-b border-gray-200 bg-gray-50 rounded-t-lg">
-        <h3 className="text-sm font-semibold text-gray-800 flex items-center gap-1.5">
-          <FilterIcon size={14} className="text-teal-600" /> {title}
-          {activeCount > 0 && (
-            <span className="text-[10px] bg-teal-100 text-teal-700 px-1.5 py-0.5 rounded-full font-medium">{activeCount}</span>
-          )}
-        </h3>
-        <button
-          onClick={clearAll}
-          disabled={activeCount === 0}
-          className={`text-xs ${activeCount === 0 ? "text-gray-300 cursor-not-allowed" : "text-red-600 hover:text-red-700 hover:underline"}`}
-        >
-          Clear All
-        </button>
-      </div>
-      <div>
-        {sections.map(section => (
-          <Section
-            key={section.id}
-            section={section}
-            value={value?.[section.id]}
-            onChange={(v) => setSectionValue(section.id, v)}
-            defaultExpanded={section.defaultExpanded !== false}
-          />
-        ))}
-      </div>
-    </div>
-  );
-
-  if (!mobile) return panel;
-
-  // Mobile drawer mode
   return (
     <>
       <button
-        onClick={() => setMobileOpen(true)}
-        className="lg:hidden flex items-center gap-1.5 px-3 py-2 bg-white border border-gray-200 rounded-lg text-sm font-medium text-gray-700 hover:bg-gray-50"
+        onClick={() => setOpen(true)}
+        className={triggerClassName || "inline-flex items-center gap-1.5 px-3 py-2 bg-white border border-gray-300 rounded-lg text-sm font-medium text-gray-700 hover:bg-gray-50 transition-colors"}
+        aria-label="Open filters"
       >
-        <FilterIcon size={14} /> Filters
+        <FilterIcon size={14} className="text-teal-600" />
+        <span>{triggerLabel}</span>
         {activeCount > 0 && (
-          <span className="text-[10px] bg-teal-100 text-teal-700 px-1.5 py-0.5 rounded-full font-medium">{activeCount}</span>
+          <span className="ml-0.5 inline-flex items-center justify-center min-w-[18px] h-[18px] px-1 bg-teal-600 text-white text-[10px] font-bold rounded-full">
+            {activeCount}
+          </span>
         )}
       </button>
-      <div className={`fixed inset-0 bg-black/30 z-40 transition-opacity ${mobileOpen ? "opacity-100" : "opacity-0 pointer-events-none"}`}
-        onClick={() => setMobileOpen(false)} />
-      <aside className={`fixed top-0 bottom-0 left-0 w-80 max-w-[85%] bg-white shadow-2xl z-50 overflow-y-auto transition-transform ${mobileOpen ? "translate-x-0" : "-translate-x-full"}`}>
-        <div className="sticky top-0 flex items-center justify-between px-3 py-2.5 border-b bg-white">
-          <h3 className="text-sm font-semibold text-gray-800">{title}</h3>
-          <button onClick={() => setMobileOpen(false)} className="p-1 hover:bg-gray-100 rounded">
-            <X size={16} />
+
+      {/* Overlay */}
+      <div
+        className={`fixed inset-0 bg-black/30 z-40 transition-opacity ${open ? "opacity-100" : "opacity-0 pointer-events-none"}`}
+        onClick={() => setOpen(false)}
+      />
+
+      {/* Slide-over drawer (slides in from the right edge of the viewport) */}
+      <aside
+        className={`fixed top-0 right-0 bottom-0 w-full sm:w-96 bg-white shadow-2xl z-50 flex flex-col transition-transform duration-200 ${open ? "translate-x-0" : "translate-x-full"}`}
+        aria-hidden={!open}
+      >
+        {/* Header: title + clear all + close */}
+        <div className="flex items-center justify-between px-4 py-3 border-b bg-gray-50">
+          <h3 className="text-sm font-semibold text-gray-800 flex items-center gap-1.5">
+            <FilterIcon size={14} className="text-teal-600" />
+            {title}
+            {activeCount > 0 && (
+              <span className="text-[10px] bg-teal-100 text-teal-700 px-1.5 py-0.5 rounded-full font-medium">{activeCount}</span>
+            )}
+          </h3>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={clearAll}
+              disabled={activeCount === 0}
+              className={`text-xs px-2 py-1 rounded ${activeCount === 0 ? "text-gray-300 cursor-not-allowed" : "text-red-600 hover:bg-red-50"}`}
+            >
+              Clear All
+            </button>
+            <button
+              onClick={() => setOpen(false)}
+              className="p-1 hover:bg-gray-200 rounded text-gray-500"
+              aria-label="Close filters"
+            >
+              <X size={16} />
+            </button>
+          </div>
+        </div>
+
+        {/* Sections (scrollable) */}
+        <div className="flex-1 overflow-y-auto">
+          {sections.map(section => (
+            <Section
+              key={section.id}
+              section={section}
+              value={value?.[section.id]}
+              onChange={(v) => setSectionValue(section.id, v)}
+              defaultExpanded={section.defaultExpanded !== false}
+            />
+          ))}
+        </div>
+
+        {/* Footer: hint that changes auto-apply (no Apply button needed) */}
+        <div className="border-t bg-gray-50 px-4 py-2.5 flex items-center justify-between">
+          <p className="text-[11px] text-gray-500">Changes apply automatically.</p>
+          <button
+            onClick={() => setOpen(false)}
+            className="px-3 py-1.5 bg-teal-600 text-white text-xs font-medium rounded-lg hover:bg-teal-700"
+          >
+            Done
           </button>
         </div>
-        {panel}
       </aside>
     </>
   );

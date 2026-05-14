@@ -997,25 +997,14 @@ export default function ReportsAnalytics({ user }) {
             <p className="text-xs text-gray-500">Disbursement analytics from the Pool Reports uploaded via OD Upload</p>
           </div>
         </div>
-        <button
-          onClick={fetchData}
-          disabled={loading}
-          className="inline-flex items-center gap-1.5 text-xs bg-teal-600 text-white px-3 py-2 rounded-lg hover:bg-teal-700 disabled:opacity-50"
-        >
-          <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
-          {loading ? "Loading…" : "Refresh"}
-        </button>
-      </div>
-
-      {/* 2-column layout: FilterSidebar on the left, all existing content on the
-          right. The sidebar reads from and writes to the page's EXISTING filter
-          state hooks (fromDate, branchFilter, productFilter, categoryFilter,
-          tableStatusFilter) so the rest of the pipeline (data fetch, memos,
-          charts) keeps working untouched. */}
-      <div className="flex flex-col lg:flex-row gap-4 items-start">
-        <aside className="w-full lg:w-64 lg:sticky lg:top-4 lg:flex-shrink-0">
+        <div className="flex items-center gap-2">
+          {/* Modern filter drawer — opens on click, slides in from the right
+              edge of the viewport. Reads and writes the page's existing filter
+              state hooks so the existing data pipeline (fetch, memos, charts,
+              table, pagination) keeps working untouched. */}
           <FilterSidebar
             title="Filters"
+            triggerLabel="Filters"
             sections={[
               { id: "dateRange",    type: "date-range", label: "Disbursement Date" },
               { id: "loanCategory", type: "radio",       label: "Loan Category",
@@ -1052,15 +1041,20 @@ export default function ReportsAnalytics({ user }) {
               if (Array.isArray(next.branch))  setBranchFilter(next.branch);
               if (Array.isArray(next.product)) setProductFilter(next.product);
               if (Array.isArray(next.loanStatus)) {
-                // tableStatusFilter is single-valued in the existing code; take the
-                // first selection (or "" if none) to remain backward-compatible.
                 setTableStatusFilter(next.loanStatus[0] || "");
               }
             }}
           />
-        </aside>
-
-        <div className="flex-1 min-w-0 space-y-5">
+          <button
+            onClick={fetchData}
+            disabled={loading}
+            className="inline-flex items-center gap-1.5 text-xs bg-teal-600 text-white px-3 py-2 rounded-lg hover:bg-teal-700 disabled:opacity-50"
+          >
+            <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
+            {loading ? "Loading…" : "Refresh"}
+          </button>
+        </div>
+      </div>
 
       {/* 2. Filter Toolbar — reactive (no Apply button). Every change auto-refreshes. */}
       <div className="bg-gray-50 border rounded-xl px-4 py-3 shadow-sm">
@@ -1754,8 +1748,6 @@ export default function ReportsAnalytics({ user }) {
           </button>
         </div>
       </SectionCard>
-        </div>{/* /right column */}
-      </div>{/* /flex wrapper */}
     </div>
   );
 }
