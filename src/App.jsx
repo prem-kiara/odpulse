@@ -4879,7 +4879,28 @@ export default function App() {
         .catch(() => {});
     };
     window.addEventListener("online", onOnline);
-    return () => window.removeEventListener("online", onOnline);
+
+    // ─── Fix for "Paid Amount drifts when I scroll the page" bug ───────────
+    // Browsers send mouse-wheel events to focused <input type="number">
+    // elements as +/-1 increments/decrements. If a user types 2000 into the
+    // Paid Amount field and then scrolls the page (e.g. to reach the Save
+    // button), every wheel tick decrements the number — making it look like
+    // the value is changing on its own (the reported "2000 -> 1961, 1963,
+    // 1905, 1884" sequence is exactly this in action). Blurring the input
+    // on any wheel event lets the page scroll normally and leaves the
+    // value untouched.
+    const onWheel = () => {
+      const el = document.activeElement;
+      if (el && el.tagName === "INPUT" && el.type === "number") {
+        el.blur();
+      }
+    };
+    window.addEventListener("wheel", onWheel, { passive: true });
+
+    return () => {
+      window.removeEventListener("online", onOnline);
+      window.removeEventListener("wheel", onWheel);
+    };
   }, []);
 
   const handleLogin = (u) => { setUser(u); setPage("dashboard"); };
