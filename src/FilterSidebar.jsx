@@ -146,8 +146,16 @@ function CheckboxSection({ section, value, onChange }) {
               type="checkbox"
               checked={checked}
               onChange={(e) => {
-                const next = e.target.checked ? [...v, optValue] : v.filter(x => x !== optValue);
-                onChange(next);
+                const willCheck = e.target.checked;
+                // Functional update: read the CURRENT value at dispatch time
+                // (via the parent's valueRef-backed onChange) so two rapid
+                // clicks don't overwrite each other's selections.
+                onChange((curV) => {
+                  const arr = Array.isArray(curV) ? curV : [];
+                  return willCheck
+                    ? (arr.includes(optValue) ? arr : [...arr, optValue])
+                    : arr.filter(x => x !== optValue);
+                });
               }}
               className="rounded text-teal-600 focus:ring-teal-500"
             />
@@ -192,7 +200,7 @@ function MultiSearchSection({ section, value, onChange }) {
           {v.map(item => (
             <span key={item} className="inline-flex items-center gap-0.5 px-1.5 py-0.5 bg-teal-50 text-teal-700 border border-teal-200 rounded text-[10px]">
               {item}
-              <button onClick={() => onChange(v.filter(x => x !== item))}
+              <button onClick={() => onChange((curV) => (Array.isArray(curV) ? curV : []).filter(x => x !== item))}
                 className="ml-0.5 hover:text-teal-900" aria-label={`Remove ${item}`}>×</button>
             </span>
           ))}
@@ -209,8 +217,13 @@ function MultiSearchSection({ section, value, onChange }) {
                 type="checkbox"
                 checked={checked}
                 onChange={(e) => {
-                  const next = e.target.checked ? [...v, optValue] : v.filter(x => x !== optValue);
-                  onChange(next);
+                  const willCheck = e.target.checked;
+                  onChange((curV) => {
+                    const arr = Array.isArray(curV) ? curV : [];
+                    return willCheck
+                      ? (arr.includes(optValue) ? arr : [...arr, optValue])
+                      : arr.filter(x => x !== optValue);
+                  });
                 }}
                 className="rounded text-teal-600 focus:ring-teal-500"
               />
@@ -282,16 +295,28 @@ export default function FilterSidebar({
     return sections.reduce((n, s) => n + (isEmptyValue(s, value?.[s.id]) ? 0 : 1), 0);
   }, [sections, value]);
 
-  const setSectionValue = (id, v) => {
+  // Stable ref to the current value so section onChange handlers can read
+  // the LIVE value at click-time, not the value captured at render time.
+  // This is the key fix for the click-race: rapid clicks were overwriting
+  // each other because each one computed `next` from the same stale prop.
+  const valueRef = React.useRef(value);
+  React.useEffect(() => { valueRef.current = value; }, [value]);
+
+  const setSectionValue = React.useCallback((id, updater) => {
     if (typeof onChange !== "function") return;
-    onChange({ ...value, [id]: v });
-  };
-  const clearAll = () => {
+    const curSectionValue = valueRef.current?.[id];
+    const nextSectionValue = typeof updater === "function" ? updater(curSectionValue) : updater;
+    // Bail if value didn't actually change — avoids a render and the
+    // accompanying focus-jump that contributed to perceived flicker.
+    if (Object.is(curSectionValue, nextSectionValue)) return;
+    onChange({ ...valueRef.current, [id]: nextSectionValue });
+  }, [onChange]);
+  const clearAll = React.useCallback(() => {
     if (typeof onChange !== "function") return;
     const empty = {};
     for (const s of sections) empty[s.id] = defaultEmpty(s);
     onChange(empty);
-  };
+  }, [sections, onChange]);
 
   return (
     <>
