@@ -699,7 +699,14 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
     if (!customerName.trim()) { alert("Please enter customer name."); return; }
     if (!customerId.trim()) { alert("Please enter customer ID."); return; }
     if (!loanAccountNo.trim()) { alert("Please enter loan account number."); return; }
-    if (numCust <= 0) { alert("Please enter the total number of customers in the group."); return; }
+    // Group Size is OPTIONAL for the same relaxed-validation branches (e.g.
+    // mahashemam, blaze trust, shiva guru — case-insensitive). The existing
+    // downstream math already treats numCust=0 as a no-op: customerShare,
+    // individualGroupOdShare and the "Group Size exceeded" check all guard
+    // against zero. Other branches keep the required check.
+    if (numCust <= 0 && !isBranchDueOptional(branch)) {
+      alert("Please enter the total number of customers in the group."); return;
+    }
     if (groupSizeExceeded) { alert(`Group Size (${numCust}) cannot exceed the actual number of members in this group (${maxGroupSize}).`); return; }
     // OD Amount Due is OPTIONAL for branches in BRANCHES_WITHOUT_DUE_REQUIRED
     // (e.g. mahashemam, blaze trust, shiva guru — matched case-insensitively).
