@@ -281,6 +281,75 @@ export default function FilterSidebar({
 }) {
   const [open, setOpen] = useState(false);
 
+  // ── Internal state ownership ────────────────────────────────────────────
+  // CRITICAL: FilterSidebar OWNS its filter state internally and treats the
+  // `value` prop only as an initial-value seed. The previous controlled-
+  // component design was vulnerable to flicker because every parent
+  // re-render (from the 250ms-debounced fetchData call, from pagination,
+  // from sort changes, etc.) flowed a freshly-built `value` object back
+  // through the component tree. With rapid clicks, the click event could
+  // be processed against a stale value reference and the second click
+  // would visibly overwrite the first.
+  //
+  // Now: internal state is the single source of truth for what's checked.
+  // Click handlers read and write internal state via functional updates
+  // (immune to closure staleness). After every internal change we notify
+  // the parent via onChange — the parent's state mirrors ours, but its
+  // re-renders no longer disturb our checkboxes/radios.
+  //
+  // We DO re-sync from props in one specific case: when the parent passes
+  // a structurally-different value (e.g. user navigates to the page with
+  // saved-filter URL params, or an external "Reset" elsewhere clears
+  // state). A JSON-string deep-compare is used so identical-but-different-
+  // reference objects from the parent don't trigger a state churn.
+  const [internalValue, setInternalValue] = useState(() => value || {});
+  const lastSyncedJsonRef = useRef(JSON.stringify(value || {}));
+
+  // External-value sync (one-way: props → internal). Only updates internal
+  // state if the parent passed a truly different value, not if they just
+  // built a new reference identity for the same data.
+  useEffect(() => {
+    const incomingJson = JSON.stringify(value || {});
+    if (incomingJson !== lastSyncedJsonRef.current) {
+      lastSyncedJsonRef.current = incomingJson;
+      setInternalValue(value || {});
+    }
+  }, [value]);
+
+  // Internal change handler — uses functional setState so the updater always
+  // sees the CURRENT internal state, even if multiple clicks fire in the
+  // same React batching cycle. Notifies the parent via onChange after the
+  // commit so parent state stays in sync for downstream data filtering.
+  const setSectionValue = useCallback((id, updater) => {
+    setInternalValue(prev => {
+      const curSectionValue = prev?.[id];
+      const nextSectionValue = typeof updater === "function" ? updater(curSectionValue) : updater;
+      if (Object.is(curSectionValue, nextSectionValue)) return prev;
+      const next = { ...prev, [id]: nextSectionValue };
+      // Notify parent OUTSIDE the setter (via microtask) so we don't run
+      // side effects inside the setState updater.
+      Promise.resolve().then(() => {
+        if (typeof onChange === "function") onChange(next);
+        // Record that this is "our own" emission so the external-sync
+        // useEffect doesn't bounce it back.
+        lastSyncedJsonRef.current = JSON.stringify(next);
+      });
+      return next;
+    });
+  }, [onChange]);
+
+  const clearAll = useCallback(() => {
+    setInternalValue(() => {
+      const empty = {};
+      for (const s of sections) empty[s.id] = defaultEmpty(s);
+      Promise.resolve().then(() => {
+        if (typeof onChange === "function") onChange(empty);
+        lastSyncedJsonRef.current = JSON.stringify(empty);
+      });
+      return empty;
+    });
+  }, [sections, onChange]);
+
   // Close on ESC for keyboard accessibility.
   useEffect(() => {
     if (!open) return;
@@ -290,33 +359,11 @@ export default function FilterSidebar({
   }, [open]);
 
   // Active filter count — shown as a badge on the trigger button so users
-  // know they've narrowed the data even when the drawer is closed.
+  // know they've narrowed the data even when the drawer is closed. Read
+  // from INTERNAL state so the badge matches what the user sees in the UI.
   const activeCount = useMemo(() => {
-    return sections.reduce((n, s) => n + (isEmptyValue(s, value?.[s.id]) ? 0 : 1), 0);
-  }, [sections, value]);
-
-  // Stable ref to the current value so section onChange handlers can read
-  // the LIVE value at click-time, not the value captured at render time.
-  // This is the key fix for the click-race: rapid clicks were overwriting
-  // each other because each one computed `next` from the same stale prop.
-  const valueRef = React.useRef(value);
-  React.useEffect(() => { valueRef.current = value; }, [value]);
-
-  const setSectionValue = React.useCallback((id, updater) => {
-    if (typeof onChange !== "function") return;
-    const curSectionValue = valueRef.current?.[id];
-    const nextSectionValue = typeof updater === "function" ? updater(curSectionValue) : updater;
-    // Bail if value didn't actually change — avoids a render and the
-    // accompanying focus-jump that contributed to perceived flicker.
-    if (Object.is(curSectionValue, nextSectionValue)) return;
-    onChange({ ...valueRef.current, [id]: nextSectionValue });
-  }, [onChange]);
-  const clearAll = React.useCallback(() => {
-    if (typeof onChange !== "function") return;
-    const empty = {};
-    for (const s of sections) empty[s.id] = defaultEmpty(s);
-    onChange(empty);
-  }, [sections, onChange]);
+    return sections.reduce((n, s) => n + (isEmptyValue(s, internalValue?.[s.id]) ? 0 : 1), 0);
+  }, [sections, internalValue]);
 
   return (
     <>
@@ -378,7 +425,7 @@ export default function FilterSidebar({
             <Section
               key={section.id}
               section={section}
-              value={value?.[section.id]}
+              value={internalValue?.[section.id]}
               onChange={(v) => setSectionValue(section.id, v)}
               defaultExpanded={section.defaultExpanded !== false}
             />
