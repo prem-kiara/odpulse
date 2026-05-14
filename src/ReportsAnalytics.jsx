@@ -1550,8 +1550,13 @@ export default function ReportsAnalytics({ user }) {
         {/* stable-table-wrap + table-layout:fixed prevents the Paid Amount /
             Foreclosure Amount columns from wobbling as rows scroll. The
             <colgroup> below pins each column to a fixed width regardless
-            of cell content. Sticky thead via the .stable-table CSS class. */}
-        <div className="stable-table-wrap rounded-lg border" style={{ maxHeight: "65vh" }}>
+            of cell content. Sticky thead via the .stable-table CSS class.
+
+            NO inline maxHeight: with pagination keeping the table short, an
+            internal scroll container never scrolls, which means sticky thead
+            has nothing to stick to. Letting the page handle vertical scroll
+            lets the sticky header pin to the viewport instead. */}
+        <div className="stable-table-wrap rounded-lg border">
           <table className="stable-table text-xs">
             <colgroup>
               <col style={{ width: "100px" }} /> {/* Date */}

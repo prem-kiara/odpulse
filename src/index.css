@@ -48,13 +48,15 @@ input.no-spinner {
 */
 .stable-table-wrap {
   position: relative;
-  overflow: auto;
-  /* Default max height for big tables — components can override via inline
-     style or a Tailwind class. Without a bounded height, sticky headers
-     have nothing to be sticky relative to. */
-  max-height: 70vh;
-  /* Performance hint to the browser: this region scrolls independently. */
-  will-change: transform;
+  /* Horizontal scroll only — wide tables can scroll sideways but vertical
+     content flows naturally so the PAGE handles vertical scrolling. This
+     is the key fix for "sticky headers don't stick": with an internal
+     vertical scroll container the sticky thead can only stick relative to
+     that container, which never scrolls when pagination keeps the table
+     short. Letting the page do the vertical scroll means the sticky thead
+     pins to the top of the viewport — what users actually want. */
+  overflow-x: auto;
+  overflow-y: visible;
 }
 
 /* ─── Global wobble fix for EVERY data table in ODPulse ───────────────────
@@ -82,10 +84,17 @@ table.w-full:not(.auto-layout) {
 }
 table.w-full:not(.auto-layout) thead th {
   position: sticky;
+  /* top: 0 = stick to the top of whatever scroll container holds the table.
+     If the table is in a wrapper with overflow:visible (the case after the
+     fix above), this becomes the PAGE viewport — which is what users
+     expect when scrolling the long page of records. */
   top: 0;
-  z-index: 2;
+  z-index: 5;
   background: #f9fafb;
-  box-shadow: inset 0 -1px 0 #e5e7eb;
+  /* Double box-shadow: bottom border (so it never gets clipped by overflow)
+     and a small top-shadow to subtly mark the header as floating above the
+     rows scrolling beneath it. */
+  box-shadow: inset 0 -1px 0 #e5e7eb, 0 1px 2px rgba(0,0,0,0.04);
 }
 /* Single-line cells with ellipsis — overrides the default wrap that causes
    row-height changes when content varies. Tables can opt rows back into
