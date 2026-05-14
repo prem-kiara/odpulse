@@ -35,7 +35,7 @@
 //     loanStatus:    ["Active", "Overdue"],
 //   }
 
-import React, { useState, useMemo, useEffect } from "react";
+import React, { useState, useMemo, useEffect, useRef, useCallback } from "react";
 import { Search, X, ChevronDown, ChevronRight, Calendar, Filter as FilterIcon } from "lucide-react";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
