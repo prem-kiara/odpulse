@@ -56,6 +56,59 @@ input.no-spinner {
   /* Performance hint to the browser: this region scrolls independently. */
   will-change: transform;
 }
+
+/* ─── Global wobble fix for EVERY data table in ODPulse ───────────────────
+   The "Paid Amount column visibly shifts left/right as I scroll" bug is
+   caused by the browser re-computing column widths whenever new rows enter
+   the viewport (a row with a long customer name pushes its column wider
+   than the previous row's). The only way to stop this is to lock the layout
+   algorithm to "fixed", which makes column widths a property of the table
+   itself rather than its contents.
+
+   ODPulse uses `class="w-full"` on virtually every data table (we audited the
+   codebase). This rule applies the fix universally — no per-table refactor
+   needed. Tables that legitimately need content-driven sizing (e.g. the
+   product × branch heatmap on OdInsights) opt out with the `auto-layout`
+   escape hatch class.
+
+   Side effect: sticky headers also get applied to every scrollable wrapper,
+   matching the behaviour the team requested ("keep table headers sticky/
+   fixed while scrolling").
+*/
+table.w-full:not(.auto-layout) {
+  table-layout: fixed;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+table.w-full:not(.auto-layout) thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: #f9fafb;
+  box-shadow: inset 0 -1px 0 #e5e7eb;
+}
+/* Single-line cells with ellipsis — overrides the default wrap that causes
+   row-height changes when content varies. Tables can opt rows back into
+   wrapping with class="wrap-cell" on the specific <td>/<th>. */
+table.w-full:not(.auto-layout) td,
+table.w-full:not(.auto-layout) th {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+}
+table.w-full:not(.auto-layout) td.wrap-cell,
+table.w-full:not(.auto-layout) th.wrap-cell {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+}
+/* Right-align tabular numeric columns (apply class="num" on the th/td). */
+table.w-full:not(.auto-layout) th.num,
+table.w-full:not(.auto-layout) td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
 table.stable-table {
   /* Critical: locks each column to the width declared in <colgroup> or the
      header cell, so row content can't push columns around. */
