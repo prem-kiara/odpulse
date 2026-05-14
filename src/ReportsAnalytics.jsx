@@ -473,7 +473,18 @@ export default function ReportsAnalytics({ user }) {
   // Active / Closed / Pending without leaving the current view (e.g.
   // they can be in the Principal Outstanding view AND filter to
   // closed-only). "" = no filter.
-  const [tableStatusFilter, setTableStatusFilter] = useState("");
+  // Multi-select Loan Status filter. Array of status strings; empty array
+  // means "no filter / show all". Powered by:
+  //   - the FilterSidebar's Loan Status checkbox section (multi-select)
+  //   - the inline table dropdown above the Disbursements table (single-select;
+  //     it sets the array to [value] or [] so the two UIs stay in sync).
+  const [tableStatusFilters, setTableStatusFilters] = useState([]);
+  // Backward-compat alias for places that still read a single-value string:
+  // the inline <select> binds to this, since it can only show one value at
+  // a time. When the sidebar selects multiple, the inline dropdown shows
+  // the first one (or "" if empty).
+  const tableStatusFilter = tableStatusFilters[0] || "";
+  const setTableStatusFilter = (v) => setTableStatusFilters(v ? [v] : []);
 
   // Selected KPI view — controls which focused detail section is shown below
   // the KPI cards. "overview" = full layout (trend + branch + product +
@@ -693,16 +704,19 @@ export default function ReportsAnalytics({ user }) {
     // statusFilter — if a view like "active" is selected AND the user
     // picks "closed" in the table dropdown, no rows match (correct: those
     // are mutually exclusive).
-    const tableStatusValue = tableStatusFilter || null;
+    // Multi-select status filter: row passes if its status matches ANY of
+    // the selected statuses. Overdue is special — it's an attribute (not a
+    // mutually-exclusive status), so selecting it requires overdue_amount > 0.
+    const statusSet = new Set(tableStatusFilters);
     let arr = recent.filter(r => {
       if (principalOnly && (Number(r.principal_outstanding) || 0) <= 0) return false;
       if (statusFilter && r.status !== statusFilter) return false;
-      // Overdue is an attribute (not a mutually-exclusive status), so the
-      // dropdown's "Overdue" choice filters by overdue_amount > 0 instead
-      // of comparing r.status. Active/Closed/Pending still compare directly.
-      if (tableStatusValue === "Overdue") {
-        if ((Number(r.overdue_amount) || 0) <= 0) return false;
-      } else if (tableStatusValue && r.status !== tableStatusValue) {
+      if (statusSet.size > 0) {
+        const wantsOverdue = statusSet.has("Overdue");
+        const overdueOK = wantsOverdue && (Number(r.overdue_amount) || 0) > 0;
+        const directOK = statusSet.has(r.status);
+        if (!overdueOK && !directOK) return false;
+      } else if (false) {
         return false;
       }
       if (q) {
@@ -722,7 +736,7 @@ export default function ReportsAnalytics({ user }) {
       return sortDir === "asc" ? cmp : -cmp;
     });
     return arr;
-  }, [recent, search, sortKey, sortDir, view, productFilter, categoryFilter, tableStatusFilter]);
+  }, [recent, search, sortKey, sortDir, view, productFilter, categoryFilter, tableStatusFilters]);
 
   const handleSort = (key) => {
     if (sortKey === key) setSortDir(d => d === "asc" ? "desc" : "asc");
@@ -766,7 +780,15 @@ export default function ReportsAnalytics({ user }) {
       // Apply the same client-side filters (search, table-status, principal-only)
       const q = search.trim().toLowerCase();
       if (view === "principal") arr = arr.filter(r => (Number(r.principal_outstanding) || 0) > 0);
-      if (tableStatusFilter) arr = arr.filter(r => r.status === tableStatusFilter);
+      // Multi-select status filter for the export path: matches any of the selected.
+      if (tableStatusFilters.length > 0) {
+        const statusSet = new Set(tableStatusFilters);
+        const wantsOverdue = statusSet.has("Overdue");
+        arr = arr.filter(r => {
+          if (wantsOverdue && (Number(r.overdue_amount) || 0) > 0) return true;
+          return statusSet.has(r.status);
+        });
+      }
       if (q) {
         arr = arr.filter(r =>
           (r.customer_name || "").toLowerCase().includes(q) ||
@@ -780,7 +802,7 @@ export default function ReportsAnalytics({ user }) {
       console.warn("Export re-fetch failed, falling back to in-memory rows:", e);
       return filteredRecent;
     }
-  }, [fromDate, toDate, branchFilter, productFilter, categoryFilter, view, search, tableStatusFilter, filteredRecent]);
+  }, [fromDate, toDate, branchFilter, productFilter, categoryFilter, view, search, tableStatusFilters, filteredRecent]);
 
   // Export schema mirrors the on-screen table: every column the user sees
   // in Recent Disbursements / Overdue Accounts ends up in the download.
@@ -1005,16 +1027,12 @@ export default function ReportsAnalytics({ user }) {
       options: branchOptions, searchable: true },
     { id: "product", type: "multi-search", label: "Product",
       options: (data?.byProduct || []).map(p => p.key), searchable: true },
-    // Loan Status is RADIO not checkbox: tableStatusFilter is a single
-    // string ("" | "Active" | "Closed" | "Pending" | "Overdue") in the
-    // existing code. Using a checkbox here would let users pick multiple
-    // statuses which the backend can't honour — the parent onChange would
-    // collapse the array to its first element, deselecting all others on
-    // every click and producing the flicker behaviour. Radio matches the
-    // backend's single-value contract exactly.
-    { id: "loanStatus", type: "radio", label: "Loan Status",
+    // Loan Status — multi-select checkbox. tableStatusFilters is now an
+    // array of status strings, so users can pick multiple statuses and the
+    // row filter does an "any-of" match. The inline <select> above the
+    // table stays single-select and binds to the first array entry.
+    { id: "loanStatus", type: "checkbox", label: "Loan Status",
       options: [
-        { value: "",        label: "All" },
         { value: "Active",  label: "Active" },
         { value: "Closed",  label: "Closed" },
         { value: "Pending", label: "Pending" },
@@ -1027,8 +1045,8 @@ export default function ReportsAnalytics({ user }) {
     loanCategory: categoryFilter,
     branch:       branchFilter,
     product:      productFilter,
-    loanStatus:   tableStatusFilter || "",
-  }), [fromDate, toDate, categoryFilter, branchFilter, productFilter, tableStatusFilter]);
+    loanStatus:   tableStatusFilters,
+  }), [fromDate, toDate, categoryFilter, branchFilter, productFilter, tableStatusFilters]);
 
   const fsOnChange = useCallback((next) => {
     if (next.dateRange) {
@@ -1038,10 +1056,14 @@ export default function ReportsAnalytics({ user }) {
     if (next.loanCategory !== undefined && next.loanCategory !== categoryFilter) setCategoryFilter(next.loanCategory);
     if (Array.isArray(next.branch))  setBranchFilter(next.branch);
     if (Array.isArray(next.product)) setProductFilter(next.product);
-    if (typeof next.loanStatus === "string" && next.loanStatus !== tableStatusFilter) {
-      setTableStatusFilter(next.loanStatus);
+    if (Array.isArray(next.loanStatus)) {
+      // Bail if identical to avoid spurious re-renders (which were
+      // contributing to perceived flicker on rapid clicks).
+      const same = next.loanStatus.length === tableStatusFilters.length
+                && next.loanStatus.every((s, i) => s === tableStatusFilters[i]);
+      if (!same) setTableStatusFilters(next.loanStatus);
     }
-  }, [fromDate, toDate, categoryFilter, branchFilter, productFilter, tableStatusFilter]);
+  }, [fromDate, toDate, categoryFilter, branchFilter, productFilter, tableStatusFilters]);
 
   return (
     <div className="space-y-5">
