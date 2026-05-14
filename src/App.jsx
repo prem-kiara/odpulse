@@ -255,7 +255,9 @@ const DEFAULT_BRANCHES = [
   "Rasipuram", "Ambai", "Alangulam", "Surandai", "Tenkasi", "Eral", "Tuticorin",
   "Palayamkottai", "Rajapalayam", "Sanakarankovil", "Srivilliputhur", "Periyakulam",
   "Chinnamanur", "Kariyapatti", "RR Nagar", "Thirupuvanam", "Valayankulam", "Checkanurani",
-  "mahashemam"
+  "mahashemam",
+  "blaze trust",
+  "shiva guru"
 ];
 
 // Branches allowed to save entries WITHOUT entering the "OD Amount Due"
@@ -268,7 +270,7 @@ const DEFAULT_BRANCHES = [
 // historically used "Mahashemam" (uppercase) for the Aadhaar-only bulk
 // upload flow, and the user-facing canonical form is now "mahashemam"
 // (lowercase). Both work.
-const BRANCHES_WITHOUT_DUE_REQUIRED = new Set(["mahashemam"]);
+const BRANCHES_WITHOUT_DUE_REQUIRED = new Set(["mahashemam", "blaze trust", "shiva guru"]);
 const isBranchDueOptional = (branch) =>
   BRANCHES_WITHOUT_DUE_REQUIRED.has(String(branch || "").trim().toLowerCase());
 const DEFAULT_USERS = [
@@ -700,7 +702,8 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
     if (numCust <= 0) { alert("Please enter the total number of customers in the group."); return; }
     if (groupSizeExceeded) { alert(`Group Size (${numCust}) cannot exceed the actual number of members in this group (${maxGroupSize}).`); return; }
     // OD Amount Due is OPTIONAL for branches in BRANCHES_WITHOUT_DUE_REQUIRED
-    // (e.g. mahashemam — matched case-insensitively). All other validations remain unchanged.
+    // (e.g. mahashemam, blaze trust, shiva guru — matched case-insensitively).
+    // All other validations remain unchanged.
     if (groupOdDue <= 0 && !isBranchDueOptional(branch)) {
       alert("Please enter Group OD Amount Due."); return;
     }
@@ -1753,7 +1756,8 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
     if (!customerName.trim()) { alert("Please enter customer name."); return; }
     if (!loanAccountNo.trim()) { alert("Please enter loan account number."); return; }
     // OD Amount Due is OPTIONAL for branches in BRANCHES_WITHOUT_DUE_REQUIRED
-    // (e.g. mahashemam — matched case-insensitively). Every other validation still applies.
+    // (e.g. mahashemam, blaze trust, shiva guru — matched case-insensitively).
+    // Every other validation still applies.
     if (due <= 0 && !isBranchDueOptional(branch)) {
       alert("Please enter OD Amount Due."); return;
     }

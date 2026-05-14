@@ -29,7 +29,9 @@ const DEFAULT_BRANCHES = [
   "Rasipuram", "Ambai", "Alangulam", "Surandai", "Tenkasi", "Eral", "Tuticorin",
   "Palayamkottai", "Rajapalayam", "Sanakarankovil", "Srivilliputhur", "Periyakulam",
   "Chinnamanur", "Kariyapatti", "RR Nagar", "Thirupuvanam", "Valayankulam", "Checkanurani",
-  "mahashemam"
+  "mahashemam",
+  "blaze trust",
+  "shiva guru"
 ];
 
 const DEFAULT_USERS = [
@@ -86,7 +88,7 @@ loadJSON("notifications.json", []);
   // Canonical form is lowercase. Case-insensitive presence check so existing
   // "Mahashemam" (uppercase, from earlier prod data) is recognised and NOT
   // duplicated.
-  const REQUIRED = ["mahashemam"];
+  const REQUIRED = ["mahashemam", "blaze trust", "shiva guru"];
   try {
     const current = loadJSON("branches.json", DEFAULT_BRANCHES);
     const lowerSet = new Set(current.map(b => String(b).trim().toLowerCase()));
