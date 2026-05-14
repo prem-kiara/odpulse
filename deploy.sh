@@ -35,6 +35,9 @@ fi
 
 # 1. Pull latest code
 echo "[1/7] Pulling latest code..."
+# Stash any live data file changes (branches.json, users.json etc.) so git pull
+# never aborts. These files are runtime data — not code — so stashing is safe.
+git stash --include-untracked -- server/data/ 2>/dev/null || true
 git pull origin main
 
 # 2. Install frontend dependencies & build
