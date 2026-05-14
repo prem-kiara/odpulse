@@ -986,6 +986,63 @@ export default function ReportsAnalytics({ user }) {
   );
 
   // ────────────────────────────────────────────────────────────────────────
+  // ─── Memoize FilterSidebar inputs so click events don't race with the
+  // page's auto-refresh re-renders. Without these refs the `sections`
+  // array, `value` object, and `onChange` callback would be recreated on
+  // every render; the FilterSidebar's internal useMemo (activeCount) and
+  // child Section components would see different reference identities
+  // each cycle, which when combined with rapid clicks made the checkbox /
+  // radio selections flicker.
+  const fsSections = useMemo(() => ([
+    { id: "dateRange",    type: "date-range", label: "Disbursement Date" },
+    { id: "loanCategory", type: "radio",       label: "Loan Category",
+      options: [
+        { value: "",            label: "All Categories" },
+        { value: "group",       label: "Group Loans" },
+        { value: "individual",  label: "Individual Loans" },
+      ] },
+    { id: "branch",  type: "multi-search", label: "Branch",
+      options: branchOptions, searchable: true },
+    { id: "product", type: "multi-search", label: "Product",
+      options: (data?.byProduct || []).map(p => p.key), searchable: true },
+    // Loan Status is RADIO not checkbox: tableStatusFilter is a single
+    // string ("" | "Active" | "Closed" | "Pending" | "Overdue") in the
+    // existing code. Using a checkbox here would let users pick multiple
+    // statuses which the backend can't honour — the parent onChange would
+    // collapse the array to its first element, deselecting all others on
+    // every click and producing the flicker behaviour. Radio matches the
+    // backend's single-value contract exactly.
+    { id: "loanStatus", type: "radio", label: "Loan Status",
+      options: [
+        { value: "",        label: "All" },
+        { value: "Active",  label: "Active" },
+        { value: "Closed",  label: "Closed" },
+        { value: "Pending", label: "Pending" },
+        { value: "Overdue", label: "Overdue" },
+      ] },
+  ]), [branchOptions, data]);
+
+  const fsValue = useMemo(() => ({
+    dateRange:    { from: fromDate, to: toDate },
+    loanCategory: categoryFilter,
+    branch:       branchFilter,
+    product:      productFilter,
+    loanStatus:   tableStatusFilter || "",
+  }), [fromDate, toDate, categoryFilter, branchFilter, productFilter, tableStatusFilter]);
+
+  const fsOnChange = useCallback((next) => {
+    if (next.dateRange) {
+      if (next.dateRange.from !== fromDate) setFromDate(next.dateRange.from || monthsAgoISO(6));
+      if (next.dateRange.to   !== toDate)   setToDate(next.dateRange.to   || todayISO());
+    }
+    if (next.loanCategory !== undefined && next.loanCategory !== categoryFilter) setCategoryFilter(next.loanCategory);
+    if (Array.isArray(next.branch))  setBranchFilter(next.branch);
+    if (Array.isArray(next.product)) setProductFilter(next.product);
+    if (typeof next.loanStatus === "string" && next.loanStatus !== tableStatusFilter) {
+      setTableStatusFilter(next.loanStatus);
+    }
+  }, [fromDate, toDate, categoryFilter, branchFilter, productFilter, tableStatusFilter]);
+
   return (
     <div className="space-y-5">
       {/* 1. Header */}
@@ -1005,45 +1062,9 @@ export default function ReportsAnalytics({ user }) {
           <FilterSidebar
             title="Filters"
             triggerLabel="Filters"
-            sections={[
-              { id: "dateRange",    type: "date-range", label: "Disbursement Date" },
-              { id: "loanCategory", type: "radio",       label: "Loan Category",
-                options: [
-                  { value: "",            label: "All Categories" },
-                  { value: "group",       label: "Group Loans" },
-                  { value: "individual",  label: "Individual Loans" },
-                ] },
-              { id: "branch",  type: "multi-search", label: "Branch",
-                options: branchOptions, searchable: true },
-              { id: "product", type: "multi-search", label: "Product",
-                options: data?.byProduct?.map(p => p.key) || [], searchable: true },
-              { id: "loanStatus", type: "checkbox", label: "Loan Status",
-                options: [
-                  { value: "Active",  label: "Active" },
-                  { value: "Closed",  label: "Closed" },
-                  { value: "Pending", label: "Pending" },
-                  { value: "Overdue", label: "Overdue" },
-                ] },
-            ]}
-            value={{
-              dateRange:    { from: fromDate, to: toDate },
-              loanCategory: categoryFilter,
-              branch:       branchFilter,
-              product:      productFilter,
-              loanStatus:   tableStatusFilter ? [tableStatusFilter] : [],
-            }}
-            onChange={(next) => {
-              if (next.dateRange) {
-                if (next.dateRange.from !== fromDate) setFromDate(next.dateRange.from || monthsAgoISO(6));
-                if (next.dateRange.to   !== toDate)   setToDate(next.dateRange.to   || todayISO());
-              }
-              if (next.loanCategory !== undefined && next.loanCategory !== categoryFilter) setCategoryFilter(next.loanCategory);
-              if (Array.isArray(next.branch))  setBranchFilter(next.branch);
-              if (Array.isArray(next.product)) setProductFilter(next.product);
-              if (Array.isArray(next.loanStatus)) {
-                setTableStatusFilter(next.loanStatus[0] || "");
-              }
-            }}
+            sections={fsSections}
+            value={fsValue}
+            onChange={fsOnChange}
           />
           <button
             onClick={fetchData}
