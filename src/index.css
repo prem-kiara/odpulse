@@ -59,58 +59,30 @@ input.no-spinner {
   overflow-y: visible;
 }
 
-/* ─── Global wobble fix for EVERY data table in ODPulse ───────────────────
-   The "Paid Amount column visibly shifts left/right as I scroll" bug is
-   caused by the browser re-computing column widths whenever new rows enter
-   the viewport (a row with a long customer name pushes its column wider
-   than the previous row's). The only way to stop this is to lock the layout
-   algorithm to "fixed", which makes column widths a property of the table
-   itself rather than its contents.
+/* ─── Global sticky-header rule for EVERY data table in ODPulse ──────────
+   Apply position:sticky to <thead th> on every `class="w-full"` table.
+   This is the safest universal change — no column-width manipulation, so
+   no risk of truncating values. The header pins to the page viewport
+   when you scroll long lists of records.
 
-   ODPulse uses `class="w-full"` on virtually every data table (we audited the
-   codebase). This rule applies the fix universally — no per-table refactor
-   needed. Tables that legitimately need content-driven sizing (e.g. the
-   product × branch heatmap on OdInsights) opt out with the `auto-layout`
-   escape hatch class.
+   We deliberately do NOT apply `table-layout: fixed` here. That setting
+   caused values like "₹70,166.947" to be truncated on tables that don't
+   declare explicit column widths (Records, OD Insights), which made the
+   Paid Amount appear to "vary" between rows. Auto-layout keeps each cell
+   sized to its content — wider but never truncated.
 
-   Side effect: sticky headers also get applied to every scrollable wrapper,
-   matching the behaviour the team requested ("keep table headers sticky/
-   fixed while scrolling").
-*/
-table.w-full:not(.auto-layout) {
-  table-layout: fixed;
-  border-collapse: separate;
-  border-spacing: 0;
-}
+   Tables that DO need stable, fixed-width columns (e.g. Recent Disbursements
+   with its <colgroup>) opt in to `class="stable-table"` separately. */
 table.w-full:not(.auto-layout) thead th {
   position: sticky;
   /* top: 0 = stick to the top of whatever scroll container holds the table.
-     If the table is in a wrapper with overflow:visible (the case after the
-     fix above), this becomes the PAGE viewport — which is what users
-     expect when scrolling the long page of records. */
+     With overflow:visible on .stable-table-wrap (the fix above), this
+     becomes the PAGE viewport — which is what users expect when scrolling
+     the long page of records. */
   top: 0;
   z-index: 5;
   background: #f9fafb;
-  /* Double box-shadow: bottom border (so it never gets clipped by overflow)
-     and a small top-shadow to subtly mark the header as floating above the
-     rows scrolling beneath it. */
   box-shadow: inset 0 -1px 0 #e5e7eb, 0 1px 2px rgba(0,0,0,0.04);
-}
-/* Single-line cells with ellipsis — overrides the default wrap that causes
-   row-height changes when content varies. Tables can opt rows back into
-   wrapping with class="wrap-cell" on the specific <td>/<th>. */
-table.w-full:not(.auto-layout) td,
-table.w-full:not(.auto-layout) th {
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  vertical-align: middle;
-}
-table.w-full:not(.auto-layout) td.wrap-cell,
-table.w-full:not(.auto-layout) th.wrap-cell {
-  white-space: normal;
-  overflow: visible;
-  text-overflow: clip;
 }
 /* Right-align tabular numeric columns (apply class="num" on the th/td). */
 table.w-full:not(.auto-layout) th.num,

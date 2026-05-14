@@ -29,6 +29,7 @@ import {
   ChevronUp, ChevronDown, RefreshCw, Building2, Package,
 } from "lucide-react";
 import { usePagination, PaginationBar } from "./Pagination";
+import FilterSidebar from "./FilterSidebar";
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 const formatINR = (n) => {
@@ -1006,6 +1007,61 @@ export default function ReportsAnalytics({ user }) {
         </button>
       </div>
 
+      {/* 2-column layout: FilterSidebar on the left, all existing content on the
+          right. The sidebar reads from and writes to the page's EXISTING filter
+          state hooks (fromDate, branchFilter, productFilter, categoryFilter,
+          tableStatusFilter) so the rest of the pipeline (data fetch, memos,
+          charts) keeps working untouched. */}
+      <div className="flex flex-col lg:flex-row gap-4 items-start">
+        <aside className="w-full lg:w-64 lg:sticky lg:top-4 lg:flex-shrink-0">
+          <FilterSidebar
+            title="Filters"
+            sections={[
+              { id: "dateRange",    type: "date-range", label: "Disbursement Date" },
+              { id: "loanCategory", type: "radio",       label: "Loan Category",
+                options: [
+                  { value: "",            label: "All Categories" },
+                  { value: "group",       label: "Group Loans" },
+                  { value: "individual",  label: "Individual Loans" },
+                ] },
+              { id: "branch",  type: "multi-search", label: "Branch",
+                options: branchOptions, searchable: true },
+              { id: "product", type: "multi-search", label: "Product",
+                options: data?.byProduct?.map(p => p.key) || [], searchable: true },
+              { id: "loanStatus", type: "checkbox", label: "Loan Status",
+                options: [
+                  { value: "Active",  label: "Active" },
+                  { value: "Closed",  label: "Closed" },
+                  { value: "Pending", label: "Pending" },
+                  { value: "Overdue", label: "Overdue" },
+                ] },
+            ]}
+            value={{
+              dateRange:    { from: fromDate, to: toDate },
+              loanCategory: categoryFilter,
+              branch:       branchFilter,
+              product:      productFilter,
+              loanStatus:   tableStatusFilter ? [tableStatusFilter] : [],
+            }}
+            onChange={(next) => {
+              if (next.dateRange) {
+                if (next.dateRange.from !== fromDate) setFromDate(next.dateRange.from || monthsAgoISO(6));
+                if (next.dateRange.to   !== toDate)   setToDate(next.dateRange.to   || todayISO());
+              }
+              if (next.loanCategory !== undefined && next.loanCategory !== categoryFilter) setCategoryFilter(next.loanCategory);
+              if (Array.isArray(next.branch))  setBranchFilter(next.branch);
+              if (Array.isArray(next.product)) setProductFilter(next.product);
+              if (Array.isArray(next.loanStatus)) {
+                // tableStatusFilter is single-valued in the existing code; take the
+                // first selection (or "" if none) to remain backward-compatible.
+                setTableStatusFilter(next.loanStatus[0] || "");
+              }
+            }}
+          />
+        </aside>
+
+        <div className="flex-1 min-w-0 space-y-5">
+
       {/* 2. Filter Toolbar — reactive (no Apply button). Every change auto-refreshes. */}
       <div className="bg-gray-50 border rounded-xl px-4 py-3 shadow-sm">
         <div className="grid grid-cols-1 md:grid-cols-5 gap-3 items-end">
@@ -1698,6 +1754,8 @@ export default function ReportsAnalytics({ user }) {
           </button>
         </div>
       </SectionCard>
+        </div>{/* /right column */}
+      </div>{/* /flex wrapper */}
     </div>
   );
 }
