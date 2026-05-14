@@ -1025,8 +1025,15 @@ export default function ReportsAnalytics({ user }) {
       ] },
     { id: "branch",  type: "multi-search", label: "Branch",
       options: branchOptions, searchable: true },
+    // Product filter uses the same pattern as Branch: a stable options list
+    // (productOptions) fetched once on mount and refined by Loan Category.
+    // The previous wiring `(data?.byProduct || []).map(p => p.key)` rebuilt
+    // the options on every data refresh, which made the Product section
+    // feel less consistent than Branch. Now they're symmetric: type=
+    // multi-search, searchable=true, stable options array, chips for
+    // selected items, individual × to remove each one.
     { id: "product", type: "multi-search", label: "Product",
-      options: (data?.byProduct || []).map(p => p.key), searchable: true },
+      options: productOptions, searchable: true },
     // Loan Status — multi-select checkbox. tableStatusFilters is now an
     // array of status strings, so users can pick multiple statuses and the
     // row filter does an "any-of" match. The inline <select> above the
@@ -1038,7 +1045,7 @@ export default function ReportsAnalytics({ user }) {
         { value: "Pending", label: "Pending" },
         { value: "Overdue", label: "Overdue" },
       ] },
-  ]), [branchOptions, data]);
+  ]), [branchOptions, productOptions]);
 
   const fsValue = useMemo(() => ({
     dateRange:    { from: fromDate, to: toDate },
