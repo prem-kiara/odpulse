@@ -22,3 +22,139 @@ input.no-spinner {
   -moz-appearance: textfield;
   appearance: textfield;
 }
+
+/* ─── Stable, scrollable data tables ──────────────────────────────────────
+   Apply class `stable-table` to <table>; wrap it in a div with class
+   `stable-table-wrap` to enable both vertical scroll within the table area
+   and sticky-on-scroll headers.
+
+   Why this is needed: without `table-layout: fixed`, browsers re-flow column
+   widths every time row content changes (e.g. a long customer name pushes
+   the "Paid Amount" column further right than the row above it). This is
+   what's been making the Paid Amount column visibly wobble when scrolling.
+
+   Usage:
+     <div class="stable-table-wrap">
+       <table class="stable-table">
+         <colgroup>                  <!-- optional but recommended: -->
+           <col style="width:160px"> <!--   explicit widths per column -->
+           <col style="width:120px">
+           ...
+         </colgroup>
+         <thead><tr>...</tr></thead>
+         <tbody>...</tbody>
+       </table>
+     </div>
+*/
+.stable-table-wrap {
+  position: relative;
+  overflow: auto;
+  /* Default max height for big tables — components can override via inline
+     style or a Tailwind class. Without a bounded height, sticky headers
+     have nothing to be sticky relative to. */
+  max-height: 70vh;
+  /* Performance hint to the browser: this region scrolls independently. */
+  will-change: transform;
+}
+table.stable-table {
+  /* Critical: locks each column to the width declared in <colgroup> or the
+     header cell, so row content can't push columns around. */
+  table-layout: fixed;
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+}
+table.stable-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: #f9fafb; /* match Tailwind's bg-gray-50 used by current tables */
+  /* Re-draw the bottom border on the sticky header so it doesn't get clipped
+     when rows scroll under it. */
+  box-shadow: inset 0 -1px 0 #e5e7eb;
+}
+table.stable-table th,
+table.stable-table td {
+  /* Single-line by default; rows that need wrapping (e.g. customer name)
+     can opt in with class `wrap-cell`. */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+}
+table.stable-table td.wrap-cell,
+table.stable-table th.wrap-cell {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+}
+/* Right-align numeric columns consistently. */
+table.stable-table th.num,
+table.stable-table td.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ─── Smart filter toolbar styles ─────────────────────────────────────────
+   Used by SmartFilterToolbar.jsx. Keeps the toolbar visually consistent
+   across every table that adopts it. */
+.smart-filter-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+  padding: 0.75rem;
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+.smart-filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.25rem 0.625rem;
+  background: #ecfeff;       /* cyan-50 — subtle */
+  color: #155e75;            /* cyan-800 */
+  border: 1px solid #a5f3fc; /* cyan-200 */
+  border-radius: 9999px;
+  font-size: 0.75rem;
+  line-height: 1rem;
+}
+.smart-filter-chip button {
+  background: transparent;
+  border: 0;
+  padding: 0 0 0 0.25rem;
+  color: inherit;
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 0.9rem;
+  line-height: 1;
+}
+.smart-filter-chip button:hover { color: #0e7490; }
+
+.smart-filter-panel {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(420px, 100%);
+  background: #fff;
+  box-shadow: -10px 0 25px -10px rgba(0,0,0,0.15);
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  transform: translateX(100%);
+  transition: transform 200ms ease-out;
+}
+.smart-filter-panel.open { transform: translateX(0); }
+.smart-filter-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.25);
+  z-index: 49;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 200ms ease-out;
+}
+.smart-filter-overlay.open { opacity: 1; pointer-events: auto; }

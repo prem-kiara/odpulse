@@ -1547,9 +1547,29 @@ export default function ReportsAnalytics({ user }) {
           </div>
         }
       >
-        <div className="overflow-x-auto rounded-lg border">
-          <table className="w-full text-xs">
-            <thead className="bg-gray-50">
+        {/* stable-table-wrap + table-layout:fixed prevents the Paid Amount /
+            Foreclosure Amount columns from wobbling as rows scroll. The
+            <colgroup> below pins each column to a fixed width regardless
+            of cell content. Sticky thead via the .stable-table CSS class. */}
+        <div className="stable-table-wrap rounded-lg border" style={{ maxHeight: "65vh" }}>
+          <table className="stable-table text-xs">
+            <colgroup>
+              <col style={{ width: "100px" }} /> {/* Date */}
+              <col style={{ width: "160px" }} /> {/* Customer */}
+              <col style={{ width: "120px" }} /> {/* Loan A/C */}
+              <col style={{ width: "140px" }} /> {/* Branch */}
+              <col style={{ width: "140px" }} /> {/* Product */}
+              <col style={{ width: "110px" }} /> {/* Category */}
+              <col style={{ width: "110px" }} /> {/* Amount */}
+              <col style={{ width: "120px" }} /> {/* Principal Out. */}
+              <col style={{ width: "120px" }} /> {/* Interest Out. */}
+              <col style={{ width: "140px" }} /> {/* Foreclosure Amount */}
+              <col style={{ width: "110px" }} /> {/* Overdue */}
+              <col style={{ width: "80px" }} />  {/* DPD Days */}
+              <col style={{ width: "90px" }} />  {/* DPD Class */}
+              <col style={{ width: "90px" }} />  {/* Status */}
+            </colgroup>
+            <thead>
               <tr>
                 <SortHeader sortKey="disbursement_date_iso" currentKey={sortKey} currentDir={sortDir} onSort={handleSort}>Date</SortHeader>
                 <SortHeader sortKey="customer_name" currentKey={sortKey} currentDir={sortDir} onSort={handleSort}>Customer</SortHeader>
