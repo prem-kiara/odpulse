@@ -820,7 +820,11 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
       const allUsers = loadData(STORAGE_KEYS.users, []);
       const recipientIds = new Set();
       recipientIds.add(entry.enteredBy);
-      allUsers.filter(u => u.role === "admin" || u.role === "elevated_staff").forEach(u => recipientIds.add(u.id));
+      // Business rule: PTP notifications go to the recorder (added above) +
+      // Administrators only. MIS staff (elevated_staff) and other roles are
+      // intentionally NOT included as recipients — keeps the notification
+      // panel focused for the people who actually act on PTPs.
+      allUsers.filter(u => u.role === "admin").forEach(u => recipientIds.add(u.id));
 
       const ptpNotifs = [...recipientIds].map(userId => ({
         id: generateId(),
@@ -1881,7 +1885,11 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
       const allUsers = loadData(STORAGE_KEYS.users, []);
       const recipientIds = new Set();
       recipientIds.add(entry.enteredBy);
-      allUsers.filter(u => u.role === "admin" || u.role === "elevated_staff").forEach(u => recipientIds.add(u.id));
+      // Business rule: PTP notifications go to the recorder (added above) +
+      // Administrators only. MIS staff (elevated_staff) and other roles are
+      // intentionally NOT included as recipients — keeps the notification
+      // panel focused for the people who actually act on PTPs.
+      allUsers.filter(u => u.role === "admin").forEach(u => recipientIds.add(u.id));
       const ptpNotifs = [...recipientIds].map(userId => ({
         id: generateId(),
         type: "ptp_pending",
@@ -2449,13 +2457,15 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
     // Clear persistent PTP notifications for this entry
     const updatedNotifs = notifications.filter(n => !(n.entryId === ptpPaymentEntry.id && n.type === "ptp_pending"));
 
-    // Collect unique recipient IDs (entry creator + admins/elevated, no duplicates)
+    // Collect unique recipient IDs. Business rule: PTP notifications go to
+    // the recorder (handled below) + Administrators only. MIS staff
+    // (elevated_staff) and other roles are intentionally NOT notified.
     const allUsers = loadData(STORAGE_KEYS.users, []);
     const recipientIds = new Set();
     // Always notify the original entry creator
     recipientIds.add(ptpPaymentEntry.enteredBy);
-    // Notify all admins and elevated staff
-    allUsers.filter(u => u.role === "admin" || u.role === "elevated_staff").forEach(u => recipientIds.add(u.id));
+    // Notify Administrators (role === "admin") only.
+    allUsers.filter(u => u.role === "admin").forEach(u => recipientIds.add(u.id));
 
     const paidNotifs = [...recipientIds].map(userId => ({
       id: generateId(),
@@ -3004,79 +3014,110 @@ function NotificationsPage({ user, users, notifications, setNotifications }) {
   };
 
   // ── Centralized export ──────────────────────────────────────────────────
-  // Builds a single CSV of all notifications matching the user's chosen
-  // filters. Replaces the per-card download buttons that cluttered the UI.
-  const matchesExportFilters = (n) => {
-    const e = n.entryId ? entryById.get(n.entryId) : null;
-    if (expType && (n.type || "") !== expType) return false;
-    const isoDate = (n.date || "").slice(0, 10);
-    if (expFrom && isoDate && isoDate < expFrom) return false;
-    if (expTo && isoDate && isoDate > expTo) return false;
-    if (expBranches.length > 0) {
-      const b = String(e?.branch || "");
-      if (!expBranches.includes(b)) return false;
-    }
-    if (expStaff && (e?.enteredBy || "") !== expStaff) return false;
-    return true;
-  };
-  // Build the export list independently of the on-screen "visibleNotifs":
-  //   1. Start from ALL notifications (not just what the current user sees),
-  //      so PTP Pending notifications sent only to admins are included even
-  //      for non-admin users running the export.
-  //   2. Apply the user's export filters (type / date / branch / staff).
-  //   3. De-dupe by entryId — when one PTP event has been broadcast to
-  //      multiple recipients (Administrator + Dinesh + entry creator), only
-  //      ONE row should appear in the report. We collapse them into a single
-  //      record and keep a comma-separated "Recipients" string for the row.
-  //   4. When the same loan has BOTH a "PTP Pending" notification and a
-  //      "PTP Payment Received" notification (different types, same entry),
-  //      keep both as separate rows — those are genuinely different events.
+  // Builds a single CSV of every PTP event matching the user's chosen filters.
+  //
+  // IMPORTANT: This walks the `entries` array — NOT the `notifications` array.
+  // Why? Notifications are only generated when the notification feature is
+  // running (cron / save handler). Any entry created before the feature went
+  // live, or saved while the device was offline, would be MISSING from a
+  // notifications-based export. The entries array is the source of truth for
+  // every PTP that has ever been recorded in OD Pulse.
+  //
+  // Each entry with PTP data produces ONE row (no duplicates per recipient).
+  // The notification recipients (admins + the recorder) are still listed in
+  // a dedicated column so the report shows who was notified, but they no
+  // longer multiply the row count.
+
+  // Classify an entry's PTP state into a stable type string used both by the
+  // Type filter dropdown and by the export's "Notification Type" column.
+  const classifyPtp = useCallback((e) => {
+    if (!e) return null;
+    if (!e.ptpDate && !e.ptpStatus) return null; // entry has no PTP info → skip
+    if (e.ptpStatus === "paid") return "ptp_paid";
+    const today = nowDate();
+    const tmr = (() => {
+      const d = new Date(); d.setDate(d.getDate() + 1);
+      return d.toISOString().slice(0, 10);
+    })();
+    if (e.ptpDate === today)    return "ptp_due_today";
+    if (e.ptpDate === tmr)      return "ptp_due_tomorrow";
+    if (e.ptpDate && e.ptpDate < today) return "ptp_overdue";
+    return "ptp_pending"; // future ptpDate or pending status with no date
+  }, []);
+
   const matchingForExport = useMemo(() => {
-    const filtered = notifications.filter((n) => n && matchesExportFilters(n));
-    // Group by (type|entryId) — same type + same entry = same event, even
-    // across recipients. If entryId is null/empty, fall back to the
-    // notification's own id so we don't merge unrelated cards.
-    const groups = new Map();
-    for (const n of filtered) {
-      const key = (n.type || "x") + "|" + (n.entryId || n.id || "");
-      if (!groups.has(key)) {
-        groups.set(key, { notif: n, recipients: new Set(), dates: [] });
-      }
-      const g = groups.get(key);
-      // Keep the most-recent notification as the canonical one (its date,
-      // read state, etc.). Carry every distinct recipient into the chip.
-      if (new Date(n.date) > new Date(g.notif.date)) g.notif = n;
-      if (n.forUserId) g.recipients.add(n.forUserId);
-      g.dates.push(n.date);
+    // Build: entryId -> Set of recipient userIds (deduped across all
+    // notifications for that entry). This lets the export show "who got
+    // notified" without inflating row count.
+    const recipientsByEntry = new Map();
+    for (const n of notifications) {
+      if (!n || !n.entryId || !n.forUserId) continue;
+      if (!recipientsByEntry.has(n.entryId)) recipientsByEntry.set(n.entryId, new Set());
+      recipientsByEntry.get(n.entryId).add(n.forUserId);
     }
-    return Array.from(groups.values()).map(g => ({
-      ...g.notif,
-      _recipientIds: Array.from(g.recipients), // string[]; consumed by handleExport
-    })).sort((a, b) => new Date(b.date) - new Date(a.date));
-  }, [notifications, expType, expFrom, expTo, expBranches, expStaff, entryById]);
+    const rows = [];
+    for (const e of allEntries) {
+      const type = classifyPtp(e);
+      if (!type) continue; // not a PTP entry
+      // Apply user-selected filters.
+      if (expType && type !== expType) continue;
+      // For type=pending, also accept overdue/due_today/due_tomorrow as a
+      // user-friendly behavior — "All Pending" should mean every unpaid PTP.
+      // (Not auto-merged when the user explicitly picks one of the sub-types.)
+      // Date filter uses the PTP date if available, else the collection date.
+      const filterDate = (e.ptpDate || e.date || "").slice(0, 10);
+      if (expFrom && filterDate && filterDate < expFrom) continue;
+      if (expTo && filterDate && filterDate > expTo) continue;
+      if (expBranches.length > 0 && !expBranches.includes(String(e.branch || ""))) continue;
+      if (expStaff && (e.enteredBy || "") !== expStaff) continue;
+      const recIds = Array.from(recipientsByEntry.get(e.id) || []);
+      rows.push({
+        _type: type,
+        _entry: e,
+        _recipientIds: recIds,
+      });
+    }
+    // Sort: most recent PTP date first (overdues bubble up naturally since
+    // their dates are in the past but their entry date is recent — we use
+    // ptpDate when present, falling back to entry.date).
+    rows.sort((a, b) => {
+      const aD = (a._entry.ptpDate || a._entry.date || "");
+      const bD = (b._entry.ptpDate || b._entry.date || "");
+      return bD.localeCompare(aD);
+    });
+    return rows;
+  }, [allEntries, notifications, expType, expFrom, expTo, expBranches, expStaff, classifyPtp]);
 
   const handleExport = () => {
-    console.log("[Export] Download CSV clicked. Matching PTP events (deduped):", matchingForExport.length);
+    console.log("[Export] Download CSV clicked. PTP entries matching filters:", matchingForExport.length);
     if (matchingForExport.length === 0) {
-      alert("No PTP notifications match the selected filters. Adjust filters above (Type / Date / Branch / Staff) and try again.");
+      alert("No PTP records match the selected filters. Adjust filters above (Type / Date / Branch / Staff) and try again.");
       return;
     }
     try {
     const typeLabel = (t) =>
-      t === "ptp_pending" ? "PTP Pending" :
-      t === "ptp_paid"    ? "PTP Payment Received" :
-      t === "ptp_reminder" ? "PTP Reminder" : (t || "Notification");
-    // Single "Recipients" column instead of one row per recipient — keeps
-    // the report clean while still recording who was notified.
+      t === "ptp_pending"      ? "PTP Pending" :
+      t === "ptp_paid"         ? "PTP Payment Received" :
+      t === "ptp_reminder"     ? "PTP Reminder Sent" :
+      t === "ptp_due_today"    ? "PTP Due Today" :
+      t === "ptp_due_tomorrow" ? "PTP Due Tomorrow" :
+      t === "ptp_overdue"      ? "PTP Overdue" : (t || "Notification");
+    // Column order is intentional — three clearly-labelled "people" columns
+    // so the report distinguishes:
+    //   • Recorded By (Name/EmpID) — the staff member who entered the PTP
+    //   • Notification Recipients   — who was notified (recorder + admins)
+    //   • Customer Name / ID        — the borrower the PTP is for
+    // These were conflated previously and caused "multiple rows per event".
     const rows = [[
-      "Notification Type", "Notification Date", "Notification Time", "Recipients",
-      "Customer Name", "Customer ID", "Loan Account No.", "Branch", "OD Type",
-      "PTP Date", "PTP Time",
+      "PTP Type",
+      "PTP Date", "PTP Time", "PTP Status",
+      "Customer Name", "Customer ID", "Loan Account No.",
+      "Branch", "OD Type",
       "Amount Due", "Amount Paid", "Payment Mode", "Payment Reference",
       "Recorded By (Name)", "Recorded By (Employee ID)",
       "Recorded On (Date)", "Recorded On (Time)",
       "PTP Paid On",
-      "Message",
+      "Notification Recipients",
     ]];
     const formatRecipientList = (ids) => {
       if (!Array.isArray(ids) || ids.length === 0) return "";
@@ -3086,39 +3127,30 @@ function NotificationsPage({ user, users, notifications, setNotifications }) {
       });
       return labels.join("; ");
     };
-    for (const n of matchingForExport) {
-      const e = n.entryId ? entryById.get(n.entryId) : null;
-      const staff = e ? (users.find(u => u.id === e.enteredBy) || null) : null;
-      const dateP = (n.date || "").split("T");
-      // _recipientIds is the deduped set built by matchingForExport. Older
-      // notifications without the field fall back to just forUserId.
-      const recipientList = formatRecipientList(
-        Array.isArray(n._recipientIds) && n._recipientIds.length > 0
-          ? n._recipientIds
-          : (n.forUserId ? [n.forUserId] : [])
-      );
+    for (const r of matchingForExport) {
+      const e = r._entry;
+      const staff = users.find(u => u.id === e.enteredBy) || null;
+      const recipientList = formatRecipientList(r._recipientIds);
       rows.push([
-        typeLabel(n.type),
-        dateP[0] ? formatDateDMY(dateP[0]) : "",
-        dateP[1]?.slice(0, 5) || "",
+        typeLabel(r._type),
+        e.ptpDate ? formatDateDMY(e.ptpDate) : "",
+        e.ptpTime || "",
+        e.ptpStatus || "",
+        e.customerName || "",
+        e.customerId || "",
+        e.loanAccountNo || "",
+        e.branch || "",
+        e.odType || "",
+        e.amountDue ?? e.groupOdAmount ?? "",
+        e.totalPaidAmount ?? e.paidAmount ?? e.groupOdPaidAmount ?? "",
+        e.paymentMode || e.ptpPaymentMode || "",
+        e.upiReference || e.transactionId || e.ptpPaymentRef || "",
+        staff ? staff.name : (e.enteredByName || ""),
+        staff ? (staff.username || staff.id) : (e.enteredBy || ""),
+        e.date ? formatDateDMY(e.date) : "",
+        e.time || "",
+        e.ptpPaidDate ? formatDateDMY(e.ptpPaidDate) : "",
         recipientList,
-        e?.customerName || "",
-        e?.customerId || "",
-        e?.loanAccountNo || "",
-        e?.branch || "",
-        e?.odType || "",
-        e?.ptpDate ? formatDateDMY(e.ptpDate) : "",
-        e?.ptpTime || "",
-        e ? (e.amountDue ?? e.groupOdAmount ?? "") : "",
-        e ? (e.totalPaidAmount ?? e.paidAmount ?? e.groupOdPaidAmount ?? "") : "",
-        e?.paymentMode || e?.ptpPaymentMode || "",
-        e?.upiReference || e?.transactionId || e?.ptpPaymentRef || "",
-        staff ? staff.name : (e?.enteredByName || ""),
-        staff ? (staff.username || staff.id) : (e?.enteredBy || ""),
-        e?.date ? formatDateDMY(e.date) : "",
-        e?.time || "",
-        e?.ptpPaidDate ? formatDateDMY(e.ptpPaidDate) : "",
-        n.message || "",
       ]);
     }
     const q = (v) => '"' + String(v ?? "").replace(/"/g, '""') + '"';
@@ -3182,10 +3214,12 @@ function NotificationsPage({ user, users, notifications, setNotifications }) {
             <div>
               <label className="block text-[10px] font-semibold text-gray-600 uppercase mb-1">Type</label>
               <select value={expType} onChange={e => setExpType(e.target.value)} className="w-full px-2 py-1.5 border rounded text-xs bg-white">
-                <option value="">All Notifications</option>
-                <option value="ptp_pending">PTP Pending (Records)</option>
-                <option value="ptp_paid">Payment Received</option>
-                <option value="ptp_reminder">Reminders</option>
+                <option value="">All PTP Records</option>
+                <option value="ptp_pending">PTP Pending</option>
+                <option value="ptp_overdue">PTP Overdue</option>
+                <option value="ptp_due_today">PTP Due Today</option>
+                <option value="ptp_due_tomorrow">PTP Due Tomorrow</option>
+                <option value="ptp_paid">PTP Payment Received</option>
               </select>
             </div>
             <div>
@@ -3283,7 +3317,7 @@ function NotificationsPage({ user, users, notifications, setNotifications }) {
           </div>
           <div className="flex items-center justify-between mt-3 pt-3 border-t border-teal-200">
             <p className="text-xs text-teal-800">
-              <span className="font-semibold">{matchingForExport.length}</span> unique PTP event{matchingForExport.length === 1 ? "" : "s"} match the current filters (deduped across recipients)
+              <span className="font-semibold">{matchingForExport.length}</span> PTP record{matchingForExport.length === 1 ? "" : "s"} match the current filters (one row per entry — recipients listed in the Recipients column)
             </p>
             <button onClick={handleExport}
               disabled={matchingForExport.length === 0}
