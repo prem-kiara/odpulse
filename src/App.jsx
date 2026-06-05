@@ -3019,22 +3019,57 @@ function NotificationsPage({ user, users, notifications, setNotifications }) {
     if (expStaff && (e?.enteredBy || "") !== expStaff) return false;
     return true;
   };
-  const matchingForExport = useMemo(
-    () => visibleNotifs.filter(matchesExportFilters),
-    [visibleNotifs, expType, expFrom, expTo, expBranches, expStaff, entryById]
-  );
+  // Build the export list independently of the on-screen "visibleNotifs":
+  //   1. Start from ALL notifications (not just what the current user sees),
+  //      so PTP Pending notifications sent only to admins are included even
+  //      for non-admin users running the export.
+  //   2. Apply the user's export filters (type / date / branch / staff).
+  //   3. De-dupe by entryId — when one PTP event has been broadcast to
+  //      multiple recipients (Administrator + Dinesh + entry creator), only
+  //      ONE row should appear in the report. We collapse them into a single
+  //      record and keep a comma-separated "Recipients" string for the row.
+  //   4. When the same loan has BOTH a "PTP Pending" notification and a
+  //      "PTP Payment Received" notification (different types, same entry),
+  //      keep both as separate rows — those are genuinely different events.
+  const matchingForExport = useMemo(() => {
+    const filtered = notifications.filter((n) => n && matchesExportFilters(n));
+    // Group by (type|entryId) — same type + same entry = same event, even
+    // across recipients. If entryId is null/empty, fall back to the
+    // notification's own id so we don't merge unrelated cards.
+    const groups = new Map();
+    for (const n of filtered) {
+      const key = (n.type || "x") + "|" + (n.entryId || n.id || "");
+      if (!groups.has(key)) {
+        groups.set(key, { notif: n, recipients: new Set(), dates: [] });
+      }
+      const g = groups.get(key);
+      // Keep the most-recent notification as the canonical one (its date,
+      // read state, etc.). Carry every distinct recipient into the chip.
+      if (new Date(n.date) > new Date(g.notif.date)) g.notif = n;
+      if (n.forUserId) g.recipients.add(n.forUserId);
+      g.dates.push(n.date);
+    }
+    return Array.from(groups.values()).map(g => ({
+      ...g.notif,
+      _recipientIds: Array.from(g.recipients), // string[]; consumed by handleExport
+    })).sort((a, b) => new Date(b.date) - new Date(a.date));
+  }, [notifications, expType, expFrom, expTo, expBranches, expStaff, entryById]);
 
   const handleExport = () => {
+    console.log("[Export] Download CSV clicked. Matching PTP events (deduped):", matchingForExport.length);
     if (matchingForExport.length === 0) {
-      alert("No notifications match the selected filters.");
+      alert("No PTP notifications match the selected filters. Adjust filters above (Type / Date / Branch / Staff) and try again.");
       return;
     }
+    try {
     const typeLabel = (t) =>
       t === "ptp_pending" ? "PTP Pending" :
       t === "ptp_paid"    ? "PTP Payment Received" :
       t === "ptp_reminder" ? "PTP Reminder" : (t || "Notification");
+    // Single "Recipients" column instead of one row per recipient — keeps
+    // the report clean while still recording who was notified.
     const rows = [[
-      "Notification Type", "Notification Date", "Notification Time", "Recipient",
+      "Notification Type", "Notification Date", "Notification Time", "Recipients",
       "Customer Name", "Customer ID", "Loan Account No.", "Branch", "OD Type",
       "PTP Date", "PTP Time",
       "Amount Due", "Amount Paid", "Payment Mode", "Payment Reference",
@@ -3043,16 +3078,30 @@ function NotificationsPage({ user, users, notifications, setNotifications }) {
       "PTP Paid On",
       "Message",
     ]];
+    const formatRecipientList = (ids) => {
+      if (!Array.isArray(ids) || ids.length === 0) return "";
+      const labels = ids.map(id => {
+        const u = users.find(x => x.id === id);
+        return u ? (u.name + " (" + (u.username || u.id) + ")") : id;
+      });
+      return labels.join("; ");
+    };
     for (const n of matchingForExport) {
       const e = n.entryId ? entryById.get(n.entryId) : null;
       const staff = e ? (users.find(u => u.id === e.enteredBy) || null) : null;
-      const recipient = users.find(u => u.id === n.forUserId);
       const dateP = (n.date || "").split("T");
+      // _recipientIds is the deduped set built by matchingForExport. Older
+      // notifications without the field fall back to just forUserId.
+      const recipientList = formatRecipientList(
+        Array.isArray(n._recipientIds) && n._recipientIds.length > 0
+          ? n._recipientIds
+          : (n.forUserId ? [n.forUserId] : [])
+      );
       rows.push([
         typeLabel(n.type),
         dateP[0] ? formatDateDMY(dateP[0]) : "",
         dateP[1]?.slice(0, 5) || "",
-        recipient ? (recipient.name + " (" + (recipient.username || recipient.id) + ")") : (n.forUserId || ""),
+        recipientList,
         e?.customerName || "",
         e?.customerId || "",
         e?.loanAccountNo || "",
@@ -3074,14 +3123,26 @@ function NotificationsPage({ user, users, notifications, setNotifications }) {
     }
     const q = (v) => '"' + String(v ?? "").replace(/"/g, '""') + '"';
     const csv = rows.map(r => r.map(q).join(",")).join("\n");
-    const stamp = todayISO();
+    // nowDate() = local "today as YYYY-MM-DD" helper. Avoids the
+    // ReferenceError that previously came from todayISO() (not in scope).
+    const stamp = nowDate();
     const fname = "odpulse-notifications-" + stamp + ".csv";
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
-    a.href = url; a.download = fname;
-    document.body.appendChild(a); a.click(); document.body.removeChild(a);
-    URL.revokeObjectURL(url);
+    a.href = url;
+    a.download = fname;
+    a.rel = "noopener";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    console.log("[Export] Triggered download:", fname, "size:", blob.size, "bytes");
+    } catch (err) {
+      console.error("[Export] FAILED:", err);
+      alert("Could not generate the report:\n\n" + (err?.message || String(err)) +
+            "\n\nOpen browser DevTools (F12) -> Console for full details.");
+    }
   };
 
   const presetLast30Days = () => {
@@ -3222,7 +3283,7 @@ function NotificationsPage({ user, users, notifications, setNotifications }) {
           </div>
           <div className="flex items-center justify-between mt-3 pt-3 border-t border-teal-200">
             <p className="text-xs text-teal-800">
-              <span className="font-semibold">{matchingForExport.length}</span> notification{matchingForExport.length === 1 ? "" : "s"} match the current filters
+              <span className="font-semibold">{matchingForExport.length}</span> unique PTP event{matchingForExport.length === 1 ? "" : "s"} match the current filters (deduped across recipients)
             </p>
             <button onClick={handleExport}
               disabled={matchingForExport.length === 0}
