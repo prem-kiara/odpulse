@@ -2876,25 +2876,69 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
 // ─── Notifications Page ─────────────────────────────────────────────────────
 function NotificationsPage({ user, users, notifications, setNotifications }) {
   const [filterUser, setFilterUser] = useState("");
+  // Export-form state. Visible only when the "Export Notifications" toolbar
+  // is open. Defaults to "all types" within the last 30 days.
+  const [showExport, setShowExport] = useState(false);
+  const [expType, setExpType] = useState("");       // "" | "ptp_pending" | "ptp_paid" | "ptp_reminder"
+  const [expFrom, setExpFrom] = useState("");
+  const [expTo, setExpTo] = useState("");
+  // Multi-select branch (array). Empty = no branch filter.
+  const [expBranches, setExpBranches] = useState([]);
+  // Inline search box inside the branch dropdown.
+  const [branchSearch, setBranchSearch] = useState("");
+  const [expStaff, setExpStaff] = useState("");
+
+  // Load entries so the export + inline staff info can resolve full context.
+  const allEntries = useMemo(() => {
+    try { return JSON.parse(localStorage.getItem(STORAGE_KEYS.entries) || "[]"); }
+    catch { return []; }
+  }, [notifications]);
+  const entryById = useMemo(() => {
+    const m = new Map();
+    for (const e of allEntries) { if (e && e.id) m.set(e.id, e); }
+    return m;
+  }, [allEntries]);
+
+  // Branch + staff option lists for the export filters. Branches come from
+  // the entries themselves (every branch that has at least one PTP entry).
+  const exportBranchOptions = useMemo(() => {
+    const s = new Set();
+    for (const e of allEntries) { if (e?.branch) s.add(e.branch); }
+    return Array.from(s).sort();
+  }, [allEntries]);
+  const exportStaffOptions = useMemo(() => users.filter(u => u.role === "staff"), [users]);
 
   const isAdminOrElevated = user.role === "admin" || user.role === "elevated_staff";
+
+  // De-dupe by (type, entryId, forUserId) — same logic as before.
+  const dedupedAll = useMemo(() => {
+    const byKey = new Map();
+    for (const n of notifications) {
+      if (!n) continue;
+      const key = (n.type || "x") + "|" + (n.entryId || "") + "|" + (n.forUserId || "");
+      const existing = byKey.get(key);
+      if (!existing || new Date(n.date) > new Date(existing.date)) byKey.set(key, n);
+    }
+    return Array.from(byKey.values());
+  }, [notifications]);
+
   const visibleNotifs = isAdminOrElevated
-    ? filterUser ? notifications.filter(n => n.forUserId === filterUser).sort((a, b) => new Date(b.date) - new Date(a.date)) : notifications.sort((a, b) => new Date(b.date) - new Date(a.date))
-    : notifications.filter(n => n.forUserId === user.id).sort((a, b) => new Date(b.date) - new Date(a.date));
+    ? (filterUser ? dedupedAll.filter(n => n.forUserId === filterUser) : dedupedAll)
+        .sort((a, b) => new Date(b.date) - new Date(a.date))
+    : dedupedAll.filter(n => n.forUserId === user.id)
+        .sort((a, b) => new Date(b.date) - new Date(a.date));
 
   const unreadCount = visibleNotifs.filter(n => !n.read && n.type !== "ptp_pending").length;
-  const pendingPtpCount = visibleNotifs.filter(n => n.type === "ptp_pending").length;
 
   const handleMarkAsRead = (id) => {
     const notif = notifications.find(n => n.id === id);
-    if (notif && notif.type === "ptp_pending") return; // Cannot mark PTP pending as read
+    if (notif && notif.type === "ptp_pending") return;
     const updated = notifications.map(n => n.id === id ? { ...n, read: true } : n);
     setNotifications(updated);
     saveData(STORAGE_KEYS.notifications, updated);
   };
 
   const handleMarkAllAsRead = () => {
-    // Skip ptp_pending — those can only be cleared by recording payment
     const updated = notifications.map(n =>
       visibleNotifs.find(v => v.id === n.id) && n.type !== "ptp_pending" ? { ...n, read: true } : n
     );
@@ -2902,9 +2946,235 @@ function NotificationsPage({ user, users, notifications, setNotifications }) {
     saveData(STORAGE_KEYS.notifications, updated);
   };
 
+  // ── Centralized export ──────────────────────────────────────────────────
+  // Builds a single CSV of all notifications matching the user's chosen
+  // filters. Replaces the per-card download buttons that cluttered the UI.
+  const matchesExportFilters = (n) => {
+    const e = n.entryId ? entryById.get(n.entryId) : null;
+    if (expType && (n.type || "") !== expType) return false;
+    const isoDate = (n.date || "").slice(0, 10);
+    if (expFrom && isoDate && isoDate < expFrom) return false;
+    if (expTo && isoDate && isoDate > expTo) return false;
+    if (expBranches.length > 0) {
+      const b = String(e?.branch || "");
+      if (!expBranches.includes(b)) return false;
+    }
+    if (expStaff && (e?.enteredBy || "") !== expStaff) return false;
+    return true;
+  };
+  const matchingForExport = useMemo(
+    () => visibleNotifs.filter(matchesExportFilters),
+    [visibleNotifs, expType, expFrom, expTo, expBranches, expStaff, entryById]
+  );
+
+  const handleExport = () => {
+    if (matchingForExport.length === 0) {
+      alert("No notifications match the selected filters.");
+      return;
+    }
+    const typeLabel = (t) =>
+      t === "ptp_pending" ? "PTP Pending" :
+      t === "ptp_paid"    ? "PTP Payment Received" :
+      t === "ptp_reminder" ? "PTP Reminder" : (t || "Notification");
+    const rows = [[
+      "Notification Type", "Notification Date", "Notification Time", "Recipient",
+      "Customer Name", "Customer ID", "Loan Account No.", "Branch", "OD Type",
+      "PTP Date", "PTP Time",
+      "Amount Due", "Amount Paid", "Payment Mode", "Payment Reference",
+      "Recorded By (Name)", "Recorded By (Employee ID)",
+      "Recorded On (Date)", "Recorded On (Time)",
+      "PTP Paid On",
+      "Message",
+    ]];
+    for (const n of matchingForExport) {
+      const e = n.entryId ? entryById.get(n.entryId) : null;
+      const staff = e ? (users.find(u => u.id === e.enteredBy) || null) : null;
+      const recipient = users.find(u => u.id === n.forUserId);
+      const dateP = (n.date || "").split("T");
+      rows.push([
+        typeLabel(n.type),
+        dateP[0] ? formatDateDMY(dateP[0]) : "",
+        dateP[1]?.slice(0, 5) || "",
+        recipient ? (recipient.name + " (" + (recipient.username || recipient.id) + ")") : (n.forUserId || ""),
+        e?.customerName || "",
+        e?.customerId || "",
+        e?.loanAccountNo || "",
+        e?.branch || "",
+        e?.odType || "",
+        e?.ptpDate ? formatDateDMY(e.ptpDate) : "",
+        e?.ptpTime || "",
+        e ? (e.amountDue ?? e.groupOdAmount ?? "") : "",
+        e ? (e.totalPaidAmount ?? e.paidAmount ?? e.groupOdPaidAmount ?? "") : "",
+        e?.paymentMode || e?.ptpPaymentMode || "",
+        e?.upiReference || e?.transactionId || e?.ptpPaymentRef || "",
+        staff ? staff.name : (e?.enteredByName || ""),
+        staff ? (staff.username || staff.id) : (e?.enteredBy || ""),
+        e?.date ? formatDateDMY(e.date) : "",
+        e?.time || "",
+        e?.ptpPaidDate ? formatDateDMY(e.ptpPaidDate) : "",
+        n.message || "",
+      ]);
+    }
+    const q = (v) => '"' + String(v ?? "").replace(/"/g, '""') + '"';
+    const csv = rows.map(r => r.map(q).join(",")).join("\n");
+    const stamp = todayISO();
+    const fname = "odpulse-notifications-" + stamp + ".csv";
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = fname;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
+  const presetLast30Days = () => {
+    const to = new Date();
+    const from = new Date(); from.setDate(from.getDate() - 30);
+    const iso = (d) => d.toISOString().slice(0, 10);
+    setExpFrom(iso(from)); setExpTo(iso(to));
+  };
+  const resetExportFilters = () => {
+    setExpType(""); setExpFrom(""); setExpTo(""); setExpBranches([]); setBranchSearch(""); setExpStaff("");
+  };
+
   return (
     <div>
-      <h2 className="text-xl font-bold text-gray-900 mb-6 flex items-center gap-2"><Bell size={22} className="text-teal-600" /> Notifications</h2>
+      <div className="flex items-center justify-between mb-6 flex-wrap gap-2">
+        <h2 className="text-xl font-bold text-gray-900 flex items-center gap-2"><Bell size={22} className="text-teal-600" /> Notifications</h2>
+        <div className="flex items-center gap-2">
+          <button onClick={() => setShowExport(s => !s)}
+            className={`inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg border transition-colors ${showExport ? "bg-teal-600 text-white border-teal-600" : "bg-white text-teal-700 border-teal-300 hover:bg-teal-50"}`}>
+            <Download size={12} />
+            {showExport ? "Hide Export Filters" : "Export Notifications"}
+          </button>
+        </div>
+      </div>
+
+      {/* Centralized export toolbar — visible when the user opens it. */}
+      {showExport && (
+        <div className="mb-6 bg-teal-50 border border-teal-200 rounded-xl p-4">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm font-semibold text-teal-800">Export Notifications</h3>
+            <div className="flex gap-2">
+              <button onClick={presetLast30Days} className="text-[11px] text-teal-700 hover:text-teal-900 underline">Last 30 days</button>
+              <button onClick={resetExportFilters} className="text-[11px] text-gray-600 hover:text-red-600 underline">Reset</button>
+            </div>
+          </div>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
+            <div>
+              <label className="block text-[10px] font-semibold text-gray-600 uppercase mb-1">Type</label>
+              <select value={expType} onChange={e => setExpType(e.target.value)} className="w-full px-2 py-1.5 border rounded text-xs bg-white">
+                <option value="">All Notifications</option>
+                <option value="ptp_pending">PTP Pending (Records)</option>
+                <option value="ptp_paid">Payment Received</option>
+                <option value="ptp_reminder">Reminders</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-[10px] font-semibold text-gray-600 uppercase mb-1">Date From</label>
+              <input type="date" value={expFrom} onChange={e => setExpFrom(e.target.value)} className="w-full px-2 py-1.5 border rounded text-xs bg-white" />
+            </div>
+            <div>
+              <label className="block text-[10px] font-semibold text-gray-600 uppercase mb-1">Date To</label>
+              <input type="date" value={expTo} onChange={e => setExpTo(e.target.value)} className="w-full px-2 py-1.5 border rounded text-xs bg-white" />
+            </div>
+            <div>
+              <label className="block text-[10px] font-semibold text-gray-600 uppercase mb-1">
+                Branch{expBranches.length > 0 ? ` (${expBranches.length})` : ""}
+              </label>
+              {/* Multi-select dropdown: search + Select All + checkbox list +
+                  removable chips below. Closing the <details> doesn't lose
+                  state — selections are reactive. */}
+              <details className="relative">
+                <summary className="w-full px-2 py-1.5 border rounded text-xs bg-white cursor-pointer list-none flex items-center justify-between">
+                  <span className="truncate text-gray-700">
+                    {expBranches.length === 0 ? "All Branches" :
+                     expBranches.length === 1 ? expBranches[0] :
+                     `${expBranches.length} branches selected`}
+                  </span>
+                  <ChevronDown size={12} className="text-gray-400 ml-1 shrink-0" />
+                </summary>
+                <div className="absolute z-30 mt-1 left-0 right-0 min-w-[220px] bg-white border border-gray-200 rounded-lg shadow-lg p-2">
+                  <div className="flex gap-1 mb-2">
+                    <button type="button"
+                      onClick={() => setExpBranches([...exportBranchOptions])}
+                      className="flex-1 text-[10px] px-2 py-1 bg-teal-50 text-teal-700 rounded hover:bg-teal-100">
+                      Select All
+                    </button>
+                    <button type="button"
+                      onClick={() => setExpBranches([])}
+                      disabled={expBranches.length === 0}
+                      className={`flex-1 text-[10px] px-2 py-1 rounded ${expBranches.length === 0 ? "bg-gray-100 text-gray-400 cursor-not-allowed" : "bg-gray-100 text-gray-700 hover:bg-gray-200"}`}>
+                      Clear
+                    </button>
+                  </div>
+                  <div className="relative mb-2">
+                    <Search size={10} className="absolute left-2 top-1/2 -translate-y-1/2 text-gray-400" />
+                    <input type="text" value={branchSearch}
+                      onChange={e => setBranchSearch(e.target.value)}
+                      placeholder="Search branches…"
+                      className="w-full pl-6 pr-2 py-1 border rounded text-[11px] focus:ring-1 focus:ring-teal-500" />
+                  </div>
+                  <div className="max-h-44 overflow-y-auto border border-gray-100 rounded">
+                    {exportBranchOptions
+                      .filter(b => !branchSearch.trim() || b.toLowerCase().includes(branchSearch.trim().toLowerCase()))
+                      .map(b => {
+                        const checked = expBranches.includes(b);
+                        return (
+                          <label key={b} className="flex items-center gap-1.5 text-xs cursor-pointer hover:bg-gray-50 px-2 py-1">
+                            <input type="checkbox" checked={checked}
+                              onChange={(ev) => {
+                                const will = ev.target.checked;
+                                setExpBranches(prev => will
+                                  ? (prev.includes(b) ? prev : [...prev, b])
+                                  : prev.filter(x => x !== b));
+                              }}
+                              className="rounded text-teal-600 focus:ring-teal-500" />
+                            <span className="text-gray-700 truncate" title={b}>{b}</span>
+                          </label>
+                        );
+                      })}
+                    {exportBranchOptions.length === 0 && (
+                      <div className="text-[11px] text-gray-400 px-2 py-2 text-center">No branches</div>
+                    )}
+                  </div>
+                </div>
+              </details>
+              {/* Selected chips — visible OUTSIDE the dropdown so users can
+                  see + remove selections without re-opening it. */}
+              {expBranches.length > 0 && (
+                <div className="flex flex-wrap gap-1 mt-1">
+                  {expBranches.map(b => (
+                    <span key={b} className="inline-flex items-center gap-0.5 px-1.5 py-0.5 bg-teal-50 text-teal-700 border border-teal-200 rounded text-[10px]">
+                      {b}
+                      <button type="button"
+                        onClick={() => setExpBranches(prev => prev.filter(x => x !== b))}
+                        className="ml-0.5 hover:text-teal-900" aria-label={`Remove ${b}`}>×</button>
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div>
+              <label className="block text-[10px] font-semibold text-gray-600 uppercase mb-1">Staff Member</label>
+              <select value={expStaff} onChange={e => setExpStaff(e.target.value)} className="w-full px-2 py-1.5 border rounded text-xs bg-white">
+                <option value="">All Staff</option>
+                {exportStaffOptions.map(u => <option key={u.id} value={u.id}>{u.name}</option>)}
+              </select>
+            </div>
+          </div>
+          <div className="flex items-center justify-between mt-3 pt-3 border-t border-teal-200">
+            <p className="text-xs text-teal-800">
+              <span className="font-semibold">{matchingForExport.length}</span> notification{matchingForExport.length === 1 ? "" : "s"} match the current filters
+            </p>
+            <button onClick={handleExport}
+              disabled={matchingForExport.length === 0}
+              className={`inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold rounded-lg ${matchingForExport.length === 0 ? "bg-gray-300 text-gray-500 cursor-not-allowed" : "bg-teal-600 text-white hover:bg-teal-700"}`}>
+              <Download size={12} /> Download CSV
+            </button>
+          </div>
+        </div>
+      )}
 
       {isAdminOrElevated && (
         <div className="mb-4 flex gap-2">
@@ -2928,30 +3198,44 @@ function NotificationsPage({ user, users, notifications, setNotifications }) {
       ) : (() => {
         const unreadNotifs = visibleNotifs.filter(n => !n.read || n.type === "ptp_pending");
         const readNotifs = visibleNotifs.filter(n => n.read && n.type !== "ptp_pending");
-        const renderNotif = (n) => (
-          <div key={n.id} className={`bg-white rounded-lg border p-4 transition-colors ${
-            n.type === "ptp_pending" ? "bg-orange-50 border-orange-200" :
-            n.type === "ptp_paid" ? "bg-green-50 border-green-200" :
-            n.read ? "bg-gray-50 border-gray-200" : "bg-blue-50 border-blue-200"
-          }`}>
-            <div className="flex items-start justify-between">
-              <div className="flex-1">
-                <div className="flex items-center gap-2 mb-1">
-                  {n.type === "ptp_pending" && <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-orange-200 text-orange-800 rounded-full text-xs font-medium"><Clock size={10} /> PTP Pending</span>}
-                  {n.type === "ptp_paid" && <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-green-200 text-green-800 rounded-full text-xs font-medium"><CheckCircle size={10} /> Payment Received</span>}
-                  {n.type === "ptp_reminder" && <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-blue-200 text-blue-800 rounded-full text-xs font-medium"><Bell size={10} /> Reminder</span>}
+        const renderNotif = (n) => {
+          const e = n.entryId ? entryById.get(n.entryId) : null;
+          const staff = e ? (users.find(u => u.id === e.enteredBy) || null) : null;
+          const isPtp = n.type === "ptp_pending" || n.type === "ptp_paid" || n.type === "ptp_reminder";
+          return (
+            <div key={n.id} className={`bg-white rounded-lg border p-4 transition-colors ${
+              n.type === "ptp_pending" ? "bg-orange-50 border-orange-200" :
+              n.type === "ptp_paid" ? "bg-green-50 border-green-200" :
+              n.read ? "bg-gray-50 border-gray-200" : "bg-blue-50 border-blue-200"
+            }`}>
+              <div className="flex items-start justify-between gap-2">
+                <div className="flex-1">
+                  <div className="flex items-center gap-2 mb-1">
+                    {n.type === "ptp_pending" && <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-orange-200 text-orange-800 rounded-full text-xs font-medium"><Clock size={10} /> PTP Pending</span>}
+                    {n.type === "ptp_paid" && <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-green-200 text-green-800 rounded-full text-xs font-medium"><CheckCircle size={10} /> Payment Received</span>}
+                    {n.type === "ptp_reminder" && <span className="inline-flex items-center gap-1 px-2 py-0.5 bg-blue-200 text-blue-800 rounded-full text-xs font-medium"><Bell size={10} /> Reminder</span>}
+                  </div>
+                  <p className={`text-sm ${n.read && n.type !== "ptp_pending" ? "text-gray-500" : "text-gray-800 font-medium"}`}>{n.message}</p>
+                  {isPtp && e && (
+                    <div className="mt-2 text-[11px] text-gray-600 flex flex-wrap gap-x-3 gap-y-0.5">
+                      <span><span className="text-gray-400">Recorded by:</span> <span className="font-medium">{staff?.name || e.enteredByName || "—"}</span>{(staff?.username || staff?.id || e.enteredBy) && <span className="text-gray-400"> (ID: {staff?.username || staff?.id || e.enteredBy})</span>}</span>
+                      <span><span className="text-gray-400">On:</span> <span className="font-medium">{formatDateDMY(e.date)} {e.time || ""}</span></span>
+                      {e.ptpPaidDate && (
+                        <span><span className="text-gray-400">Paid:</span> <span className="font-medium">{formatDateDMY(e.ptpPaidDate)}</span></span>
+                      )}
+                    </div>
+                  )}
+                  <p className="text-xs text-gray-400 mt-1">Notified: {formatDateDMY(n.date.split("T")[0])} {n.date.split("T")[1]?.slice(0, 5)}</p>
                 </div>
-                <p className={`text-sm ${n.read && n.type !== "ptp_pending" ? "text-gray-500" : "text-gray-800 font-medium"}`}>{n.message}</p>
-                <p className="text-xs text-gray-400 mt-1">{formatDateDMY(n.date.split("T")[0])} {n.date.split("T")[1]?.slice(0, 5)}</p>
+                {!n.read && n.type !== "ptp_pending" && (
+                  <button onClick={() => handleMarkAsRead(n.id)} className="px-2 py-1 bg-teal-600 text-white rounded text-xs hover:bg-teal-700 shrink-0">
+                    Mark read
+                  </button>
+                )}
               </div>
-              {!n.read && n.type !== "ptp_pending" && (
-                <button onClick={() => handleMarkAsRead(n.id)} className="ml-2 px-2 py-1 bg-teal-600 text-white rounded text-xs hover:bg-teal-700">
-                  Mark read
-                </button>
-              )}
             </div>
-          </div>
-        );
+          );
+        };
         return (
           <div className="space-y-3">
             {unreadNotifs.length > 0 && (
