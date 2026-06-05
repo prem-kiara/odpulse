@@ -203,6 +203,33 @@ export function CustomerInfoPanel({ loanAccountNo, customerId, compact = false, 
 
   const { customer, pool, accrued, foreclosure, isClosed, loanStatus, principalOutstanding, accruedInterest, unpaidInterest, foreclosureValue, poolSnapshotDate, accruedSnapshotDate, foreclosureSnapshotDate } = data;
 
+  // ─── Track local recoveries (OD Pulse PTP / collection payments) ──────────
+  // The pool / accrued / foreclosure snapshots above come from the bank's
+  // source system. Recoveries we've collected through OD Pulse (entries.json)
+  // typically lag the bank's pool report by a day or two. To give users an
+  // accurate "what's actually left to collect today" number, we subtract the
+  // sum of OD Pulse payments for THIS loan from the bank's foreclosure value.
+  //
+  // Read from localStorage at render time — entries are small (<1MB) and we
+  // need this to stay in sync without prop drilling from the parent.
+  let trackedRecovered = 0;
+  try {
+    const allEntries = JSON.parse(localStorage.getItem("odpulse_entries") || "[]");
+    const loanKey = String(loanAccountNo || "").trim();
+    if (loanKey) {
+      for (const e of allEntries) {
+        if (!e || String(e.loanAccountNo || "").trim() !== loanKey) continue;
+        // Prefer totalPaidAmount (set by PTP modal); fall back to paidAmount or groupOdPaidAmount.
+        const v = Number(e.totalPaidAmount ?? e.paidAmount ?? e.groupOdPaidAmount ?? 0);
+        if (Number.isFinite(v) && v > 0) trackedRecovered += v;
+      }
+    }
+  } catch {}
+  // Net remaining = bank foreclosure value − everything we have already
+  // collected via OD Pulse. Clamped at 0 so over-collections (rare) don't
+  // show as negative outstanding.
+  const netRemaining = Math.max(0, (Number(foreclosureValue) || 0) - trackedRecovered);
+
   // Closed loans get a grey-toned panel; active loans keep the teal gradient.
   const panelCls = isClosed
     ? "mt-3 bg-gradient-to-br from-gray-50 to-gray-100 border border-gray-300 rounded-xl p-4 space-y-3"
@@ -247,6 +274,24 @@ export function CustomerInfoPanel({ loanAccountNo, customerId, compact = false, 
           <div className="bg-teal-600 rounded-lg p-3 border border-teal-700 shadow-sm">
             <div className="text-[10px] uppercase tracking-wide text-teal-100">Foreclosure Value</div>
             <div className="text-base font-bold text-white mt-0.5">{formatINR(foreclosureValue)}</div>
+          </div>
+        </div>
+      )}
+      {/* Tracked recoveries banner — only shown when OD Pulse has logged at
+          least one payment against this loan. Makes the remaining balance
+          after PTP / collection payments explicitly visible so users don't
+          have to manually subtract paid amounts from the bank's outstanding. */}
+      {!hideValueBoxes && !isClosed && trackedRecovered > 0 && (
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          <div className="bg-emerald-50 rounded-lg p-3 border border-emerald-200">
+            <div className="text-[10px] uppercase tracking-wide text-emerald-700">Recovered (OD Pulse)</div>
+            <div className="text-sm font-semibold text-emerald-800 mt-0.5">{formatINR(trackedRecovered)}</div>
+            <div className="text-[10px] text-emerald-600 mt-0.5">Sum of payments logged against this loan</div>
+          </div>
+          <div className="bg-amber-50 rounded-lg p-3 border border-amber-300">
+            <div className="text-[10px] uppercase tracking-wide text-amber-800">Net Remaining</div>
+            <div className="text-base font-bold text-amber-900 mt-0.5">{formatINR(netRemaining)}</div>
+            <div className="text-[10px] text-amber-700 mt-0.5">Foreclosure − Recovered (still due)</div>
           </div>
         </div>
       )}

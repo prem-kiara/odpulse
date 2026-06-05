@@ -978,6 +978,36 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
               className="w-full px-3 py-2 border-2 border-teal-500 rounded-lg bg-teal-50 text-teal-900 font-bold cursor-default" />
           </div>
         </div>
+        {/* Tracked recoveries banner — visible when OD Pulse has already
+            logged at least one payment against this loan. Subtracts tracked
+            recoveries from the bank's Foreclosure Amount to show users the
+            actual remaining due. */}
+        {odSnap && loanAccountNo && (() => {
+          const loanKey = String(loanAccountNo || "").trim();
+          let tracked = 0;
+          for (const e of (entries || [])) {
+            if (!e || String(e.loanAccountNo || "").trim() !== loanKey) continue;
+            const v = Number(e.totalPaidAmount ?? e.paidAmount ?? e.groupOdPaidAmount ?? 0);
+            if (Number.isFinite(v) && v > 0) tracked += v;
+          }
+          if (tracked <= 0) return null;
+          const fcl = Number(odSnap.foreclosureValue) || 0;
+          const netRemaining = Math.max(0, fcl - tracked);
+          return (
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-3">
+              <div className="bg-emerald-50 rounded-lg p-3 border border-emerald-200">
+                <div className="text-[10px] uppercase tracking-wide text-emerald-700">Recovered (OD Pulse)</div>
+                <div className="text-base font-semibold text-emerald-800 mt-0.5">{formatINR(tracked)}</div>
+                <div className="text-[10px] text-emerald-600 mt-0.5">Sum of payments logged against this loan</div>
+              </div>
+              <div className="bg-amber-50 rounded-lg p-3 border border-amber-300">
+                <div className="text-[10px] uppercase tracking-wide text-amber-800">Net Remaining</div>
+                <div className="text-base font-bold text-amber-900 mt-0.5">{formatINR(netRemaining)}</div>
+                <div className="text-[10px] text-amber-700 mt-0.5">Foreclosure − Recovered (still due)</div>
+              </div>
+            </div>
+          );
+        })()}
         <p className="text-[11px] text-gray-500 mt-2">Foreclosure = Principal Outstanding + Unpaid Interest + Accrued Interest. Values refresh automatically from the latest uploaded OD reports.</p>
       </div>
 
@@ -2010,6 +2040,33 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
               className="w-full px-3 py-2 border-2 border-indigo-500 rounded-lg bg-indigo-50 text-indigo-900 font-bold cursor-default" />
           </div>
         </div>
+        {/* Tracked recoveries banner — same logic as Group OD's snapshot. */}
+        {odSnap && loanAccountNo && (() => {
+          const loanKey = String(loanAccountNo || "").trim();
+          let tracked = 0;
+          for (const e of (entries || [])) {
+            if (!e || String(e.loanAccountNo || "").trim() !== loanKey) continue;
+            const v = Number(e.totalPaidAmount ?? e.paidAmount ?? e.groupOdPaidAmount ?? 0);
+            if (Number.isFinite(v) && v > 0) tracked += v;
+          }
+          if (tracked <= 0) return null;
+          const fcl = Number(odSnap.foreclosureValue) || 0;
+          const netRemaining = Math.max(0, fcl - tracked);
+          return (
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mt-3">
+              <div className="bg-emerald-50 rounded-lg p-3 border border-emerald-200">
+                <div className="text-[10px] uppercase tracking-wide text-emerald-700">Recovered (OD Pulse)</div>
+                <div className="text-base font-semibold text-emerald-800 mt-0.5">{formatINR(tracked)}</div>
+                <div className="text-[10px] text-emerald-600 mt-0.5">Sum of payments logged against this loan</div>
+              </div>
+              <div className="bg-amber-50 rounded-lg p-3 border border-amber-300">
+                <div className="text-[10px] uppercase tracking-wide text-amber-800">Net Remaining</div>
+                <div className="text-base font-bold text-amber-900 mt-0.5">{formatINR(netRemaining)}</div>
+                <div className="text-[10px] text-amber-700 mt-0.5">Foreclosure − Recovered (still due)</div>
+              </div>
+            </div>
+          );
+        })()}
         <p className="text-[11px] text-gray-500 mt-2">Foreclosure = Principal Outstanding + Unpaid Interest + Accrued Interest. Values refresh automatically from the latest uploaded OD reports.</p>
       </div>
 
