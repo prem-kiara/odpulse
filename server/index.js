@@ -3432,12 +3432,11 @@ async function checkPTPReminders() {
 
   console.log(`[PTP] Found ${ptpEntries.length} PTP entries due.`);
 
-  // Find admin user IDs.
+  // Find recipient user IDs.
   // Business rule: PTP reminder notifications go to the recorder (handled per
-  // entry below) + Administrators only. MIS staff (elevated_staff) and other
-  // roles are intentionally excluded so the PTP queue stays scoped to the
-  // people who need to act on it.
-  const adminIds = users.filter(u => u.role === "admin").map(u => u.id);
+  // entry below), every Administrator, AND MIS staff (elevated_staff) so the
+  // full collections + oversight team gets daily PTP visibility.
+  const adminIds = users.filter(u => u.role === "admin" || u.role === "elevated_staff").map(u => u.id);
 
   const newNotifications = [];
   const emailLines = [];

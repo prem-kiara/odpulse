@@ -820,11 +820,10 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
       const allUsers = loadData(STORAGE_KEYS.users, []);
       const recipientIds = new Set();
       recipientIds.add(entry.enteredBy);
-      // Business rule: PTP notifications go to the recorder (added above) +
-      // Administrators only. MIS staff (elevated_staff) and other roles are
-      // intentionally NOT included as recipients — keeps the notification
-      // panel focused for the people who actually act on PTPs.
-      allUsers.filter(u => u.role === "admin").forEach(u => recipientIds.add(u.id));
+      // Business rule: PTP notifications are sent to the recorder (added
+      // above), to all Administrators, AND to MIS staff (elevated_staff) so
+      // they have full visibility on every PTP for oversight & reporting.
+      allUsers.filter(u => u.role === "admin" || u.role === "elevated_staff").forEach(u => recipientIds.add(u.id));
 
       const ptpNotifs = [...recipientIds].map(userId => ({
         id: generateId(),
@@ -1885,11 +1884,10 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
       const allUsers = loadData(STORAGE_KEYS.users, []);
       const recipientIds = new Set();
       recipientIds.add(entry.enteredBy);
-      // Business rule: PTP notifications go to the recorder (added above) +
-      // Administrators only. MIS staff (elevated_staff) and other roles are
-      // intentionally NOT included as recipients — keeps the notification
-      // panel focused for the people who actually act on PTPs.
-      allUsers.filter(u => u.role === "admin").forEach(u => recipientIds.add(u.id));
+      // Business rule: PTP notifications are sent to the recorder (added
+      // above), to all Administrators, AND to MIS staff (elevated_staff) so
+      // they have full visibility on every PTP for oversight & reporting.
+      allUsers.filter(u => u.role === "admin" || u.role === "elevated_staff").forEach(u => recipientIds.add(u.id));
       const ptpNotifs = [...recipientIds].map(userId => ({
         id: generateId(),
         type: "ptp_pending",
@@ -2457,15 +2455,15 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
     // Clear persistent PTP notifications for this entry
     const updatedNotifs = notifications.filter(n => !(n.entryId === ptpPaymentEntry.id && n.type === "ptp_pending"));
 
-    // Collect unique recipient IDs. Business rule: PTP notifications go to
-    // the recorder (handled below) + Administrators only. MIS staff
-    // (elevated_staff) and other roles are intentionally NOT notified.
+    // Collect unique recipient IDs. Business rule: PTP notifications are
+    // sent to the recorder (added below), all Administrators, AND MIS staff
+    // (elevated_staff) so the full collections team has visibility.
     const allUsers = loadData(STORAGE_KEYS.users, []);
     const recipientIds = new Set();
     // Always notify the original entry creator
     recipientIds.add(ptpPaymentEntry.enteredBy);
-    // Notify Administrators (role === "admin") only.
-    allUsers.filter(u => u.role === "admin").forEach(u => recipientIds.add(u.id));
+    // Notify Administrators + MIS Staff.
+    allUsers.filter(u => u.role === "admin" || u.role === "elevated_staff").forEach(u => recipientIds.add(u.id));
 
     const paidNotifs = [...recipientIds].map(userId => ({
       id: generateId(),
@@ -2989,11 +2987,70 @@ function NotificationsPage({ user, users, notifications, setNotifications }) {
     return Array.from(byKey.values());
   }, [notifications]);
 
-  const visibleNotifs = isAdminOrElevated
-    ? (filterUser ? dedupedAll.filter(n => n.forUserId === filterUser) : dedupedAll)
-        .sort((a, b) => new Date(b.date) - new Date(a.date))
-    : dedupedAll.filter(n => n.forUserId === user.id)
-        .sort((a, b) => new Date(b.date) - new Date(a.date));
+  // Combine real notifications with "virtual" rows synthesized from every
+  // historical PTP entry that doesn't yet have a notification record. This
+  // ensures the panel shows the COMPLETE PTP history — including entries
+  // created before the notification system went live or while offline.
+  //
+  //  • Real rows  — actual notifications.json records, deduped above.
+  //  • Synth rows — marked `_synthetic:true` and `read:true` so they don't
+  //                 inflate the unread bell counter. Visibility follows the
+  //                 same rule as real rows: admin/MIS see everything; staff
+  //                 see only the entries they personally recorded.
+  const visibleNotifs = useMemo(() => {
+    const realFiltered = isAdminOrElevated
+      ? (filterUser ? dedupedAll.filter(n => n.forUserId === filterUser) : dedupedAll)
+      : dedupedAll.filter(n => n.forUserId === user.id);
+    // Classify an entry's current PTP state into one of the stable type
+    // strings used elsewhere in the file (kept inline so this block
+    // self-contains its dependencies).
+    const classify = (e) => {
+      if (!e || (!e.ptpDate && !e.ptpStatus)) return null;
+      if (e.ptpStatus === "paid") return "ptp_paid";
+      const today = nowDate();
+      const d = new Date(); d.setDate(d.getDate() + 1);
+      const tmr = d.toISOString().slice(0, 10);
+      if (e.ptpDate === today)            return "ptp_due_today";
+      if (e.ptpDate === tmr)              return "ptp_due_tomorrow";
+      if (e.ptpDate && e.ptpDate < today) return "ptp_overdue";
+      return "ptp_pending";
+    };
+    const typeLabel = (t) =>
+      t === "ptp_paid"         ? "PTP Payment Received" :
+      t === "ptp_due_today"    ? "PTP Due Today" :
+      t === "ptp_due_tomorrow" ? "PTP Due Tomorrow" :
+      t === "ptp_overdue"      ? "PTP Overdue" :
+      t === "ptp_reminder"     ? "PTP Reminder" : "PTP Pending";
+    // Index of entry IDs that already have at least one real notification —
+    // used to skip duplicate synthesis.
+    const entryIdsWithNotif = new Set(
+      notifications.filter(n => n && n.entryId).map(n => n.entryId)
+    );
+    const synth = [];
+    for (const e of allEntries) {
+      if (!e || !e.id) continue;
+      if (entryIdsWithNotif.has(e.id)) continue;
+      const t = classify(e);
+      if (!t) continue;
+      if (!isAdminOrElevated && e.enteredBy !== user.id) continue;
+      if (isAdminOrElevated && filterUser && e.enteredBy !== filterUser) continue;
+      const amt = e.amountDue ?? e.groupOdAmount ?? e.totalPaidAmount ?? e.customerShare ?? "";
+      synth.push({
+        id: "synth_" + e.id,
+        type: t,
+        entryId: e.id,
+        userId: e.enteredBy,
+        forUserId: e.enteredBy,
+        date: e.date || new Date().toISOString(),
+        read: true,            // historical → don't inflate unread bell
+        _synthetic: true,
+        ptpDate: e.ptpDate,
+        ptpTime: e.ptpTime,
+        message: typeLabel(t) + ": " + (e.customerName || "") + " (" + (e.customerId || "") + ") - Branch: " + (e.branch || "") + " - PTP: " + (e.ptpDate ? formatDateDMY(e.ptpDate) : "N/A") + " " + (e.ptpTime || "") + " - Amount: " + formatINR(amt),
+      });
+    }
+    return [...realFiltered, ...synth].sort((a, b) => new Date(b.date) - new Date(a.date));
+  }, [dedupedAll, notifications, allEntries, isAdminOrElevated, filterUser, user.id]);
 
   const unreadCount = visibleNotifs.filter(n => !n.read && n.type !== "ptp_pending").length;
 
