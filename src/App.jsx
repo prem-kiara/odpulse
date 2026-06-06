@@ -3959,6 +3959,12 @@ function Dashboard({ user, entries, branches, config }) {
         )}
       </div>
 
+      {/* Collection Performance — bar chart with bucket breakdown per staff
+          and optional 3-month rolling-average overlay. Positioned right
+          after the Monthly Recovery Trend / Recovery by Payment Mode
+          charts so the analytics flow stays together. */}
+      <CollectionPerformanceWidget user={user} entries={entries} />
+
       {/* Branch cards */}
       {stats.branchData.length > 0 && (
         <div className="mb-6">
@@ -4016,10 +4022,6 @@ function Dashboard({ user, entries, branches, config }) {
           </div>
         </div>
       )}
-
-      {/* Aggregates collections by Staff × Branch × Bucket with a 3-month
-          rolling average for trend comparison. */}
-      <CollectionPerformanceWidget user={user} entries={entries} />
     </div>
   );
 }
@@ -4107,21 +4109,27 @@ function CPMultiSelectFilter({ label, options, value, onChange, search, setSearc
 }
 
 // ─── Collection Performance Widget ─────────────────────────────────────────
-// Dashboard analytics widget. Aggregates entries by (Staff × Branch × Bucket)
-// and shows:
-//   • Total Amount Collected in the selected period
-//   • Number of distinct Accounts Collected
-//   • Rolling 3-month average (the 90 days immediately preceding the
-//     selected start date) for current-vs-historical comparison
-//   • % change vs the 3-month average (green = above, red = below)
+// Dashboard analytics widget. Visual bar chart (NOT a table) that compares
+// collection performance across staff with:
+//   • Stacked bars per staff broken down by Bucket Category
+//     (SMA-0 / SMA-1 / SMA-2 / NPA / No-Bucket — colour-coded)
+//   • Optional 3-Month Avg overlay bar (toggle button) — sum of the same
+//     staff's collections over the 90 days immediately preceding the
+//     selected start date, divided by 3
 //
-// Filters: Branch / Staff / Bucket (multi-select with Select All) + Date Range.
-// RBAC: Export CSV is shown only to Administrator + MIS Staff.
+// Filters (multi-select with Select All + search where useful):
+//   • Branch / Staff / Bucket — each defaults to "all"
+//   • Date Range — defaults to the last 30 days
+//
+// Style match: same `bg-white rounded-xl border p-4` card and recharts
+// BarChart used by the existing Monthly Recovery Trend / Recovery by
+// Payment Mode charts directly above.
+//
+// RBAC: Export CSV button is shown only to Administrator + MIS Staff.
 function CollectionPerformanceWidget({ user, entries }) {
   const isAdminOrElevated = user.role === "admin" || user.role === "elevated_staff";
 
-  // Read users from localStorage — Dashboard's prop signature doesn't
-  // currently include users, so we look them up directly here.
+  // Users for staff-name lookup (Dashboard prop signature doesn't include them).
   const users = useMemo(() => {
     try { return JSON.parse(localStorage.getItem(STORAGE_KEYS.users) || "[]"); }
     catch { return []; }
@@ -4142,7 +4150,9 @@ function CollectionPerformanceWidget({ user, entries }) {
   const [branchSearch, setBranchSearch] = useState("");
   const [staffSearch, setStaffSearch] = useState("");
 
-  // Filter option lists derived from the entries themselves.
+  // Toggle for the 3-month-average overlay bar.
+  const [showAvg, setShowAvg] = useState(true);
+
   const branchOptions = useMemo(() => Array.from(new Set(
     entries.map(e => e.branch).filter(Boolean)
   )).sort(), [entries]);
@@ -4173,8 +4183,7 @@ function CollectionPerformanceWidget({ user, entries }) {
     Number(e.totalPaidAmount ?? e.paidAmount ?? e.groupOdPaidAmount ?? e.customerShare ?? 0) || 0;
   const bucketOf = (e) => e.smaBucket || "(no bucket)";
 
-  // 3-month-prior window: 90 days strictly BEFORE the selected dateFrom.
-  // Using 90 days (not 3 calendar months) keeps the divisor uniform.
+  // 3-month-prior window: 90 days strictly BEFORE dateFrom (uniform divisor).
   const threeMonthsStart = useMemo(() => {
     if (!dateFrom) return "";
     const d = new Date(dateFrom);
@@ -4189,73 +4198,115 @@ function CollectionPerformanceWidget({ user, entries }) {
     return true;
   }, [selBranches, selStaff, selBuckets]);
 
-  // Single pass: build current-period totals + prior-3m totals per group.
-  const rows = useMemo(() => {
-    const cur = new Map();
-    const prior = new Map();
+  // Aggregate per staff: one chart datum per staff with bucket breakdowns
+  // + accountCount + prior-90 total. avg3m = prior90 / 3.
+  const chartData = useMemo(() => {
+    const byStaff = new Map();
+    const accounts = new Map(); // staffId -> Set of distinct accounts
+    const ensure = (sid) => {
+      if (!byStaff.has(sid)) byStaff.set(sid, {
+        staffId: sid,
+        name: staffNameById.get(sid) || sid || "—",
+        branch: "",
+        "SMA-0": 0, "SMA-1": 0, "SMA-2": 0, "NPA": 0, "Other": 0,
+        currentTotal: 0,
+        accountCount: 0,
+        prior90: 0,
+        avg3m: 0,
+      });
+      return byStaff.get(sid);
+    };
+
     for (const e of entries) {
       if (!matchesFilters(e)) continue;
-      const k = (e.enteredBy || "") + "::" + (e.branch || "") + "::" + bucketOf(e);
+      const sid = e.enteredBy || "(unknown)";
       const d = e.date || "";
-      if ((!dateFrom || d >= dateFrom) && (!dateTo || d <= dateTo)) {
-        if (!cur.has(k)) cur.set(k, { total: 0, accounts: new Set() });
-        const slot = cur.get(k);
-        slot.total += getPaid(e);
-        slot.accounts.add(e.loanAccountNo || e.customerId || e.id);
+      const inCur = (!dateFrom || d >= dateFrom) && (!dateTo || d <= dateTo);
+      const inPrior = threeMonthsStart && d >= threeMonthsStart && (!dateFrom || d < dateFrom);
+
+      if (inCur) {
+        const slot = ensure(sid);
+        slot.branch = e.branch || slot.branch;
+        const amt = getPaid(e);
+        slot.currentTotal += amt;
+        const b = bucketOf(e);
+        if (b === "SMA-0") slot["SMA-0"] += amt;
+        else if (b === "SMA-1") slot["SMA-1"] += amt;
+        else if (b === "SMA-2") slot["SMA-2"] += amt;
+        else if (b === "NPA") slot["NPA"] += amt;
+        else slot["Other"] += amt;
+        if (!accounts.has(sid)) accounts.set(sid, new Set());
+        accounts.get(sid).add(e.loanAccountNo || e.customerId || e.id);
       }
-      if (threeMonthsStart && d >= threeMonthsStart && (!dateFrom || d < dateFrom)) {
-        prior.set(k, (prior.get(k) || 0) + getPaid(e));
+      if (inPrior) {
+        const slot = ensure(sid);
+        slot.prior90 += getPaid(e);
       }
     }
-    const out = [];
-    for (const [k, v] of cur) {
-      const [staffId, branch, bucket] = k.split("::");
-      const staffName = staffNameById.get(staffId) || staffId || "—";
-      const priorTotal = prior.get(k) || 0;
-      out.push({
-        staffId, staffName, branch, bucket,
-        currentTotal: v.total,
-        accountCount: v.accounts.size,
-        priorTotal,
-        threeMonthAvg: priorTotal / 3,
-      });
+    for (const [sid, slot] of byStaff) {
+      slot.accountCount = (accounts.get(sid) || new Set()).size;
+      slot.avg3m = slot.prior90 / 3;
     }
-    return out.sort((a, b) => b.currentTotal - a.currentTotal);
+    // Drop staff with absolutely zero in both windows so the chart isn't noisy.
+    return Array.from(byStaff.values())
+      .filter(s => s.currentTotal > 0 || s.avg3m > 0)
+      .sort((a, b) => b.currentTotal - a.currentTotal);
   }, [entries, dateFrom, dateTo, threeMonthsStart, matchesFilters, staffNameById]);
 
-  const totals = useMemo(() => rows.reduce(
-    (acc, r) => ({
-      currentTotal: acc.currentTotal + r.currentTotal,
-      accountCount: acc.accountCount + r.accountCount,
-      threeMonthAvg: acc.threeMonthAvg + r.threeMonthAvg,
-    }),
-    { currentTotal: 0, accountCount: 0, threeMonthAvg: 0 }
-  ), [rows]);
+  // Bucket palette — matches the existing SMA badge colours used elsewhere.
+  const COLOR = { "SMA-0": "#3b82f6", "SMA-1": "#eab308", "SMA-2": "#f97316", "NPA": "#ef4444", "Other": "#94a3b8" };
+
+  // Custom tooltip — shows full staff + branch + per-bucket breakdown + avg.
+  const renderTooltip = ({ active, payload, label }) => {
+    if (!active || !payload || payload.length === 0) return null;
+    const d = payload[0].payload || {};
+    return (
+      <div className="bg-white p-3 border border-gray-200 rounded-lg shadow-md text-xs min-w-[180px]">
+        <div className="font-semibold text-gray-900 mb-1">{d.name}</div>
+        <div className="text-gray-500 mb-2">Branch: {d.branch || "—"} · Accounts: {d.accountCount || 0}</div>
+        {["SMA-0", "SMA-1", "SMA-2", "NPA", "Other"].map(k => (
+          (d[k] || 0) > 0 ? (
+            <div key={k} className="flex justify-between gap-3">
+              <span className="text-gray-600">
+                <span className="inline-block w-2 h-2 rounded-sm mr-1.5 align-middle" style={{ background: COLOR[k] }} />
+                {k === "Other" ? "No Bucket" : k}
+              </span>
+              <span className="font-medium text-gray-800">{formatINR(d[k])}</span>
+            </div>
+          ) : null
+        ))}
+        <div className="border-t border-gray-200 mt-2 pt-1.5 flex justify-between font-semibold">
+          <span>Total</span><span>{formatINR(d.currentTotal)}</span>
+        </div>
+        {showAvg && (
+          <div className="flex justify-between text-teal-700 mt-0.5">
+            <span>3-Month Avg</span><span>{formatINR(Math.round(d.avg3m || 0))}</span>
+          </div>
+        )}
+      </div>
+    );
+  };
 
   const handleExport = () => {
     if (!isAdminOrElevated) {
       alert("Export is restricted to Administrator and MIS Staff roles.");
       return;
     }
-    if (rows.length === 0) {
-      alert("No rows match the selected filters. Adjust filters and try again.");
+    if (chartData.length === 0) {
+      alert("No data to export. Adjust filters and try again.");
       return;
     }
     const headers = [
-      "Staff Name", "Branch", "Bucket Category",
+      "Staff Name", "Branch",
+      "SMA-0", "SMA-1", "SMA-2", "NPA", "No Bucket",
       "Total Amount Collected", "Accounts Collected", "3-Month Avg",
-      "% vs 3-Month Avg",
     ];
     const q = v => '"' + String(v == null ? "" : v).replace(/"/g, '""') + '"';
-    const lines = [headers, ...rows.map(r => {
-      const diffPct = r.threeMonthAvg > 0
-        ? ((r.currentTotal - r.threeMonthAvg) / r.threeMonthAvg * 100).toFixed(0) + "%"
-        : "";
-      return [
-        r.staffName, r.branch, r.bucket,
-        r.currentTotal, r.accountCount, Math.round(r.threeMonthAvg), diffPct,
-      ];
-    })];
+    const lines = [headers, ...chartData.map(d => [
+      d.name, d.branch,
+      d["SMA-0"], d["SMA-1"], d["SMA-2"], d["NPA"], d["Other"],
+      d.currentTotal, d.accountCount, Math.round(d.avg3m),
+    ])];
     const csv = lines.map(row => row.map(q).join(",")).join("\n");
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
     const url = URL.createObjectURL(blob);
@@ -4278,25 +4329,31 @@ function CollectionPerformanceWidget({ user, entries }) {
   };
 
   return (
-    <div className="bg-white rounded-xl border p-5 mt-6">
-      <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
-        <h3 className="text-lg font-bold text-gray-900 flex items-center gap-2">
-          <TrendingUp size={20} className="text-teal-600" /> Collection Performance
-          <span className="text-xs font-normal text-gray-500">— with 3-month rolling avg</span>
+    <div className="bg-white rounded-xl border p-4 mb-6">
+      <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+        <h3 className="text-sm font-semibold text-gray-700 flex items-center gap-2">
+          <TrendingUp size={16} className="text-teal-600" />
+          Collection Performance — Staff × Bucket
+          <span className="text-[11px] font-normal text-gray-400">{chartData.length} staff</span>
         </h3>
-        <div className="flex items-center gap-2">
-          <button onClick={presetLast30} className="text-xs text-teal-700 hover:text-teal-900 underline">Last 30 days</button>
-          <button onClick={resetAll} className="text-xs text-gray-600 hover:text-red-600 underline">Reset</button>
+        <div className="flex items-center gap-2 flex-wrap">
+          <button onClick={() => setShowAvg(s => !s)}
+            className={"text-[11px] px-2 py-1 rounded border transition-colors " + (showAvg ? "bg-teal-600 text-white border-teal-600" : "bg-white text-teal-700 border-teal-300 hover:bg-teal-50")}>
+            {showAvg ? "✓ 3-Month Avg" : "Show 3-Month Avg"}
+          </button>
+          <button onClick={presetLast30} className="text-[11px] text-teal-700 hover:text-teal-900 underline">Last 30 days</button>
+          <button onClick={resetAll} className="text-[11px] text-gray-600 hover:text-red-600 underline">Reset</button>
           {isAdminOrElevated && (
             <button onClick={handleExport}
-              disabled={rows.length === 0}
-              className={"inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg " + (rows.length === 0 ? "bg-gray-200 text-gray-400 cursor-not-allowed" : "bg-teal-600 text-white hover:bg-teal-700")}>
-              <Download size={12} /> Export CSV
+              disabled={chartData.length === 0}
+              className={"inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium rounded " + (chartData.length === 0 ? "bg-gray-200 text-gray-400 cursor-not-allowed" : "bg-teal-600 text-white hover:bg-teal-700")}>
+              <Download size={11} /> Export CSV
             </button>
           )}
         </div>
       </div>
 
+      {/* Filter row — same dropdown style as Notifications export */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 mb-4">
         <div>
           <label className="block text-[10px] font-semibold text-gray-600 uppercase mb-1">Date From</label>
@@ -4319,56 +4376,34 @@ function CollectionPerformanceWidget({ user, entries }) {
           value={selBuckets} onChange={setSelBuckets} />
       </div>
 
-      <div className="overflow-x-auto">
-        <table className="w-full text-sm auto-layout">
-          <thead className="bg-gray-50">
-            <tr>
-              <th className="px-3 py-2 text-left font-semibold text-gray-700">Staff Name</th>
-              <th className="px-3 py-2 text-left font-semibold text-gray-700">Branch</th>
-              <th className="px-3 py-2 text-left font-semibold text-gray-700">Bucket</th>
-              <th className="px-3 py-2 text-right font-semibold text-gray-700">Amount Collected</th>
-              <th className="px-3 py-2 text-right font-semibold text-gray-700">Accounts</th>
-              <th className="px-3 py-2 text-right font-semibold text-gray-700">3-Month Avg</th>
-              <th className="px-3 py-2 text-right font-semibold text-gray-700">vs Avg</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.length === 0 ? (
-              <tr><td colSpan={7} className="px-3 py-6 text-center text-gray-500">No collections match the selected filters.</td></tr>
-            ) : rows.map((r, i) => {
-              const diff = r.currentTotal - r.threeMonthAvg;
-              const diffPct = r.threeMonthAvg > 0 ? ((diff / r.threeMonthAvg) * 100) : null;
-              return (
-                <tr key={r.staffId + "_" + r.branch + "_" + r.bucket + "_" + i} className="border-t border-gray-100 hover:bg-gray-50">
-                  <td className="px-3 py-2 text-gray-800">{r.staffName}</td>
-                  <td className="px-3 py-2 text-gray-700">{r.branch || "—"}</td>
-                  <td className="px-3 py-2 text-gray-700">{r.bucket}</td>
-                  <td className="px-3 py-2 text-right font-semibold text-gray-900 num">{formatINR(r.currentTotal)}</td>
-                  <td className="px-3 py-2 text-right text-gray-700 num">{r.accountCount}</td>
-                  <td className="px-3 py-2 text-right text-gray-700 num">{formatINR(Math.round(r.threeMonthAvg))}</td>
-                  <td className={"px-3 py-2 text-right num font-medium " + (diff > 0 ? "text-emerald-700" : diff < 0 ? "text-red-700" : "text-gray-500")}>
-                    {diffPct === null ? "—" : (diff > 0 ? "+" : "") + diffPct.toFixed(0) + "%"}
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-          {rows.length > 0 && (
-            <tfoot className="bg-gray-50">
-              <tr className="border-t-2 border-gray-200">
-                <td className="px-3 py-2 font-semibold text-gray-800" colSpan={3}>Total ({rows.length} group{rows.length === 1 ? "" : "s"})</td>
-                <td className="px-3 py-2 text-right font-bold text-gray-900 num">{formatINR(totals.currentTotal)}</td>
-                <td className="px-3 py-2 text-right font-bold text-gray-700 num">{totals.accountCount}</td>
-                <td className="px-3 py-2 text-right font-bold text-gray-700 num">{formatINR(Math.round(totals.threeMonthAvg))}</td>
-                <td className="px-3 py-2"></td>
-              </tr>
-            </tfoot>
-          )}
-        </table>
-      </div>
+      {/* Chart */}
+      {chartData.length === 0 ? (
+        <div className="py-10 text-center text-gray-500 text-sm border border-dashed border-gray-200 rounded">
+          No collections match the selected filters.
+        </div>
+      ) : (
+        <ResponsiveContainer width="100%" height={Math.max(320, 60 + chartData.length * 28)}>
+          <BarChart data={chartData} margin={{ top: 10, right: 16, bottom: 30, left: 0 }}>
+            <CartesianGrid strokeDasharray="3 3" />
+            <XAxis dataKey="name" tick={{ fontSize: 11 }} angle={-30} textAnchor="end" interval={0} height={70} />
+            <YAxis tickFormatter={v => formatLakhs(v)} tick={{ fontSize: 11 }} />
+            <Tooltip content={renderTooltip} cursor={{ fill: "rgba(15, 118, 110, 0.04)" }} />
+            <Legend wrapperStyle={{ fontSize: 11 }} />
+            {/* Stacked bars per bucket — current period */}
+            <Bar dataKey="SMA-0" name="SMA-0" stackId="cur" fill={COLOR["SMA-0"]} />
+            <Bar dataKey="SMA-1" name="SMA-1" stackId="cur" fill={COLOR["SMA-1"]} />
+            <Bar dataKey="SMA-2" name="SMA-2" stackId="cur" fill={COLOR["SMA-2"]} />
+            <Bar dataKey="NPA"   name="NPA"   stackId="cur" fill={COLOR["NPA"]} radius={[4, 4, 0, 0]} />
+            <Bar dataKey="Other" name="No Bucket" stackId="cur" fill={COLOR["Other"]} />
+            {/* Optional rolling-3-month average overlay (separate bar group) */}
+            {showAvg && <Bar dataKey="avg3m" name="3-Month Avg" fill="#0d9488" radius={[4, 4, 0, 0]} />}
+          </BarChart>
+        </ResponsiveContainer>
+      )}
+
       <p className="text-[11px] text-gray-500 mt-2">
-        Rolling average is computed over the 90 days immediately preceding the selected start date and divided by 3.
-        Rows are grouped by Staff × Branch × Bucket and ranked by current-period amount.
+        Stacked bars = collections by bucket per staff in the selected period. The teal bar overlays the rolling 3-month average
+        (sum of collections in the 90 days immediately before the start date, divided by 3). Hover for branch + per-bucket detail.
       </p>
     </div>
   );
