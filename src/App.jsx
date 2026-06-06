@@ -4124,33 +4124,24 @@ function CPMultiSelectFilter({ label, options, value, onChange, search, setSearc
 }
 
 // ─── Collection Performance Widget ─────────────────────────────────────────
-// Interactive chart + data table for Collection Performance analysis.
+// Two layers in one widget:
 //
-// Layout: one chart + one explicit data grid below it. The grid prints the
-// underlying numbers so users can verify each (bucket × month) cell instead
-// of trying to read pixel heights off thin bars. When multiple staff are
-// selected, the grid adds per-staff rows under each bucket so staff
-// comparison is direct + exact.
+//   1. PRODUCTIVITY — KPI tiles + per-staff productivity table that capture
+//      "how efficiently is each staff working", not just "how much money".
+//      Metrics: Total Accounts, Branches Covered, Total Amount, 3-Month
+//      Total + Avg, Avg ₹/Day, Avg Accounts/Day, and per-bucket account
+//      counts. Computed off the same filtered entries set the chart uses,
+//      so KPIs always agree with what the chart is showing.
 //
-// View modes:
-//   • By Bucket (default) — X = bucket; bars per bucket = months in range +
-//     N-Month Total + N-Month Average. ONE aggregated chart regardless of
-//     how many staff are selected. The data grid below shows per-staff
-//     breakdown when multi-staff is selected.
-//   • By Staff — X = staff; bars per staff = buckets. Line overlay shows
-//     each staff's 3-Month Average.
-//   • By Month — X = month; bars per month = buckets. Reference line shows
-//     the global 3-month-avg level.
+//   2. COLLECTION ANALYSIS — recharts bar chart with three view modes
+//      (Bucket / Staff / Month) + a values-grid below the chart.
 //
-// Why no per-staff bar expansion in the chart: with 4 buckets × (3 months
-// + Total + Avg) × N staff bars, the chart became dense enough that bar
-// heights weren't trustworthy at a glance. Moving per-staff numbers into
-// the data grid eliminates that ambiguity and gives users exact values for
-// every combination they care about.
+// Days-in-range divisor for daily averages = calendar days between
+// dateFrom and dateTo inclusive (so "Last 30 days" → ÷30, "Last 90 days"
+// → ÷90). 3-Month Total / Avg uses the 90 days strictly BEFORE dateFrom.
+// Account counts dedupe by loanAccountNo → customerId → entry.id.
 //
-// Exclusions: Administrator users + entries without a valid bucket.
-// Filters: Branch / Staff / Bucket (multi-select with click-outside +
-// count-only summary) + Date Range. Export CSV → Admin + MIS only.
+// Exclusions: Administrator users and entries without a valid bucket.
 function CollectionPerformanceWidget({ user, entries }) {
   const isAdminOrElevated = user.role === "admin" || user.role === "elevated_staff";
 
@@ -4182,6 +4173,7 @@ function CollectionPerformanceWidget({ user, entries }) {
   const [viewMode, setViewMode] = useState("bucket");
   const [showAvg, setShowAvg] = useState(true);
   const [showTable, setShowTable] = useState(true);
+  const [showProductivity, setShowProductivity] = useState(true);
 
   const branchOptions = useMemo(() => Array.from(new Set(
     entries.map(e => e.branch).filter(Boolean)
@@ -4220,6 +4212,7 @@ function CollectionPerformanceWidget({ user, entries }) {
     const b = e && e.smaBucket;
     return (b === "SMA-0" || b === "SMA-1" || b === "SMA-2" || b === "NPA") ? b : null;
   };
+  const accountKey = (e) => e.loanAccountNo || e.customerId || e.id;
 
   const threeMonthsStart = useMemo(() => {
     if (!dateFrom) return "";
@@ -4227,6 +4220,14 @@ function CollectionPerformanceWidget({ user, entries }) {
     d.setDate(d.getDate() - 90);
     return d.toISOString().slice(0, 10);
   }, [dateFrom]);
+
+  // Calendar days in the selected range — divisor for "per-day" averages.
+  const daysInRange = useMemo(() => {
+    if (!dateFrom || !dateTo) return 1;
+    const a = new Date(dateFrom);
+    const b = new Date(dateTo);
+    return Math.max(1, Math.floor((b - a) / 86400000) + 1);
+  }, [dateFrom, dateTo]);
 
   const matchesFilters = useCallback((e) => {
     if (!e) return false;
@@ -4282,10 +4283,94 @@ function CollectionPerformanceWidget({ user, entries }) {
     return MONTHS[Math.max(0, Math.min(11, parseInt(m, 10) - 1))] + " " + y;
   };
 
-  // ── Core tally: per-staff per-bucket per-month sums ───────────────────
-  // SOURCE OF TRUTH for every downstream view + table. One pass over entries.
+  // ── Productivity computation ──────────────────────────────────────────
+  // One pass: per-staff metrics + roll up into aggregate KPIs. Sets are
+  // used so accounts and branches are counted as DISTINCT, not as
+  // entry-rows. matchesFilters has already applied branch/staff/bucket
+  // filters; date and prior-90 windows are evaluated here.
+  const productivity = useMemo(() => {
+    const byStaff = new Map();
+    const ensure = (sid) => {
+      if (!byStaff.has(sid)) byStaff.set(sid, {
+        staffId: sid,
+        name: staffNameById.get(sid) || sid || "—",
+        branches: new Set(),
+        allAccounts: new Set(),
+        acctsByBucket: { "SMA-0": new Set(), "SMA-1": new Set(), "SMA-2": new Set(), "NPA": new Set() },
+        amtByBucket:  { "SMA-0": 0, "SMA-1": 0, "SMA-2": 0, "NPA": 0 },
+        totalAmount: 0,
+        prior90: 0,
+      });
+      return byStaff.get(sid);
+    };
+    for (const e of entries) {
+      if (!matchesFilters(e)) continue;
+      const sid = e.enteredBy || "(unknown)";
+      const d = e.date || "";
+      const inCur = (!dateFrom || d >= dateFrom) && (!dateTo || d <= dateTo);
+      const inPrior = threeMonthsStart && d >= threeMonthsStart && (!dateFrom || d < dateFrom);
+      const slot = ensure(sid);
+      const b = validBucket(e);
+      const ak = accountKey(e);
+      if (inCur) {
+        if (e.branch) slot.branches.add(e.branch);
+        slot.allAccounts.add(ak);
+        if (b) { slot.acctsByBucket[b].add(ak); slot.amtByBucket[b] += getPaid(e); }
+        slot.totalAmount += getPaid(e);
+      }
+      if (inPrior) slot.prior90 += getPaid(e);
+    }
+    const rows = Array.from(byStaff.values()).map(s => ({
+      staffId: s.staffId,
+      name: s.name,
+      branches: Array.from(s.branches).sort(),
+      branchCount: s.branches.size,
+      accountCount: s.allAccounts.size,
+      acctsByBucket: {
+        "SMA-0": s.acctsByBucket["SMA-0"].size,
+        "SMA-1": s.acctsByBucket["SMA-1"].size,
+        "SMA-2": s.acctsByBucket["SMA-2"].size,
+        "NPA":   s.acctsByBucket["NPA"].size,
+      },
+      amtByBucket: s.amtByBucket,
+      totalAmount: s.totalAmount,
+      threeMonthTotal: s.prior90,
+      threeMonthAvg: s.prior90 / 3,
+      avgAmountPerDay: s.totalAmount / daysInRange,
+      avgAccountsPerDay: s.allAccounts.size / daysInRange,
+    })).filter(r => r.totalAmount > 0 || r.threeMonthTotal > 0)
+      .sort((a, b) => b.totalAmount - a.totalAmount);
+
+    // Aggregate roll-up. Total Accounts = sum of per-staff distinct counts
+    // (an account worked by two staff counts as 2 — closer to the
+    // productivity definition the user described). Branches Covered is a
+    // distinct union since a branch worked by two staff is still one branch.
+    const allBranches = new Set();
+    let totalAccounts = 0;
+    let totalAmount = 0;
+    let totalPrior90 = 0;
+    for (const r of rows) {
+      r.branches.forEach(b => allBranches.add(b));
+      totalAccounts += r.accountCount;
+      totalAmount += r.totalAmount;
+      totalPrior90 += r.threeMonthTotal;
+    }
+    const aggregate = {
+      staffCount: rows.length,
+      totalAccounts,
+      branchesCovered: allBranches.size,
+      totalAmount,
+      threeMonthTotal: totalPrior90,
+      threeMonthAvg: totalPrior90 / 3,
+      avgAmountPerDay: totalAmount / daysInRange,
+      avgAccountsPerDay: totalAccounts / daysInRange,
+    };
+    return { rows, aggregate, days: daysInRange };
+  }, [entries, matchesFilters, dateFrom, dateTo, threeMonthsStart, daysInRange, staffNameById]);
+
+  // ── Single source-of-truth tally for chart + data table ────────────────
   const tally = useMemo(() => {
-    const m = new Map(); // key: sid|bucket|ym → amount
+    const m = new Map();
     for (const e of entries) {
       if (!matchesFilters(e)) continue;
       const d = e.date || "";
@@ -4301,7 +4386,6 @@ function CollectionPerformanceWidget({ user, entries }) {
     return m;
   }, [entries, matchesFilters, dateFrom, dateTo]);
 
-  // Bucket-aggregated chart data (across all selected staff).
   const bucketChartData = useMemo(() => {
     const n = monthsInRange.length || 1;
     return BUCKETS.map(b => {
@@ -4310,7 +4394,6 @@ function CollectionPerformanceWidget({ user, entries }) {
       for (const ym of monthsInRange) {
         let v = 0;
         for (const sid of staffIdOptions) {
-          // Apply staff filter so totals match the filter chips.
           if (selStaff.length > 0 && !selStaff.includes(sid)) continue;
           v += tally.get(sid + "|" + b + "|" + ym) || 0;
         }
@@ -4323,9 +4406,6 @@ function CollectionPerformanceWidget({ user, entries }) {
     });
   }, [tally, monthsInRange, staffIdOptions, selStaff]);
 
-  // Per-staff grid rows: one row per (staff, bucket) combination, columns =
-  // months + Total + Avg. Used by the data table when 2+ staff are selected.
-  // When 0 or 1 staff selected, the table shows the bucket-aggregated rows.
   const perStaffGridRows = useMemo(() => {
     if (selStaff.length < 2) return null;
     const n = monthsInRange.length || 1;
@@ -4348,7 +4428,6 @@ function CollectionPerformanceWidget({ user, entries }) {
     return rows;
   }, [tally, monthsInRange, selStaff, staffNameById]);
 
-  // Staff mode (X = staff, bars per bucket + 3M Avg line).
   const staffChartData = useMemo(() => {
     const byStaff = new Map();
     const accounts = new Map();
@@ -4375,7 +4454,7 @@ function CollectionPerformanceWidget({ user, entries }) {
         slot.currentTotal += amt;
         slot[validBucket(e)] += amt;
         if (!accounts.has(sid)) accounts.set(sid, new Set());
-        accounts.get(sid).add(e.loanAccountNo || e.customerId || e.id);
+        accounts.get(sid).add(accountKey(e));
       }
       if (inPrior) ensure(sid).prior90 += getPaid(e);
     }
@@ -4388,7 +4467,6 @@ function CollectionPerformanceWidget({ user, entries }) {
       .sort((a, b) => b.currentTotal - a.currentTotal);
   }, [entries, dateFrom, dateTo, threeMonthsStart, matchesFilters, staffNameById]);
 
-  // Month mode (X = month, bars per bucket).
   const monthChartData = useMemo(() => {
     const byMonth = new Map();
     const ensure = (ym) => {
@@ -4537,6 +4615,38 @@ function CollectionPerformanceWidget({ user, entries }) {
     setTimeout(() => URL.revokeObjectURL(url), 5000);
   };
 
+  // CSV export for the productivity table (per-staff). Gated on RBAC.
+  const handleExportProductivity = () => {
+    if (!isAdminOrElevated) {
+      alert("Export is restricted to Administrator and MIS Staff roles.");
+      return;
+    }
+    if (productivity.rows.length === 0) {
+      alert("No staff productivity data to export.");
+      return;
+    }
+    const q = v => '"' + String(v == null ? "" : v).replace(/"/g, '""') + '"';
+    const headers = [
+      "Staff Name", "Branches Handled", "Branches",
+      "Total Accounts", "SMA-0 Accts", "SMA-1 Accts", "SMA-2 Accts", "NPA Accts",
+      "Total Amount", "3-Month Total", "3-Month Avg",
+      "Avg ₹ / Day", "Avg Accounts / Day",
+    ];
+    const lines = [headers, ...productivity.rows.map(r => [
+      r.name, r.branchCount, r.branches.join("; "),
+      r.accountCount, r.acctsByBucket["SMA-0"], r.acctsByBucket["SMA-1"], r.acctsByBucket["SMA-2"], r.acctsByBucket["NPA"],
+      Math.round(r.totalAmount), Math.round(r.threeMonthTotal), Math.round(r.threeMonthAvg),
+      Math.round(r.avgAmountPerDay), r.avgAccountsPerDay.toFixed(2),
+    ])];
+    const csv = lines.map(row => row.map(q).join(",")).join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "staff-productivity-" + nowDate() + ".csv";
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  };
+
   const presetLast30 = () => {
     const to = new Date();
     const from = new Date(); from.setDate(from.getDate() - 30);
@@ -4561,36 +4671,54 @@ function CollectionPerformanceWidget({ user, entries }) {
   );
   const visibleRowCount = viewMode === "bucket" ? (hasBucketData ? chartData.length : 0)
                                                  : chartData.length;
-
-  // Format helper for the data table.
   const fmt = (v) => formatINR(Math.round(Number(v) || 0));
+
+  // KPI tile colour palette (background / border / text).
+  const KPI_STYLES = [
+    "bg-teal-50 border-teal-200 text-teal-900",
+    "bg-indigo-50 border-indigo-200 text-indigo-900",
+    "bg-emerald-50 border-emerald-200 text-emerald-900",
+    "bg-amber-50 border-amber-200 text-amber-900",
+    "bg-sky-50 border-sky-200 text-sky-900",
+    "bg-fuchsia-50 border-fuchsia-200 text-fuchsia-900",
+    "bg-rose-50 border-rose-200 text-rose-900",
+    "bg-cyan-50 border-cyan-200 text-cyan-900",
+  ];
+  const KPI_LABEL_COLOURS = [
+    "text-teal-700","text-indigo-700","text-emerald-700","text-amber-700",
+    "text-sky-700","text-fuchsia-700","text-rose-700","text-cyan-700",
+  ];
+  const kpiTiles = [
+    { label: "Total Accounts",      value: productivity.aggregate.totalAccounts, formatter: (v) => v.toLocaleString("en-IN") },
+    { label: "Branches Covered",    value: productivity.aggregate.branchesCovered, formatter: (v) => v.toLocaleString("en-IN") },
+    { label: "Total Collection",    value: productivity.aggregate.totalAmount, formatter: formatLakhs },
+    { label: "3-Month Total",       value: productivity.aggregate.threeMonthTotal, formatter: formatLakhs },
+    { label: "3-Month Avg / Month", value: productivity.aggregate.threeMonthAvg, formatter: formatLakhs },
+    { label: "Avg ₹ / Day",         value: productivity.aggregate.avgAmountPerDay, formatter: formatLakhs },
+    { label: "Avg Accounts / Day",  value: productivity.aggregate.avgAccountsPerDay, formatter: (v) => (v || 0).toFixed(1) },
+    { label: "Active Staff",        value: productivity.aggregate.staffCount, formatter: (v) => v.toLocaleString("en-IN") },
+  ];
 
   return (
     <div className="bg-white rounded-xl border p-4 mb-6">
       <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
         <h3 className="text-sm font-semibold text-gray-700 flex items-center gap-2">
           <TrendingUp size={16} className="text-teal-600" />
-          Collection Performance — by Bucket
+          Collection Performance — Productivity + Bucket Analysis
           {viewMode === "bucket" && (
             <span className="text-[11px] font-normal text-gray-400">
-              {n} month{n === 1 ? "" : "s"} in range{selStaff.length > 1 ? " · " + selStaff.length + " staff" : ""}
+              {n} month{n === 1 ? "" : "s"} in range · {daysInRange} day{daysInRange === 1 ? "" : "s"}
             </span>
           )}
         </h3>
         <div className="flex items-center gap-2 flex-wrap">
           <div className="inline-flex rounded-lg border border-gray-200 overflow-hidden text-[11px]">
             <button onClick={() => setViewMode("bucket")}
-              className={"px-2.5 py-1 " + (viewMode === "bucket" ? "bg-teal-600 text-white" : "bg-white text-gray-700 hover:bg-gray-50")}>
-              By Bucket
-            </button>
+              className={"px-2.5 py-1 " + (viewMode === "bucket" ? "bg-teal-600 text-white" : "bg-white text-gray-700 hover:bg-gray-50")}>By Bucket</button>
             <button onClick={() => setViewMode("staff")}
-              className={"px-2.5 py-1 border-l border-gray-200 " + (viewMode === "staff" ? "bg-teal-600 text-white" : "bg-white text-gray-700 hover:bg-gray-50")}>
-              By Staff
-            </button>
+              className={"px-2.5 py-1 border-l border-gray-200 " + (viewMode === "staff" ? "bg-teal-600 text-white" : "bg-white text-gray-700 hover:bg-gray-50")}>By Staff</button>
             <button onClick={() => setViewMode("month")}
-              className={"px-2.5 py-1 border-l border-gray-200 " + (viewMode === "month" ? "bg-teal-600 text-white" : "bg-white text-gray-700 hover:bg-gray-50")}>
-              By Month
-            </button>
+              className={"px-2.5 py-1 border-l border-gray-200 " + (viewMode === "month" ? "bg-teal-600 text-white" : "bg-white text-gray-700 hover:bg-gray-50")}>By Month</button>
           </div>
           {viewMode !== "bucket" && (
             <button onClick={() => setShowAvg(s => !s)}
@@ -4604,6 +4732,10 @@ function CollectionPerformanceWidget({ user, entries }) {
               {showTable ? "✓ Data Table" : "Show Data Table"}
             </button>
           )}
+          <button onClick={() => setShowProductivity(s => !s)}
+            className={"text-[11px] px-2 py-1 rounded border transition-colors " + (showProductivity ? "bg-teal-600 text-white border-teal-600" : "bg-white text-teal-700 border-teal-300 hover:bg-teal-50")}>
+            {showProductivity ? "✓ Staff Productivity" : "Show Staff Productivity"}
+          </button>
           <button onClick={presetLast30} className="text-[11px] text-teal-700 hover:text-teal-900 underline">30d</button>
           <button onClick={presetLast90} className="text-[11px] text-teal-700 hover:text-teal-900 underline">90d</button>
           <button onClick={resetAll} className="text-[11px] text-gray-600 hover:text-red-600 underline">Reset</button>
@@ -4620,23 +4752,25 @@ function CollectionPerformanceWidget({ user, entries }) {
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 mb-4">
         <div>
           <label className="block text-[10px] font-semibold text-gray-600 uppercase mb-1">Date From</label>
-          <input type="date" value={dateFrom} onChange={e => setDateFrom(e.target.value)}
-            className="w-full px-2 py-1.5 border rounded text-xs bg-white" />
+          <input type="date" value={dateFrom} onChange={e => setDateFrom(e.target.value)} className="w-full px-2 py-1.5 border rounded text-xs bg-white" />
         </div>
         <div>
           <label className="block text-[10px] font-semibold text-gray-600 uppercase mb-1">Date To</label>
-          <input type="date" value={dateTo} onChange={e => setDateTo(e.target.value)}
-            className="w-full px-2 py-1.5 border rounded text-xs bg-white" />
+          <input type="date" value={dateTo} onChange={e => setDateTo(e.target.value)} className="w-full px-2 py-1.5 border rounded text-xs bg-white" />
         </div>
-        <CPMultiSelectFilter label="Branches" options={branchOptions}
-          value={selBranches} onChange={setSelBranches}
-          search={branchSearch} setSearch={setBranchSearch} />
-        <CPMultiSelectFilter label="Staff" options={staffIdOptions}
-          value={selStaff} onChange={setSelStaff}
-          search={staffSearch} setSearch={setStaffSearch}
-          renderLabel={(id) => staffNameById.get(id) || id} />
-        <CPMultiSelectFilter label="Buckets" options={BUCKETS}
-          value={selBuckets} onChange={setSelBuckets} />
+        <CPMultiSelectFilter label="Branches" options={branchOptions} value={selBranches} onChange={setSelBranches} search={branchSearch} setSearch={setBranchSearch} />
+        <CPMultiSelectFilter label="Staff" options={staffIdOptions} value={selStaff} onChange={setSelStaff} search={staffSearch} setSearch={setStaffSearch} renderLabel={(id) => staffNameById.get(id) || id} />
+        <CPMultiSelectFilter label="Buckets" options={BUCKETS} value={selBuckets} onChange={setSelBuckets} />
+      </div>
+
+      {/* ── KPI TILES ──────────────────────────────────────────────── */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-2 mb-4">
+        {kpiTiles.map((k, i) => (
+          <div key={k.label} className={"rounded-lg border p-2.5 " + KPI_STYLES[i % KPI_STYLES.length]}>
+            <p className={"text-[10px] uppercase font-semibold mb-0.5 " + KPI_LABEL_COLOURS[i % KPI_LABEL_COLOURS.length]}>{k.label}</p>
+            <p className="text-base font-bold leading-tight">{k.formatter(k.value)}</p>
+          </div>
+        ))}
       </div>
 
       {visibleRowCount === 0 ? (
@@ -4647,12 +4781,7 @@ function CollectionPerformanceWidget({ user, entries }) {
         <ResponsiveContainer width="100%"
           height={viewMode === "bucket" ? 360
                 : Math.max(320, 60 + chartData.length * (viewMode === "month" ? 60 : 28))}>
-          {/* Tight bars: barGap={1} between sibling bars; barCategoryGap
-              left at the recharts default so bucket groups stay visually
-              separated. */}
-          <ComposedChart data={chartData}
-            margin={{ top: 10, right: 16, bottom: 30, left: 0 }}
-            barGap={1}>
+          <ComposedChart data={chartData} margin={{ top: 10, right: 16, bottom: 30, left: 0 }} barGap={1}>
             <CartesianGrid strokeDasharray="3 3" />
             <XAxis dataKey={viewMode === "bucket" ? "bucket" : "name"}
               tick={{ fontSize: 12, fontWeight: 600 }}
@@ -4663,65 +4792,32 @@ function CollectionPerformanceWidget({ user, entries }) {
             <YAxis tickFormatter={v => formatLakhs(v)} tick={{ fontSize: 11 }} />
             <Tooltip content={renderTooltip} cursor={{ fill: "rgba(15, 118, 110, 0.04)" }} />
             <Legend wrapperStyle={{ fontSize: 11 }} />
-
             {viewMode === "bucket" && monthsInRange.map((ym, i) => (
-              <Bar key={ym}
-                dataKey={shortMonthLabel(ym)}
-                name={shortMonthLabel(ym)}
-                fill={MONTH_PALETTE[i % MONTH_PALETTE.length]}
-                radius={[3, 3, 0, 0]} />
+              <Bar key={ym} dataKey={shortMonthLabel(ym)} name={shortMonthLabel(ym)} fill={MONTH_PALETTE[i % MONTH_PALETTE.length]} radius={[3, 3, 0, 0]} />
             ))}
-            {viewMode === "bucket" && (
-              <Bar dataKey="total" name={totalLabel} fill={TOTAL_COLOR} radius={[3, 3, 0, 0]} />
-            )}
-            {viewMode === "bucket" && (
-              <Bar dataKey="avg" name={avgLabel} fill={AVG_COLOR} radius={[3, 3, 0, 0]} />
-            )}
-
-            {viewMode !== "bucket" && (
-              <Bar dataKey="SMA-0" name="SMA-0" fill={BUCKET_COLOR["SMA-0"]} radius={[3, 3, 0, 0]} />
-            )}
-            {viewMode !== "bucket" && (
-              <Bar dataKey="SMA-1" name="SMA-1" fill={BUCKET_COLOR["SMA-1"]} radius={[3, 3, 0, 0]} />
-            )}
-            {viewMode !== "bucket" && (
-              <Bar dataKey="SMA-2" name="SMA-2" fill={BUCKET_COLOR["SMA-2"]} radius={[3, 3, 0, 0]} />
-            )}
-            {viewMode !== "bucket" && (
-              <Bar dataKey="NPA" name="NPA" fill={BUCKET_COLOR["NPA"]} radius={[3, 3, 0, 0]} />
-            )}
-
+            {viewMode === "bucket" && (<Bar dataKey="total" name={totalLabel} fill={TOTAL_COLOR} radius={[3, 3, 0, 0]} />)}
+            {viewMode === "bucket" && (<Bar dataKey="avg" name={avgLabel} fill={AVG_COLOR} radius={[3, 3, 0, 0]} />)}
+            {viewMode !== "bucket" && (<Bar dataKey="SMA-0" name="SMA-0" fill={BUCKET_COLOR["SMA-0"]} radius={[3, 3, 0, 0]} />)}
+            {viewMode !== "bucket" && (<Bar dataKey="SMA-1" name="SMA-1" fill={BUCKET_COLOR["SMA-1"]} radius={[3, 3, 0, 0]} />)}
+            {viewMode !== "bucket" && (<Bar dataKey="SMA-2" name="SMA-2" fill={BUCKET_COLOR["SMA-2"]} radius={[3, 3, 0, 0]} />)}
+            {viewMode !== "bucket" && (<Bar dataKey="NPA" name="NPA" fill={BUCKET_COLOR["NPA"]} radius={[3, 3, 0, 0]} />)}
             {viewMode === "staff" && showAvg && (
-              <Line type="monotone" dataKey="avg3m" name="3-Month Avg"
-                stroke="#0d9488" strokeWidth={2}
-                dot={{ r: 4, fill: "#0d9488", strokeWidth: 0 }}
-                activeDot={{ r: 5 }} />
+              <Line type="monotone" dataKey="avg3m" name="3-Month Avg" stroke="#0d9488" strokeWidth={2} dot={{ r: 4, fill: "#0d9488", strokeWidth: 0 }} activeDot={{ r: 5 }} />
             )}
             {viewMode === "month" && showAvg && monthlyAvgRef > 0 && (
-              <ReferenceLine y={monthlyAvgRef} stroke="#0d9488" strokeDasharray="4 4"
-                label={{ value: "3-Month Avg: " + formatINR(Math.round(monthlyAvgRef)), position: "right", fill: "#0d9488", fontSize: 10 }} />
+              <ReferenceLine y={monthlyAvgRef} stroke="#0d9488" strokeDasharray="4 4" label={{ value: "3-Month Avg: " + formatINR(Math.round(monthlyAvgRef)), position: "right", fill: "#0d9488", fontSize: 10 }} />
             )}
           </ComposedChart>
         </ResponsiveContainer>
       )}
 
-      {/* ── Data table: exact values per (bucket [× staff] × month) ──── */}
       {viewMode === "bucket" && showTable && visibleRowCount > 0 && (
         <div className="mt-4 overflow-x-auto border border-gray-200 rounded-lg">
           <table className="w-full text-xs auto-layout">
             <thead className="bg-gray-50">
               <tr>
-                {perStaffGridRows ? (
-                  <>
-                    <th className="px-3 py-2 text-left font-semibold text-gray-700">Staff</th>
-                    <th className="px-3 py-2 text-left font-semibold text-gray-700">Bucket</th>
-                  </>
-                ) : (
-                  <th className="px-3 py-2 text-left font-semibold text-gray-700">Bucket</th>
-                )}
-                {monthsInRange.map(ym => (
-                  <th key={ym} className="px-3 py-2 text-right font-semibold text-gray-700">{fullMonthLabel(ym)}</th>
-                ))}
+                {perStaffGridRows ? (<><th className="px-3 py-2 text-left font-semibold text-gray-700">Staff</th><th className="px-3 py-2 text-left font-semibold text-gray-700">Bucket</th></>) : (<th className="px-3 py-2 text-left font-semibold text-gray-700">Bucket</th>)}
+                {monthsInRange.map(ym => (<th key={ym} className="px-3 py-2 text-right font-semibold text-gray-700">{fullMonthLabel(ym)}</th>))}
                 <th className="px-3 py-2 text-right font-semibold text-teal-700">{totalLabel}</th>
                 <th className="px-3 py-2 text-right font-semibold text-teal-700">{avgLabel}</th>
               </tr>
@@ -4732,29 +4828,12 @@ function CollectionPerformanceWidget({ user, entries }) {
                   {perStaffGridRows ? (
                     <>
                       <td className="px-3 py-1.5 text-gray-800">{r.staffName}</td>
-                      <td className="px-3 py-1.5">
-                        <span className="inline-flex items-center gap-1.5">
-                          <span className="inline-block w-2 h-2 rounded-sm" style={{ background: BUCKET_COLOR[r.bucket] }} />
-                          <span className="text-gray-800 font-medium">{r.bucket}</span>
-                        </span>
-                      </td>
+                      <td className="px-3 py-1.5"><span className="inline-flex items-center gap-1.5"><span className="inline-block w-2 h-2 rounded-sm" style={{ background: BUCKET_COLOR[r.bucket] }} /><span className="text-gray-800 font-medium">{r.bucket}</span></span></td>
                     </>
                   ) : (
-                    <td className="px-3 py-1.5">
-                      <span className="inline-flex items-center gap-1.5">
-                        <span className="inline-block w-2 h-2 rounded-sm" style={{ background: BUCKET_COLOR[r.bucket] }} />
-                        <span className="text-gray-800 font-medium">{r.bucket}</span>
-                      </span>
-                    </td>
+                    <td className="px-3 py-1.5"><span className="inline-flex items-center gap-1.5"><span className="inline-block w-2 h-2 rounded-sm" style={{ background: BUCKET_COLOR[r.bucket] }} /><span className="text-gray-800 font-medium">{r.bucket}</span></span></td>
                   )}
-                  {monthsInRange.map(ym => {
-                    const v = r[shortMonthLabel(ym)] || 0;
-                    return (
-                      <td key={ym} className={"px-3 py-1.5 text-right num " + (v > 0 ? "text-gray-800" : "text-gray-300")}>
-                        {fmt(v)}
-                      </td>
-                    );
-                  })}
+                  {monthsInRange.map(ym => { const v = r[shortMonthLabel(ym)] || 0; return (<td key={ym} className={"px-3 py-1.5 text-right num " + (v > 0 ? "text-gray-800" : "text-gray-300")}>{fmt(v)}</td>); })}
                   <td className="px-3 py-1.5 text-right num font-semibold text-teal-700">{fmt(r.total)}</td>
                   <td className="px-3 py-1.5 text-right num text-teal-600">{fmt(r.avg)}</td>
                 </tr>
@@ -4764,21 +4843,94 @@ function CollectionPerformanceWidget({ user, entries }) {
         </div>
       )}
 
-      <div className="text-[11px] text-gray-500 mt-2 space-y-0.5">
+      {/* ── STAFF PRODUCTIVITY PANEL ─────────────────────────────── */}
+      {showProductivity && productivity.rows.length > 0 && (
+        <div className="mt-5">
+          <div className="flex items-center justify-between mb-2 flex-wrap gap-2">
+            <h4 className="text-xs font-semibold text-gray-700 uppercase tracking-wide flex items-center gap-2">
+              <Activity size={13} className="text-teal-600" />
+              Staff Productivity — {productivity.rows.length} staff · {daysInRange} day{daysInRange === 1 ? "" : "s"} in range
+            </h4>
+            {isAdminOrElevated && (
+              <button onClick={handleExportProductivity}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium rounded bg-white text-teal-700 border border-teal-300 hover:bg-teal-50">
+                <Download size={11} /> Export Productivity CSV
+              </button>
+            )}
+          </div>
+          <div className="overflow-x-auto border border-gray-200 rounded-lg">
+            <table className="w-full text-xs auto-layout">
+              <thead className="bg-gray-50">
+                <tr>
+                  <th className="px-3 py-2 text-left font-semibold text-gray-700">Staff</th>
+                  <th className="px-3 py-2 text-right font-semibold text-gray-700">Branches</th>
+                  <th className="px-3 py-2 text-right font-semibold text-gray-700">Total Accts</th>
+                  <th className="px-3 py-2 text-right font-semibold text-blue-700">SMA-0</th>
+                  <th className="px-3 py-2 text-right font-semibold text-yellow-700">SMA-1</th>
+                  <th className="px-3 py-2 text-right font-semibold text-orange-700">SMA-2</th>
+                  <th className="px-3 py-2 text-right font-semibold text-red-700">NPA</th>
+                  <th className="px-3 py-2 text-right font-semibold text-gray-800">Total Amount</th>
+                  <th className="px-3 py-2 text-right font-semibold text-teal-700">3-Month Total</th>
+                  <th className="px-3 py-2 text-right font-semibold text-teal-600">3-Month Avg</th>
+                  <th className="px-3 py-2 text-right font-semibold text-gray-700">Avg ₹/Day</th>
+                  <th className="px-3 py-2 text-right font-semibold text-gray-700">Avg Accts/Day</th>
+                </tr>
+              </thead>
+              <tbody>
+                {productivity.rows.map(r => (
+                  <tr key={r.staffId} className="border-t border-gray-100 hover:bg-gray-50">
+                    <td className="px-3 py-1.5">
+                      <div className="text-gray-900 font-medium">{r.name}</div>
+                      <div className="text-[10px] text-gray-500 truncate max-w-[200px]" title={r.branches.join(", ")}>
+                        {r.branches.length > 0 ? r.branches.join(" · ") : "—"}
+                      </div>
+                    </td>
+                    <td className="px-3 py-1.5 text-right num text-gray-700">{r.branchCount}</td>
+                    <td className="px-3 py-1.5 text-right num font-semibold text-gray-900">{r.accountCount}</td>
+                    <td className="px-3 py-1.5 text-right num text-blue-700">{r.acctsByBucket["SMA-0"]}</td>
+                    <td className="px-3 py-1.5 text-right num text-yellow-700">{r.acctsByBucket["SMA-1"]}</td>
+                    <td className="px-3 py-1.5 text-right num text-orange-700">{r.acctsByBucket["SMA-2"]}</td>
+                    <td className="px-3 py-1.5 text-right num text-red-700">{r.acctsByBucket["NPA"]}</td>
+                    <td className="px-3 py-1.5 text-right num font-semibold text-gray-900">{fmt(r.totalAmount)}</td>
+                    <td className="px-3 py-1.5 text-right num text-teal-700">{fmt(r.threeMonthTotal)}</td>
+                    <td className="px-3 py-1.5 text-right num text-teal-600">{fmt(r.threeMonthAvg)}</td>
+                    <td className="px-3 py-1.5 text-right num text-gray-700">{fmt(r.avgAmountPerDay)}</td>
+                    <td className="px-3 py-1.5 text-right num text-gray-700">{r.avgAccountsPerDay.toFixed(2)}</td>
+                  </tr>
+                ))}
+              </tbody>
+              <tfoot className="bg-gray-50">
+                <tr className="border-t-2 border-gray-200 font-semibold">
+                  <td className="px-3 py-2 text-gray-800">Total ({productivity.rows.length} staff)</td>
+                  <td className="px-3 py-2 text-right num text-gray-800">{productivity.aggregate.branchesCovered}</td>
+                  <td className="px-3 py-2 text-right num text-gray-900">{productivity.aggregate.totalAccounts}</td>
+                  <td className="px-3 py-2 text-right num text-blue-800">{productivity.rows.reduce((a, r) => a + r.acctsByBucket["SMA-0"], 0)}</td>
+                  <td className="px-3 py-2 text-right num text-yellow-800">{productivity.rows.reduce((a, r) => a + r.acctsByBucket["SMA-1"], 0)}</td>
+                  <td className="px-3 py-2 text-right num text-orange-800">{productivity.rows.reduce((a, r) => a + r.acctsByBucket["SMA-2"], 0)}</td>
+                  <td className="px-3 py-2 text-right num text-red-800">{productivity.rows.reduce((a, r) => a + r.acctsByBucket["NPA"], 0)}</td>
+                  <td className="px-3 py-2 text-right num text-gray-900">{fmt(productivity.aggregate.totalAmount)}</td>
+                  <td className="px-3 py-2 text-right num text-teal-800">{fmt(productivity.aggregate.threeMonthTotal)}</td>
+                  <td className="px-3 py-2 text-right num text-teal-700">{fmt(productivity.aggregate.threeMonthAvg)}</td>
+                  <td className="px-3 py-2 text-right num text-gray-800">{fmt(productivity.aggregate.avgAmountPerDay)}</td>
+                  <td className="px-3 py-2 text-right num text-gray-800">{productivity.aggregate.avgAccountsPerDay.toFixed(2)}</td>
+                </tr>
+              </tfoot>
+            </table>
+          </div>
+        </div>
+      )}
+
+      <div className="text-[11px] text-gray-500 mt-3 space-y-0.5">
         <div>
-          {viewMode === "bucket"
-            ? "Each bucket shows month-wise collections + " + totalLabel + " + " + avgLabel + ". The grid below prints the exact numbers per (bucket × month) so values are verifiable. Select multiple staff to add per-staff rows for direct comparison."
-            : viewMode === "staff"
-              ? "Each staff shows one bar per bucket. The teal line overlays the 3-Month Average (90 days before the start date, ÷ 3). Staff with no current-period collections are hidden."
-              : "Bars show monthly collections per bucket within the selected range. The dashed teal line marks the average monthly collection over the 90 days before the start date."}
+          <span className="font-medium">Productivity tiles + table</span> use the selected filters. "Avg ₹/Day" and "Avg Accounts/Day" divide by calendar days in the date range ({daysInRange} day{daysInRange === 1 ? "" : "s"}). Account counts dedupe by loan account → customer → entry id.
         </div>
         {excludedSummary.total > 0 && (
           <div className="text-gray-400">
-            <span className="font-medium">Excluded from chart:</span>{" "}
+            <span className="font-medium">Excluded:</span>{" "}
             {excludedSummary.adminAuthored > 0 && <span>{excludedSummary.adminAuthored} admin-authored</span>}
             {excludedSummary.adminAuthored > 0 && excludedSummary.noBucket > 0 && <span> · </span>}
             {excludedSummary.noBucket > 0 && <span>{excludedSummary.noBucket} without bucket assignment</span>}
-            <span> (assign SMA-0/1/2/NPA on the entry to include them)</span>
+            <span> (assign SMA-0/1/2/NPA on the entry to include them).</span>
           </div>
         )}
       </div>
