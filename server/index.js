@@ -442,6 +442,52 @@ app.get("/api/admin/duplicate-users", (req, res) => {
 // Effect: every entry where enteredBy === duplicateId is re-attributed to
 // canonicalId (and enteredByName is updated to the canonical's name). The
 // duplicate user is marked active:false. Idempotent on repeat calls.
+// ─── PATCH /api/users/:id/password ─────────────────────────────────────
+// Focused password-update endpoint. Avoids the full-array-replace pattern
+// that POST /api/:collection uses — that pattern is dangerous because any
+// stale client tab could overwrite the live users.json with old data,
+// reverting password changes and re-flipping mustChangePassword to true.
+//
+// Behaviour:
+//   • Locates the target user by id.
+//   • Updates ONLY password + mustChangePassword: false.
+//   • Preserves every other field (role, branch, active, name, etc.).
+//   • Audit-logs the action so we can trace who changed what.
+//
+// Authorization: the caller MUST be either the user themselves (header
+// x-od-user matches :id) or an admin (x-od-role === "admin"). MIS staff
+// cannot change other users' passwords.
+app.patch("/api/users/:id/password", (req, res) => {
+  try {
+    const targetId = String(req.params.id || "");
+    const callerId = req.header("x-od-user") || "";
+    const callerRole = req.header("x-od-role") || "";
+    if (!targetId) return res.status(400).json({ error: "Missing user id" });
+    const isSelf = callerId && callerId === targetId;
+    const isAdmin = callerRole === "admin";
+    if (!isSelf && !isAdmin) {
+      return res.status(403).json({ error: "You can only change your own password unless you are an Administrator." });
+    }
+    const password = req.body && typeof req.body.password === "string" ? req.body.password : "";
+    if (!password || password.length < 6) {
+      return res.status(400).json({ error: "Password must be at least 6 characters." });
+    }
+    if (password === "Dhanam@123") {
+      return res.status(400).json({ error: "Please choose a different password — the default password is not allowed." });
+    }
+    const users = loadJSON("users.json", []);
+    const idx = users.findIndex(u => u && u.id === targetId);
+    if (idx === -1) return res.status(404).json({ error: "User not found" });
+    users[idx] = { ...users[idx], password, mustChangePassword: false };
+    saveJSON("users.json", users);
+    console.log(`[users/password] ${targetId} updated by ${callerId || "(unknown)"} (role: ${callerRole || "n/a"})`);
+    res.json({ ok: true, userId: targetId });
+  } catch (err) {
+    console.error("[/api/users/:id/password] failed:", err);
+    res.status(500).json({ error: "Failed to update password: " + (err.message || err) });
+  }
+});
+
 app.post("/api/admin/merge-users", (req, res) => {
   const { canonicalId, duplicateId } = req.body || {};
   if (!canonicalId || !duplicateId) {

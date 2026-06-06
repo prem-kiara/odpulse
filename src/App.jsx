@@ -5144,12 +5144,37 @@ function ChangePasswordModal({ user, users, setUsers, onDone, isForced }) {
   const [error, setError] = useState("");
   const [showPass, setShowPass] = useState(false);
 
-  const handleChange = () => {
+  const handleChange = async () => {
     if (!newPass || newPass.length < 6) { setError("Password must be at least 6 characters."); return; }
     if (newPass === "Dhanam@123") { setError("Please choose a different password."); return; }
     if (newPass !== confirmPass) { setError("Passwords do not match."); return; }
+    setError("");
+    // Use a focused endpoint that updates ONLY this user on the server.
+    // The old path POSTed the entire users array via saveData, which let
+    // any stale tab clobber the change with old data. The new endpoint
+    // does a server-side merge by id, so concurrent updates are safe.
+    try {
+      const res = await fetch(`${API_BASE}/users/${encodeURIComponent(user.id)}/password`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", "x-od-user": user.id, "x-od-role": user.role || "" },
+        body: JSON.stringify({ password: newPass }),
+      });
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({}));
+        setError("Could not save password: " + (j.error || `HTTP ${res.status}`));
+        return;
+      }
+    } catch (err) {
+      setError("Network error while saving password. Please try again.");
+      console.error("[ChangePassword] network error:", err);
+      return;
+    }
+    // Mirror locally so the UI reflects the change without a refetch. We
+    // intentionally do NOT call saveData(users) here — that would POST the
+    // whole array and re-introduce the race.
     const updated = users.map(u => u.id === user.id ? { ...u, password: newPass, mustChangePassword: false } : u);
-    setUsers(updated); saveData(STORAGE_KEYS.users, updated);
+    setUsers(updated);
+    localStorage.setItem(STORAGE_KEYS.users, JSON.stringify(updated));
     onDone({ ...user, password: newPass, mustChangePassword: false });
   };
 
@@ -5283,34 +5308,66 @@ export default function App() {
       const apiAvailable = apiEntries !== null || apiUsers !== null;
 
       // ── Users ──
+      // PASSWORD-RESET BUG FIX:
+      // Earlier this branch did `saveData(STORAGE_KEYS.users, DEFAULT_USERS)`
+      // whenever the API was briefly unreachable AND the local version flag
+      // was older than APP_VERSION. saveData() POSTs the entire array to
+      // /api/users, so a single network blip would CLOBBER the server-side
+      // users.json with DEFAULT_USERS — wiping every password change and
+      // resetting `mustChangePassword: true` for every staff user. The next
+      // morning, everyone was prompted to reset again.
+      //
+      // The fix:
+      //   1. On every successful API fetch, mark localStorage.version =
+      //      APP_VERSION so the offline branch can recognize "we have a
+      //      real prior session" vs "this is genuine first boot".
+      //   2. In the offline branch, NEVER POST DEFAULT_USERS to the server.
+      //      DEFAULT_USERS is only the server's first-boot seed (handled by
+      //      loadJSON in server/index.js). Use it locally only as a fallback
+      //      when neither the API nor localStorage has anything.
       let finalUsers;
       if (apiAvailable && apiUsers && apiUsers.length > 0) {
         finalUsers = apiUsers;
         localStorage.setItem(STORAGE_KEYS.users, JSON.stringify(finalUsers));
+        // Mark this device as "seen real data" so the offline fallback below
+        // never reverts to defaults on a future network blip.
+        localStorage.setItem(STORAGE_KEYS.version, JSON.stringify(APP_VERSION));
       } else {
-        const savedVersion = loadData(STORAGE_KEYS.version, 0);
-        if (savedVersion < APP_VERSION) {
-          finalUsers = DEFAULT_USERS;
-          saveData(STORAGE_KEYS.users, DEFAULT_USERS);
-          saveData(STORAGE_KEYS.version, APP_VERSION);
+        // OFFLINE-FALLBACK ONLY. Read whatever's in localStorage. Do NOT
+        // write to server here — that's what caused the daily password
+        // reset loop.
+        const stored = loadData(STORAGE_KEYS.users, null);
+        if (Array.isArray(stored) && stored.length > 0) {
+          finalUsers = stored;
         } else {
-          finalUsers = loadData(STORAGE_KEYS.users, DEFAULT_USERS);
+          // True first-run on this device AND server unreachable. Seed
+          // DEFAULT_USERS into localStorage so the login screen has SOME
+          // accounts to authenticate against, but don't push to the server.
+          // When the API comes back up, the next bootstrap will overwrite
+          // local with authoritative server data.
+          finalUsers = DEFAULT_USERS;
+          localStorage.setItem(STORAGE_KEYS.users, JSON.stringify(DEFAULT_USERS));
+          localStorage.setItem(STORAGE_KEYS.version, JSON.stringify(APP_VERSION));
         }
       }
       setUsers(finalUsers);
 
       // ── Branches ──
+      // Same destructive-seed risk as the users block above: a transient
+      // API outage could `saveData(branches, DEFAULT_BRANCHES)` and POST
+      // defaults to the server, wiping any branches the admin added. Apply
+      // the same fix — never POST defaults from the offline fallback path.
       let finalBranches;
       if (apiAvailable && apiBranches && apiBranches.length > 0) {
         finalBranches = apiBranches;
         localStorage.setItem(STORAGE_KEYS.branches, JSON.stringify(finalBranches));
       } else {
-        const savedVersion = loadData(STORAGE_KEYS.version, 0);
-        if (savedVersion < APP_VERSION) {
-          finalBranches = DEFAULT_BRANCHES;
-          saveData(STORAGE_KEYS.branches, DEFAULT_BRANCHES);
+        const stored = loadData(STORAGE_KEYS.branches, null);
+        if (Array.isArray(stored) && stored.length > 0) {
+          finalBranches = stored;
         } else {
-          finalBranches = loadData(STORAGE_KEYS.branches, DEFAULT_BRANCHES);
+          finalBranches = DEFAULT_BRANCHES;
+          localStorage.setItem(STORAGE_KEYS.branches, JSON.stringify(DEFAULT_BRANCHES));
         }
       }
       setBranches(finalBranches);
