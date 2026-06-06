@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend, LineChart, Line, ReferenceLine } from "recharts";
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend, LineChart, Line, ReferenceLine, ComposedChart } from "recharts";
 import { Plus, Trash2, LogOut, Settings, Users, GitBranch, LayoutDashboard, FileText, ChevronDown, ChevronRight, ArrowLeft, Search, Eye, EyeOff, Edit2, Save, X, AlertTriangle, CheckCircle, Database, Shield, UserPlus, ChevronUp, Download, Calendar, Tag, Lock, Upload, Bell, Clock, CreditCard, TrendingUp, Activity } from "lucide-react";
 import { CustomerInfoPanel, DataUploadPage, CollectionDashboard } from "./OdInsights.jsx";
 import ReportsAnalytics from "./ReportsAnalytics.jsx";
@@ -4027,11 +4027,11 @@ function Dashboard({ user, entries, branches, config }) {
 }
 
 // ─── Collection Performance: reusable multi-select filter ──────────────────
-// Controlled dropdown that auto-closes on outside-click. Earlier this used
-// <details> which has native open/close but does NOT close when the user
-// clicks elsewhere on the page — that was leaving the dropdown open and
-// obscuring the chart. The new pattern owns its `open` state and listens
-// for mousedown events on document; clicks outside the rootRef close it.
+// Controlled dropdown that auto-closes on outside-click (mousedown listener
+// on document) and on Escape. Shows ONLY a count summary in the trigger
+// ("9 Staff Selected") — no chip row underneath. Individual selections are
+// visible only when the dropdown is opened. Keeps the chart from being
+// pushed down by long chip rows.
 function CPMultiSelectFilter({ label, options, value, onChange, search, setSearch, renderLabel }) {
   const rl = renderLabel || ((v) => v);
   const [open, setOpen] = useState(false);
@@ -4055,14 +4055,20 @@ function CPMultiSelectFilter({ label, options, value, onChange, search, setSearc
     ? options.filter(o => String(rl(o)).toLowerCase().includes(search.trim().toLowerCase()))
     : options;
 
-  const summaryText = value.length === 0 ? "All " + label
-    : value.length === 1 ? String(rl(value[0]))
-    : value.length + " selected";
+  // Summary text — always a count, never the comma-separated list.
+  //   • 0 selected → "All <Label>"  (filter is inactive)
+  //   • 1 selected → the single value (still concise)
+  //   • 2+ selected → "N <Label> Selected"
+  const summaryText = value.length === 0
+    ? "All " + label
+    : value.length === 1
+      ? String(rl(value[0]))
+      : value.length + " " + label + " Selected";
 
   return (
     <div ref={rootRef} className="relative">
       <label className="block text-[10px] font-semibold text-gray-600 uppercase mb-1">
-        {label}{value.length > 0 ? ` (${value.length})` : ""}
+        {label}
       </label>
       <button type="button" onClick={() => setOpen(o => !o)}
         className="w-full px-2 py-1.5 border rounded text-xs bg-white text-left flex items-center justify-between hover:bg-gray-50">
@@ -4113,49 +4119,41 @@ function CPMultiSelectFilter({ label, options, value, onChange, search, setSearc
           </div>
         </div>
       )}
-      {value.length > 0 && (
-        <div className="flex flex-wrap gap-1 mt-1">
-          {value.map(v => (
-            <span key={String(v)} className="inline-flex items-center gap-0.5 px-1.5 py-0.5 bg-teal-50 text-teal-700 border border-teal-200 rounded text-[10px]">
-              {String(rl(v))}
-              <button type="button"
-                onClick={() => onChange(value.filter(x => x !== v))}
-                className="ml-0.5 hover:text-teal-900" aria-label={"Remove " + String(rl(v))}>×</button>
-            </span>
-          ))}
-        </div>
-      )}
     </div>
   );
 }
 
 // ─── Collection Performance Widget ─────────────────────────────────────────
-// Dashboard analytics widget — interactive bar chart (NOT a table) showing
-// collection performance across staff and months, broken down by bucket.
+// Interactive chart showing collection performance by staff and month,
+// broken down per bucket.
 //
-// View modes (segmented toggle):
-//   • Staff  — X-axis = staff name. Each bucket is a separate side-by-side
-//              bar so SMA-0 / SMA-1 / SMA-2 / NPA / No-Bucket are directly
-//              comparable. Optional 3-Month Avg overlay shown as an extra
-//              teal bar per staff.
-//   • Month  — X-axis = month within the selected range. Each bucket is a
-//              separate bar so trend per bucket is visible. The 3-Month
-//              Avg appears as a horizontal ReferenceLine for the global
-//              monthly comparison level.
+// What changed vs the previous version (and why):
+//   • Previous behaviour: a staff member with NO collections in the selected
+//     period but with prior-90-day data would still appear, rendering five
+//     zero-height bucket bars and only the avg3m bar visible. The user saw
+//     "only the 3-Month Average bar is showing". Fix: in Staff mode, only
+//     include staff with currentTotal > 0. Every visible staff has real
+//     bucket data to display.
+//   • Previous chart used a Bar for avg3m next to five bucket bars — the
+//     avg bar was typically the SUM, so it dwarfed each individual bucket
+//     bar and gave the impression buckets weren't rendering. Fix: switch
+//     to a ComposedChart and render avg3m as a Line series (teal, with
+//     dots) overlaid across staff. The line stops competing for bar width
+//     and acts as a clear visual reference.
+//   • Buckets are NOT stacked (no stackId). Five side-by-side bars per
+//     staff, colour-coded SMA-0 / SMA-1 / SMA-2 / NPA / No Bucket.
 //
-// Filters: Branch / Staff / Bucket (multi-select with Select All + click-
-// outside auto-close) + Date Range. RBAC: Export CSV visible to Admin + MIS.
+// Filters: Branch / Staff / Bucket (multi-select, click-outside close,
+// count-only summary — no chip row) + Date Range. RBAC: Export CSV visible
+// to Admin + MIS only.
 function CollectionPerformanceWidget({ user, entries }) {
   const isAdminOrElevated = user.role === "admin" || user.role === "elevated_staff";
 
-  // Users for staff-name lookup.
   const users = useMemo(() => {
     try { return JSON.parse(localStorage.getItem(STORAGE_KEYS.users) || "[]"); }
     catch { return []; }
   }, []);
 
-  // Default = last 90 days (3 months) so the Month view shows a meaningful
-  // multi-month comparison out of the box.
   const defaultTo = useMemo(() => nowDate(), []);
   const defaultFrom = useMemo(() => {
     const d = new Date(); d.setDate(d.getDate() - 90);
@@ -4170,8 +4168,7 @@ function CollectionPerformanceWidget({ user, entries }) {
   const [branchSearch, setBranchSearch] = useState("");
   const [staffSearch, setStaffSearch] = useState("");
 
-  // "staff" | "month" — segmented toggle. Defaults to staff.
-  const [viewMode, setViewMode] = useState("staff");
+  const [viewMode, setViewMode] = useState("staff"); // "staff" | "month"
   const [showAvg, setShowAvg] = useState(true);
 
   const branchOptions = useMemo(() => Array.from(new Set(
@@ -4221,14 +4218,12 @@ function CollectionPerformanceWidget({ user, entries }) {
     return true;
   }, [selBranches, selStaff, selBuckets]);
 
-  // Month-label helper: "2026-04" → "Apr 2026"
   const monthLabel = (ym) => {
     if (!ym) return "";
     const [y, m] = ym.split("-");
     return MONTHS[Math.max(0, Math.min(11, parseInt(m, 10) - 1))] + " " + y;
   };
 
-  // Aggregate per current view mode.
   const chartData = useMemo(() => {
     if (viewMode === "month") {
       const byMonth = new Map();
@@ -4291,13 +4286,16 @@ function CollectionPerformanceWidget({ user, entries }) {
       slot.accountCount = (accounts.get(sid) || new Set()).size;
       slot.avg3m = slot.prior90 / 3;
     }
+    // STRICT filter: only include staff with current-period activity. Earlier
+    // we OR-ed with avg3m > 0, which let prior-only staff in and produced
+    // the "only the avg bar shows" symptom. If you want to see prior-only
+    // staff, widen the date range.
     return Array.from(byStaff.values())
-      .filter(s => s.currentTotal > 0 || s.avg3m > 0)
+      .filter(s => s.currentTotal > 0)
       .sort((a, b) => b.currentTotal - a.currentTotal);
   }, [viewMode, entries, dateFrom, dateTo, threeMonthsStart, matchesFilters, staffNameById]);
 
-  // Global 3-Month Avg amount per month for the ReferenceLine in Month mode.
-  // Sums the same filters across the prior-90-day window and divides by 3.
+  // Global 3-Month Avg for Month-mode ReferenceLine.
   const monthlyAvgRef = useMemo(() => {
     if (viewMode !== "month" || !showAvg || !threeMonthsStart) return 0;
     let total = 0;
@@ -4404,7 +4402,6 @@ function CollectionPerformanceWidget({ user, entries }) {
           </span>
         </h3>
         <div className="flex items-center gap-2 flex-wrap">
-          {/* View toggle: Staff vs Month */}
           <div className="inline-flex rounded-lg border border-gray-200 overflow-hidden text-[11px]">
             <button onClick={() => setViewMode("staff")}
               className={"px-2.5 py-1 " + (viewMode === "staff" ? "bg-teal-600 text-white" : "bg-white text-gray-700 hover:bg-gray-50")}>
@@ -4443,14 +4440,14 @@ function CollectionPerformanceWidget({ user, entries }) {
           <input type="date" value={dateTo} onChange={e => setDateTo(e.target.value)}
             className="w-full px-2 py-1.5 border rounded text-xs bg-white" />
         </div>
-        <CPMultiSelectFilter label="Branch" options={branchOptions}
+        <CPMultiSelectFilter label="Branches" options={branchOptions}
           value={selBranches} onChange={setSelBranches}
           search={branchSearch} setSearch={setBranchSearch} />
         <CPMultiSelectFilter label="Staff" options={staffIdOptions}
           value={selStaff} onChange={setSelStaff}
           search={staffSearch} setSearch={setStaffSearch}
           renderLabel={(id) => staffNameById.get(id) || id} />
-        <CPMultiSelectFilter label="Bucket" options={BUCKETS}
+        <CPMultiSelectFilter label="Buckets" options={BUCKETS}
           value={selBuckets} onChange={setSelBuckets} />
       </div>
 
@@ -4461,7 +4458,10 @@ function CollectionPerformanceWidget({ user, entries }) {
       ) : (
         <ResponsiveContainer width="100%"
           height={Math.max(320, 60 + chartData.length * (viewMode === "month" ? 60 : 28))}>
-          <BarChart data={chartData} margin={{ top: 10, right: 16, bottom: 30, left: 0 }}>
+          {/* ComposedChart so we can mix grouped Bars (per bucket) with a
+              Line (3-Month Avg). The Line doesn't compete for bar width and
+              acts as a clear visual reference across staff. */}
+          <ComposedChart data={chartData} margin={{ top: 10, right: 16, bottom: 30, left: 0 }}>
             <CartesianGrid strokeDasharray="3 3" />
             <XAxis dataKey="name" tick={{ fontSize: 11 }}
               angle={viewMode === "month" ? 0 : -30}
@@ -4471,29 +4471,32 @@ function CollectionPerformanceWidget({ user, entries }) {
             <YAxis tickFormatter={v => formatLakhs(v)} tick={{ fontSize: 11 }} />
             <Tooltip content={renderTooltip} cursor={{ fill: "rgba(15, 118, 110, 0.04)" }} />
             <Legend wrapperStyle={{ fontSize: 11 }} />
-            {/* GROUPED (not stacked) bars per bucket — each bucket gets its
-                own side-by-side bar so they're directly comparable. */}
+            {/* GROUPED bars — each bucket gets its own side-by-side bar */}
             <Bar dataKey="SMA-0" name="SMA-0" fill={COLOR["SMA-0"]} radius={[3, 3, 0, 0]} />
             <Bar dataKey="SMA-1" name="SMA-1" fill={COLOR["SMA-1"]} radius={[3, 3, 0, 0]} />
             <Bar dataKey="SMA-2" name="SMA-2" fill={COLOR["SMA-2"]} radius={[3, 3, 0, 0]} />
             <Bar dataKey="NPA"   name="NPA"   fill={COLOR["NPA"]}   radius={[3, 3, 0, 0]} />
             <Bar dataKey="Other" name="No Bucket" fill={COLOR["Other"]} radius={[3, 3, 0, 0]} />
-            {/* Staff mode: per-staff 3-Month Avg as an extra bar. */}
+            {/* Staff mode: avg3m as a Line overlay so it doesn't visually
+                consume bar width or dwarf the per-bucket bars. */}
             {viewMode === "staff" && showAvg && (
-              <Bar dataKey="avg3m" name="3-Month Avg" fill="#0d9488" radius={[3, 3, 0, 0]} />
+              <Line type="monotone" dataKey="avg3m" name="3-Month Avg"
+                stroke="#0d9488" strokeWidth={2}
+                dot={{ r: 4, fill: "#0d9488", strokeWidth: 0 }}
+                activeDot={{ r: 5 }} />
             )}
-            {/* Month mode: global 3-Month Avg as a horizontal reference line. */}
+            {/* Month mode: dashed horizontal ReferenceLine for the global avg. */}
             {viewMode === "month" && showAvg && monthlyAvgRef > 0 && (
               <ReferenceLine y={monthlyAvgRef} stroke="#0d9488" strokeDasharray="4 4"
                 label={{ value: "3-Month Avg: " + formatINR(Math.round(monthlyAvgRef)), position: "right", fill: "#0d9488", fontSize: 10 }} />
             )}
-          </BarChart>
+          </ComposedChart>
         </ResponsiveContainer>
       )}
 
       <p className="text-[11px] text-gray-500 mt-2">
         {viewMode === "staff"
-          ? "Each staff has one bar per bucket — colors match SMA badges. Toggle 3-Month Avg to compare against the average of the 90 days before the selected start date."
+          ? "Each staff shows one bar per bucket (SMA-0 / SMA-1 / SMA-2 / NPA / No Bucket). The teal line overlays the 3-Month Average (90 days before the start date, ÷ 3). Staff with no current-period collections are hidden — widen the date range to include them."
           : "Bars show monthly collections per bucket within the selected range. The dashed teal line marks the average monthly collection over the 90 days before the start date."}
       </p>
     </div>
