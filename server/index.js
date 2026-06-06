@@ -186,6 +186,114 @@ app.get("/api/health", (req, res) => {
   });
 });
 
+// ─── POST /api/notifications/export ────────────────────────────────────
+// Server-side notification export. Returns text/csv. RBAC enforced via
+// requireAdminOrElevated — non-admin/non-MIS callers get HTTP 403 before
+// any data is read.
+// Body: { type, from, to, branches[], staff }  — all optional filters.
+app.post("/api/notifications/export", requireAdminOrElevated, (req, res) => {
+  try {
+    const { type = "", from = "", to = "", branches = [], staff = "" } = req.body || {};
+    const entries = loadJSON("entries.json", []);
+    const notifications = loadJSON("notifications.json", []);
+    const users = loadJSON("users.json", []);
+
+    const today = new Date().toISOString().slice(0, 10);
+    const tmrD = new Date(); tmrD.setDate(tmrD.getDate() + 1);
+    const tmr = tmrD.toISOString().slice(0, 10);
+
+    const classify = (e) => {
+      if (!e || (!e.ptpDate && !e.ptpStatus)) return null;
+      if (e.ptpStatus === "paid") return "ptp_paid";
+      if (e.ptpDate === today) return "ptp_due_today";
+      if (e.ptpDate === tmr)   return "ptp_due_tomorrow";
+      if (e.ptpDate && e.ptpDate < today) return "ptp_overdue";
+      return "ptp_pending";
+    };
+    const typeLabel = {
+      ptp_pending: "PTP Pending",
+      ptp_overdue: "PTP Overdue",
+      ptp_due_today: "PTP Due Today",
+      ptp_due_tomorrow: "PTP Due Tomorrow",
+      ptp_paid: "PTP Payment Received",
+      ptp_reminder: "PTP Reminder Sent",
+    };
+    const fmtDMY = (iso) => {
+      if (!iso) return "";
+      const [y, m, d] = String(iso).split("-");
+      return (d && m && y) ? `${d}-${m}-${y}` : "";
+    };
+
+    const recipientsByEntry = new Map();
+    for (const n of notifications) {
+      if (!n || !n.entryId || !n.forUserId) continue;
+      if (!recipientsByEntry.has(n.entryId)) recipientsByEntry.set(n.entryId, new Set());
+      recipientsByEntry.get(n.entryId).add(n.forUserId);
+    }
+    const userById = new Map(users.map(u => [u.id, u]));
+
+    const rows = [];
+    for (const e of entries) {
+      const t = classify(e);
+      if (!t) continue;
+      if (type && t !== type) continue;
+      const fd = (e.ptpDate || e.date || "").slice(0, 10);
+      if (from && fd && fd < from) continue;
+      if (to && fd && fd > to) continue;
+      if (Array.isArray(branches) && branches.length > 0 && !branches.includes(String(e.branch || ""))) continue;
+      if (staff && (e.enteredBy || "") !== staff) continue;
+      const recIds = Array.from(recipientsByEntry.get(e.id) || []);
+      const staffUser = userById.get(e.enteredBy) || null;
+      const recipientList = recIds.map(id => {
+        const u = userById.get(id);
+        return u ? `${u.name} (${u.username || u.id})` : id;
+      }).join("; ");
+      rows.push([
+        typeLabel[t] || t,
+        fmtDMY(e.ptpDate),
+        e.ptpTime || "",
+        e.ptpStatus || "",
+        e.customerName || "",
+        e.customerId || "",
+        e.loanAccountNo || "",
+        e.branch || "",
+        e.odType || "",
+        e.amountDue ?? e.groupOdAmount ?? "",
+        e.totalPaidAmount ?? e.paidAmount ?? e.groupOdPaidAmount ?? "",
+        e.paymentMode || e.ptpPaymentMode || "",
+        e.upiReference || e.transactionId || e.ptpPaymentRef || "",
+        staffUser ? staffUser.name : (e.enteredByName || ""),
+        staffUser ? (staffUser.username || staffUser.id) : (e.enteredBy || ""),
+        fmtDMY(e.date),
+        e.time || "",
+        fmtDMY(e.ptpPaidDate),
+        recipientList,
+      ]);
+    }
+    rows.sort((a, b) => String(b[1]).localeCompare(String(a[1])));
+
+    const headers = [
+      "PTP Type", "PTP Date", "PTP Time", "PTP Status",
+      "Customer Name", "Customer ID", "Loan Account No.",
+      "Branch", "OD Type",
+      "Amount Due", "Amount Paid", "Payment Mode", "Payment Reference",
+      "Recorded By (Name)", "Recorded By (Employee ID)",
+      "Recorded On (Date)", "Recorded On (Time)",
+      "PTP Paid On",
+      "Notification Recipients",
+    ];
+    const q = (v) => '"' + String(v == null ? "" : v).replace(/"/g, '""') + '"';
+    const csv = [headers, ...rows].map(r => r.map(q).join(",")).join("\n");
+
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="odpulse-notifications-${today}.csv"`);
+    res.send(csv);
+  } catch (err) {
+    console.error("[/api/notifications/export] failed:", err);
+    res.status(500).json({ error: "Failed to build notifications export: " + (err.message || err) });
+  }
+});
+
 // Audit log for every entry save/delete/update attempt — successful or failed.
 // Helps trace missing or mutated entries. Logs to entries-audit.json with
 // monthly rotation: once a month rolls over, the previous month is moved to
@@ -782,6 +890,16 @@ function requireUploader(req, res, next) {
     if (allowed.includes(userId)) return next();
   }
   return res.status(403).json({ error: "You do not have permission to upload OD data. Ask an admin to grant OD Upload access." });
+}
+
+// Notifications export RBAC: only Administrator + MIS Staff can download
+// notification reports. View access stays open to all roles.
+function requireAdminOrElevated(req, res, next) {
+  const role = req.header("x-od-role") || "";
+  if (role === "admin" || role === "elevated_staff") return next();
+  return res.status(403).json({
+    error: "You do not have permission to export notifications. This feature is restricted to Administrator and MIS Staff roles.",
+  });
 }
 
 function todayIso() { return new Date().toISOString().slice(0, 10); }

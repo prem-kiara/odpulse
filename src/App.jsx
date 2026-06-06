@@ -3146,6 +3146,14 @@ function NotificationsPage({ user, users, notifications, setNotifications }) {
   }, [allEntries, notifications, expType, expFrom, expTo, expBranches, expStaff, classifyPtp]);
 
   const handleExport = () => {
+    // RBAC: Export restricted to Administrator + MIS Staff. The button is
+    // also hidden via isAdminOrElevated below; this re-check prevents a
+    // DevTools console call from bypassing the UI gate.
+    if (!(user.role === "admin" || user.role === "elevated_staff")) {
+      alert("You do not have permission to export notifications.\n\nThis feature is restricted to Administrator and MIS Staff roles.");
+      console.warn("[Export] Blocked — user role:", user.role);
+      return;
+    }
     console.log("[Export] Download CSV clicked. PTP entries matching filters:", matchingForExport.length);
     if (matchingForExport.length === 0) {
       alert("No PTP records match the selected filters. Adjust filters above (Type / Date / Branch / Staff) and try again.");
@@ -3249,16 +3257,21 @@ function NotificationsPage({ user, users, notifications, setNotifications }) {
       <div className="flex items-center justify-between mb-6 flex-wrap gap-2">
         <h2 className="text-xl font-bold text-gray-900 flex items-center gap-2"><Bell size={22} className="text-teal-600" /> Notifications</h2>
         <div className="flex items-center gap-2">
-          <button onClick={() => setShowExport(s => !s)}
-            className={`inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg border transition-colors ${showExport ? "bg-teal-600 text-white border-teal-600" : "bg-white text-teal-700 border-teal-300 hover:bg-teal-50"}`}>
-            <Download size={12} />
-            {showExport ? "Hide Export Filters" : "Export Notifications"}
-          </button>
+          {/* Export button: visible only to Administrator + MIS Staff. */}
+          {isAdminOrElevated && (
+            <button onClick={() => setShowExport(s => !s)}
+              className={`inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-lg border transition-colors ${showExport ? "bg-teal-600 text-white border-teal-600" : "bg-white text-teal-700 border-teal-300 hover:bg-teal-50"}`}>
+              <Download size={12} />
+              {showExport ? "Hide Export Filters" : "Export Notifications"}
+            </button>
+          )}
         </div>
       </div>
 
-      {/* Centralized export toolbar — visible when the user opens it. */}
-      {showExport && (
+      {/* Centralized export toolbar — RBAC: double-gated on isAdminOrElevated
+          so a forced setShowExport(true) from devtools cannot render the
+          export panel for ordinary staff. */}
+      {isAdminOrElevated && showExport && (
         <div className="mb-6 bg-teal-50 border border-teal-200 rounded-xl p-4">
           <div className="flex items-center justify-between mb-3">
             <h3 className="text-sm font-semibold text-teal-800">Export Notifications</h3>
@@ -4003,6 +4016,360 @@ function Dashboard({ user, entries, branches, config }) {
           </div>
         </div>
       )}
+
+      {/* Aggregates collections by Staff × Branch × Bucket with a 3-month
+          rolling average for trend comparison. */}
+      <CollectionPerformanceWidget user={user} entries={entries} />
+    </div>
+  );
+}
+
+// ─── Collection Performance: reusable multi-select filter ──────────────────
+// Used by the Collection Performance widget. Shows a checkbox list with
+// Select All / Clear / search, plus removable chips below for selected
+// values. Defined at module level so it isn't re-created per parent render.
+function CPMultiSelectFilter({ label, options, value, onChange, search, setSearch, renderLabel }) {
+  const rl = renderLabel || ((v) => v);
+  const filtered = (search && search.trim())
+    ? options.filter(o => String(rl(o)).toLowerCase().includes(search.trim().toLowerCase()))
+    : options;
+  return (
+    <div>
+      <label className="block text-[10px] font-semibold text-gray-600 uppercase mb-1">
+        {label}{value.length > 0 ? ` (${value.length})` : ""}
+      </label>
+      <details className="relative">
+        <summary className="w-full px-2 py-1.5 border rounded text-xs bg-white cursor-pointer list-none flex items-center justify-between">
+          <span className="truncate text-gray-700">
+            {value.length === 0 ? "All " + label :
+             value.length === 1 ? String(rl(value[0])) :
+             value.length + " selected"}
+          </span>
+          <ChevronDown size={12} className="text-gray-400 ml-1 shrink-0" />
+        </summary>
+        <div className="absolute z-30 mt-1 left-0 right-0 min-w-[220px] bg-white border border-gray-200 rounded-lg shadow-lg p-2">
+          <div className="flex gap-1 mb-2">
+            <button type="button" onClick={() => onChange([...options])}
+              className="flex-1 text-[10px] px-2 py-1 bg-teal-50 text-teal-700 rounded hover:bg-teal-100">
+              Select All
+            </button>
+            <button type="button" onClick={() => onChange([])}
+              disabled={value.length === 0}
+              className={"flex-1 text-[10px] px-2 py-1 rounded " + (value.length === 0 ? "bg-gray-100 text-gray-400 cursor-not-allowed" : "bg-gray-100 text-gray-700 hover:bg-gray-200")}>
+              Clear
+            </button>
+          </div>
+          {setSearch && (
+            <div className="relative mb-2">
+              <Search size={10} className="absolute left-2 top-1/2 -translate-y-1/2 text-gray-400" />
+              <input type="text" value={search || ""}
+                onChange={e => setSearch(e.target.value)}
+                placeholder={"Search " + label.toLowerCase() + "…"}
+                className="w-full pl-6 pr-2 py-1 border rounded text-[11px] focus:ring-1 focus:ring-teal-500" />
+            </div>
+          )}
+          <div className="max-h-44 overflow-y-auto border border-gray-100 rounded">
+            {filtered.length === 0 ? (
+              <div className="text-[11px] text-gray-400 px-2 py-2 text-center">No options</div>
+            ) : filtered.map(o => {
+              const checked = value.includes(o);
+              return (
+                <label key={String(o)} className="flex items-center gap-1.5 text-xs cursor-pointer hover:bg-gray-50 px-2 py-1">
+                  <input type="checkbox" checked={checked}
+                    onChange={ev => {
+                      const will = ev.target.checked;
+                      onChange(will
+                        ? (value.includes(o) ? value : [...value, o])
+                        : value.filter(x => x !== o));
+                    }}
+                    className="rounded text-teal-600 focus:ring-teal-500" />
+                  <span className="text-gray-700 truncate" title={String(rl(o))}>{String(rl(o))}</span>
+                </label>
+              );
+            })}
+          </div>
+        </div>
+      </details>
+      {value.length > 0 && (
+        <div className="flex flex-wrap gap-1 mt-1">
+          {value.map(v => (
+            <span key={String(v)} className="inline-flex items-center gap-0.5 px-1.5 py-0.5 bg-teal-50 text-teal-700 border border-teal-200 rounded text-[10px]">
+              {String(rl(v))}
+              <button type="button"
+                onClick={() => onChange(value.filter(x => x !== v))}
+                className="ml-0.5 hover:text-teal-900" aria-label={"Remove " + String(rl(v))}>×</button>
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Collection Performance Widget ─────────────────────────────────────────
+// Dashboard analytics widget. Aggregates entries by (Staff × Branch × Bucket)
+// and shows:
+//   • Total Amount Collected in the selected period
+//   • Number of distinct Accounts Collected
+//   • Rolling 3-month average (the 90 days immediately preceding the
+//     selected start date) for current-vs-historical comparison
+//   • % change vs the 3-month average (green = above, red = below)
+//
+// Filters: Branch / Staff / Bucket (multi-select with Select All) + Date Range.
+// RBAC: Export CSV is shown only to Administrator + MIS Staff.
+function CollectionPerformanceWidget({ user, entries }) {
+  const isAdminOrElevated = user.role === "admin" || user.role === "elevated_staff";
+
+  // Read users from localStorage — Dashboard's prop signature doesn't
+  // currently include users, so we look them up directly here.
+  const users = useMemo(() => {
+    try { return JSON.parse(localStorage.getItem(STORAGE_KEYS.users) || "[]"); }
+    catch { return []; }
+  }, []);
+
+  // Default range = last 30 days inclusive.
+  const defaultTo = useMemo(() => nowDate(), []);
+  const defaultFrom = useMemo(() => {
+    const d = new Date(); d.setDate(d.getDate() - 30);
+    return d.toISOString().slice(0, 10);
+  }, []);
+  const [dateFrom, setDateFrom] = useState(defaultFrom);
+  const [dateTo, setDateTo] = useState(defaultTo);
+
+  const [selBranches, setSelBranches] = useState([]);
+  const [selStaff, setSelStaff] = useState([]);
+  const [selBuckets, setSelBuckets] = useState([]);
+  const [branchSearch, setBranchSearch] = useState("");
+  const [staffSearch, setStaffSearch] = useState("");
+
+  // Filter option lists derived from the entries themselves.
+  const branchOptions = useMemo(() => Array.from(new Set(
+    entries.map(e => e.branch).filter(Boolean)
+  )).sort(), [entries]);
+
+  const staffOptions = useMemo(() => {
+    const seen = new Set();
+    const out = [];
+    for (const e of entries) {
+      const sid = e.enteredBy || "";
+      if (!sid || seen.has(sid)) continue;
+      seen.add(sid);
+      const u = users.find(x => x.id === sid);
+      out.push({ id: sid, name: u ? u.name : (e.enteredByName || sid) });
+    }
+    out.sort((a, b) => a.name.localeCompare(b.name));
+    return out;
+  }, [entries, users]);
+  const staffIdOptions = useMemo(() => staffOptions.map(s => s.id), [staffOptions]);
+  const staffNameById = useMemo(() => {
+    const m = new Map();
+    for (const s of staffOptions) m.set(s.id, s.name);
+    return m;
+  }, [staffOptions]);
+
+  const BUCKETS = ["SMA-0", "SMA-1", "SMA-2", "NPA", "(no bucket)"];
+
+  const getPaid = (e) =>
+    Number(e.totalPaidAmount ?? e.paidAmount ?? e.groupOdPaidAmount ?? e.customerShare ?? 0) || 0;
+  const bucketOf = (e) => e.smaBucket || "(no bucket)";
+
+  // 3-month-prior window: 90 days strictly BEFORE the selected dateFrom.
+  // Using 90 days (not 3 calendar months) keeps the divisor uniform.
+  const threeMonthsStart = useMemo(() => {
+    if (!dateFrom) return "";
+    const d = new Date(dateFrom);
+    d.setDate(d.getDate() - 90);
+    return d.toISOString().slice(0, 10);
+  }, [dateFrom]);
+
+  const matchesFilters = useCallback((e) => {
+    if (selBranches.length > 0 && !selBranches.includes(e.branch || "")) return false;
+    if (selStaff.length > 0 && !selStaff.includes(e.enteredBy || "")) return false;
+    if (selBuckets.length > 0 && !selBuckets.includes(bucketOf(e))) return false;
+    return true;
+  }, [selBranches, selStaff, selBuckets]);
+
+  // Single pass: build current-period totals + prior-3m totals per group.
+  const rows = useMemo(() => {
+    const cur = new Map();
+    const prior = new Map();
+    for (const e of entries) {
+      if (!matchesFilters(e)) continue;
+      const k = (e.enteredBy || "") + "::" + (e.branch || "") + "::" + bucketOf(e);
+      const d = e.date || "";
+      if ((!dateFrom || d >= dateFrom) && (!dateTo || d <= dateTo)) {
+        if (!cur.has(k)) cur.set(k, { total: 0, accounts: new Set() });
+        const slot = cur.get(k);
+        slot.total += getPaid(e);
+        slot.accounts.add(e.loanAccountNo || e.customerId || e.id);
+      }
+      if (threeMonthsStart && d >= threeMonthsStart && (!dateFrom || d < dateFrom)) {
+        prior.set(k, (prior.get(k) || 0) + getPaid(e));
+      }
+    }
+    const out = [];
+    for (const [k, v] of cur) {
+      const [staffId, branch, bucket] = k.split("::");
+      const staffName = staffNameById.get(staffId) || staffId || "—";
+      const priorTotal = prior.get(k) || 0;
+      out.push({
+        staffId, staffName, branch, bucket,
+        currentTotal: v.total,
+        accountCount: v.accounts.size,
+        priorTotal,
+        threeMonthAvg: priorTotal / 3,
+      });
+    }
+    return out.sort((a, b) => b.currentTotal - a.currentTotal);
+  }, [entries, dateFrom, dateTo, threeMonthsStart, matchesFilters, staffNameById]);
+
+  const totals = useMemo(() => rows.reduce(
+    (acc, r) => ({
+      currentTotal: acc.currentTotal + r.currentTotal,
+      accountCount: acc.accountCount + r.accountCount,
+      threeMonthAvg: acc.threeMonthAvg + r.threeMonthAvg,
+    }),
+    { currentTotal: 0, accountCount: 0, threeMonthAvg: 0 }
+  ), [rows]);
+
+  const handleExport = () => {
+    if (!isAdminOrElevated) {
+      alert("Export is restricted to Administrator and MIS Staff roles.");
+      return;
+    }
+    if (rows.length === 0) {
+      alert("No rows match the selected filters. Adjust filters and try again.");
+      return;
+    }
+    const headers = [
+      "Staff Name", "Branch", "Bucket Category",
+      "Total Amount Collected", "Accounts Collected", "3-Month Avg",
+      "% vs 3-Month Avg",
+    ];
+    const q = v => '"' + String(v == null ? "" : v).replace(/"/g, '""') + '"';
+    const lines = [headers, ...rows.map(r => {
+      const diffPct = r.threeMonthAvg > 0
+        ? ((r.currentTotal - r.threeMonthAvg) / r.threeMonthAvg * 100).toFixed(0) + "%"
+        : "";
+      return [
+        r.staffName, r.branch, r.bucket,
+        r.currentTotal, r.accountCount, Math.round(r.threeMonthAvg), diffPct,
+      ];
+    })];
+    const csv = lines.map(row => row.map(q).join(",")).join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = "collection-performance-" + nowDate() + ".csv";
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+  };
+
+  const presetLast30 = () => {
+    const to = new Date();
+    const from = new Date(); from.setDate(from.getDate() - 30);
+    setDateFrom(from.toISOString().slice(0, 10));
+    setDateTo(to.toISOString().slice(0, 10));
+  };
+  const resetAll = () => {
+    setDateFrom(defaultFrom); setDateTo(defaultTo);
+    setSelBranches([]); setSelStaff([]); setSelBuckets([]);
+    setBranchSearch(""); setStaffSearch("");
+  };
+
+  return (
+    <div className="bg-white rounded-xl border p-5 mt-6">
+      <div className="flex items-center justify-between mb-4 flex-wrap gap-2">
+        <h3 className="text-lg font-bold text-gray-900 flex items-center gap-2">
+          <TrendingUp size={20} className="text-teal-600" /> Collection Performance
+          <span className="text-xs font-normal text-gray-500">— with 3-month rolling avg</span>
+        </h3>
+        <div className="flex items-center gap-2">
+          <button onClick={presetLast30} className="text-xs text-teal-700 hover:text-teal-900 underline">Last 30 days</button>
+          <button onClick={resetAll} className="text-xs text-gray-600 hover:text-red-600 underline">Reset</button>
+          {isAdminOrElevated && (
+            <button onClick={handleExport}
+              disabled={rows.length === 0}
+              className={"inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg " + (rows.length === 0 ? "bg-gray-200 text-gray-400 cursor-not-allowed" : "bg-teal-600 text-white hover:bg-teal-700")}>
+              <Download size={12} /> Export CSV
+            </button>
+          )}
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 mb-4">
+        <div>
+          <label className="block text-[10px] font-semibold text-gray-600 uppercase mb-1">Date From</label>
+          <input type="date" value={dateFrom} onChange={e => setDateFrom(e.target.value)}
+            className="w-full px-2 py-1.5 border rounded text-xs bg-white" />
+        </div>
+        <div>
+          <label className="block text-[10px] font-semibold text-gray-600 uppercase mb-1">Date To</label>
+          <input type="date" value={dateTo} onChange={e => setDateTo(e.target.value)}
+            className="w-full px-2 py-1.5 border rounded text-xs bg-white" />
+        </div>
+        <CPMultiSelectFilter label="Branch" options={branchOptions}
+          value={selBranches} onChange={setSelBranches}
+          search={branchSearch} setSearch={setBranchSearch} />
+        <CPMultiSelectFilter label="Staff" options={staffIdOptions}
+          value={selStaff} onChange={setSelStaff}
+          search={staffSearch} setSearch={setStaffSearch}
+          renderLabel={(id) => staffNameById.get(id) || id} />
+        <CPMultiSelectFilter label="Bucket" options={BUCKETS}
+          value={selBuckets} onChange={setSelBuckets} />
+      </div>
+
+      <div className="overflow-x-auto">
+        <table className="w-full text-sm auto-layout">
+          <thead className="bg-gray-50">
+            <tr>
+              <th className="px-3 py-2 text-left font-semibold text-gray-700">Staff Name</th>
+              <th className="px-3 py-2 text-left font-semibold text-gray-700">Branch</th>
+              <th className="px-3 py-2 text-left font-semibold text-gray-700">Bucket</th>
+              <th className="px-3 py-2 text-right font-semibold text-gray-700">Amount Collected</th>
+              <th className="px-3 py-2 text-right font-semibold text-gray-700">Accounts</th>
+              <th className="px-3 py-2 text-right font-semibold text-gray-700">3-Month Avg</th>
+              <th className="px-3 py-2 text-right font-semibold text-gray-700">vs Avg</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.length === 0 ? (
+              <tr><td colSpan={7} className="px-3 py-6 text-center text-gray-500">No collections match the selected filters.</td></tr>
+            ) : rows.map((r, i) => {
+              const diff = r.currentTotal - r.threeMonthAvg;
+              const diffPct = r.threeMonthAvg > 0 ? ((diff / r.threeMonthAvg) * 100) : null;
+              return (
+                <tr key={r.staffId + "_" + r.branch + "_" + r.bucket + "_" + i} className="border-t border-gray-100 hover:bg-gray-50">
+                  <td className="px-3 py-2 text-gray-800">{r.staffName}</td>
+                  <td className="px-3 py-2 text-gray-700">{r.branch || "—"}</td>
+                  <td className="px-3 py-2 text-gray-700">{r.bucket}</td>
+                  <td className="px-3 py-2 text-right font-semibold text-gray-900 num">{formatINR(r.currentTotal)}</td>
+                  <td className="px-3 py-2 text-right text-gray-700 num">{r.accountCount}</td>
+                  <td className="px-3 py-2 text-right text-gray-700 num">{formatINR(Math.round(r.threeMonthAvg))}</td>
+                  <td className={"px-3 py-2 text-right num font-medium " + (diff > 0 ? "text-emerald-700" : diff < 0 ? "text-red-700" : "text-gray-500")}>
+                    {diffPct === null ? "—" : (diff > 0 ? "+" : "") + diffPct.toFixed(0) + "%"}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+          {rows.length > 0 && (
+            <tfoot className="bg-gray-50">
+              <tr className="border-t-2 border-gray-200">
+                <td className="px-3 py-2 font-semibold text-gray-800" colSpan={3}>Total ({rows.length} group{rows.length === 1 ? "" : "s"})</td>
+                <td className="px-3 py-2 text-right font-bold text-gray-900 num">{formatINR(totals.currentTotal)}</td>
+                <td className="px-3 py-2 text-right font-bold text-gray-700 num">{totals.accountCount}</td>
+                <td className="px-3 py-2 text-right font-bold text-gray-700 num">{formatINR(Math.round(totals.threeMonthAvg))}</td>
+                <td className="px-3 py-2"></td>
+              </tr>
+            </tfoot>
+          )}
+        </table>
+      </div>
+      <p className="text-[11px] text-gray-500 mt-2">
+        Rolling average is computed over the 90 days immediately preceding the selected start date and divided by 3.
+        Rows are grouped by Staff × Branch × Bucket and ranked by current-period amount.
+      </p>
     </div>
   );
 }
