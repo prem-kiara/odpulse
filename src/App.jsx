@@ -4124,24 +4124,27 @@ function CPMultiSelectFilter({ label, options, value, onChange, search, setSearc
 }
 
 // ─── Collection Performance Widget ─────────────────────────────────────────
-// Interactive chart showing collection performance by staff and month,
-// broken down per bucket.
+// Interactive chart with three view modes:
 //
-// Exclusions (intentional, business-driven):
-//   • Administrator role — admins don't collect; including them skews
-//     averages, rankings, totals. Excluded from the staff filter, the
-//     aggregation, and the CSV export.
-//   • Entries with no smaBucket — the chart is "by Bucket". Entries that
-//     have no bucket assignment (most Group OD entries by design, plus
-//     Individual OD entries where the user skipped the optional dropdown,
-//     plus bulk-uploaded rows whose source column didn't match a known
-//     bucket string) are excluded. A counter under the chart shows how
-//     many records were dropped so the exclusion is transparent. To
-//     include them, an admin needs to either assign a bucket in the entry
-//     form or fix the source CSV mapping during bulk upload.
+//   • By Bucket (default) — X-axis = bucket (SMA-0 / SMA-1 / SMA-2 / NPA).
+//     For each bucket, the chart group contains one bar per month in the
+//     selected date range plus two summary bars: N-Month Total and
+//     N-Month Average. Users can compare month-wise performance, total
+//     recovery, and per-month average in a single visual. The "N" is
+//     dynamic — picks up the actual number of months in the selected range
+//     (3 if last 90 days, 2 if 60 days, etc.).
+//
+//   • By Staff — X-axis = staff. Five grouped bars per bucket + 3-Month
+//     Average overlay as a Line. Identifies top performers and laggards.
+//
+//   • By Month — X-axis = month. Four grouped bars per bucket + ReferenceLine
+//     for the global 3-month-avg level. Identifies trend direction.
+//
+// Exclusions: Administrator users + entries without a valid bucket. A
+// counter under the chart shows how many records were dropped and why.
 //
 // Filters: Branch / Staff / Bucket (multi-select, click-outside close,
-// count-only summary) + Date Range. RBAC: Export CSV is Admin + MIS only.
+// count-only summary) + Date Range. RBAC: Export CSV → Admin + MIS only.
 function CollectionPerformanceWidget({ user, entries }) {
   const isAdminOrElevated = user.role === "admin" || user.role === "elevated_staff";
 
@@ -4150,10 +4153,6 @@ function CollectionPerformanceWidget({ user, entries }) {
     catch { return []; }
   }, []);
 
-  // Build the set of user IDs that should be EXCLUDED from collection
-  // analytics. Currently only Administrator — if more roles need exclusion
-  // (e.g. "auditor"), add them here. The exclusion is purely role-based,
-  // so a user changing role flows through automatically on next render.
   const excludedUserIds = useMemo(() => {
     const s = new Set();
     for (const u of users) if (u && u.role === "admin") s.add(u.id);
@@ -4174,24 +4173,21 @@ function CollectionPerformanceWidget({ user, entries }) {
   const [branchSearch, setBranchSearch] = useState("");
   const [staffSearch, setStaffSearch] = useState("");
 
-  const [viewMode, setViewMode] = useState("staff");
+  // New default mode = "bucket". Three options now: "bucket" | "staff" | "month".
+  const [viewMode, setViewMode] = useState("bucket");
   const [showAvg, setShowAvg] = useState(true);
 
   const branchOptions = useMemo(() => Array.from(new Set(
     entries.map(e => e.branch).filter(Boolean)
   )).sort(), [entries]);
 
-  // Staff filter: only show users with role staff or elevated_staff (and a
-  // matching entry exists). Administrators are filtered out — they aren't
-  // collection staff, even if they happen to have created a bulk-upload
-  // entry that has their id on it.
   const staffOptions = useMemo(() => {
     const seen = new Set();
     const out = [];
     for (const e of entries) {
       const sid = e.enteredBy || "";
       if (!sid || seen.has(sid)) continue;
-      if (excludedUserIds.has(sid)) continue; // skip admins
+      if (excludedUserIds.has(sid)) continue;
       seen.add(sid);
       const u = users.find(x => x.id === sid);
       out.push({ id: sid, name: u ? u.name : (e.enteredByName || sid) });
@@ -4206,17 +4202,16 @@ function CollectionPerformanceWidget({ user, entries }) {
     return m;
   }, [staffOptions]);
 
-  // Valid buckets only — "No Bucket" intentionally removed from the filter.
-  // The chart shows bucket-classified collections; entries without buckets
-  // (most Group OD, partial Individual OD, unmapped bulk uploads) are
-  // counted separately as "excluded" and surfaced below the chart.
   const BUCKETS = ["SMA-0", "SMA-1", "SMA-2", "NPA"];
-  const COLOR = { "SMA-0": "#3b82f6", "SMA-1": "#eab308", "SMA-2": "#f97316", "NPA": "#ef4444" };
+  const BUCKET_COLOR = { "SMA-0": "#3b82f6", "SMA-1": "#eab308", "SMA-2": "#f97316", "NPA": "#ef4444" };
+  // Distinct colours for month-bars in Bucket mode — sequential teal/blue/purple.
+  const MONTH_PALETTE = ["#0ea5e9", "#22c55e", "#a855f7", "#f43f5e", "#f59e0b", "#06b6d4", "#84cc16", "#ec4899"];
+  // Strong/light teal for the summary bars (Total + Avg).
+  const TOTAL_COLOR = "#0f766e";
+  const AVG_COLOR = "#5eead4";
 
   const getPaid = (e) =>
     Number(e.totalPaidAmount ?? e.paidAmount ?? e.groupOdPaidAmount ?? e.customerShare ?? 0) || 0;
-  // Validates an entry's bucket. Returns the bucket string if it's one of
-  // the four supported categories, otherwise null. null = "exclude from chart".
   const validBucket = (e) => {
     const b = e && e.smaBucket;
     return (b === "SMA-0" || b === "SMA-1" || b === "SMA-2" || b === "NPA") ? b : null;
@@ -4229,23 +4224,17 @@ function CollectionPerformanceWidget({ user, entries }) {
     return d.toISOString().slice(0, 10);
   }, [dateFrom]);
 
-  // Core matcher: applies the user's filters AND the analytics exclusions
-  // (admin + no-bucket). One central place keeps the rules consistent across
-  // chart, tooltip, export.
   const matchesFilters = useCallback((e) => {
     if (!e) return false;
     if (excludedUserIds.has(e.enteredBy)) return false;
     if (selBranches.length > 0 && !selBranches.includes(e.branch || "")) return false;
     if (selStaff.length > 0 && !selStaff.includes(e.enteredBy || "")) return false;
     const b = validBucket(e);
-    if (!b) return false; // exclude no-bucket entries
+    if (!b) return false;
     if (selBuckets.length > 0 && !selBuckets.includes(b)) return false;
     return true;
   }, [selBranches, selStaff, selBuckets, excludedUserIds]);
 
-  // Count of entries we DROPPED inside the user's selected date+branch+staff
-  // window but didn't include because they lacked a valid bucket or were
-  // admin-authored. Surfaced as a footnote so the exclusion is transparent.
   const excludedSummary = useMemo(() => {
     let noBucket = 0;
     let adminAuthored = 0;
@@ -4257,7 +4246,6 @@ function CollectionPerformanceWidget({ user, entries }) {
       if (dateTo && d && d > dateTo) continue;
       if (selBranches.length > 0 && !selBranches.includes(e.branch || "")) continue;
       if (selStaff.length > 0 && !selStaff.includes(e.enteredBy || "")) continue;
-      // Within scope but excluded?
       const isAdminAuth = excludedUserIds.has(e.enteredBy);
       const noB = !validBucket(e);
       if (isAdminAuth) { adminAuthored++; total++; }
@@ -4266,39 +4254,74 @@ function CollectionPerformanceWidget({ user, entries }) {
     return { noBucket, adminAuthored, total };
   }, [entries, dateFrom, dateTo, selBranches, selStaff, excludedUserIds]);
 
-  const monthLabel = (ym) => {
-    if (!ym) return "";
+  // Months in the selected range (chronological). One element per
+  // distinct YYYY-MM that the range covers, regardless of whether any
+  // entry falls in it. Bucket mode renders one bar per month using these.
+  const monthsInRange = useMemo(() => {
+    if (!dateFrom || !dateTo) return [];
+    const months = [];
+    const seen = new Set();
+    const cur = new Date(dateFrom);
+    cur.setDate(1); // start of month
+    const end = new Date(dateTo);
+    while (cur <= end) {
+      const ym = cur.toISOString().slice(0, 7);
+      if (!seen.has(ym)) { seen.add(ym); months.push(ym); }
+      cur.setMonth(cur.getMonth() + 1);
+    }
+    return months;
+  }, [dateFrom, dateTo]);
+
+  // "Mar 26" / "Apr 26" style labels, kept short so legends + xticks fit.
+  const shortMonthLabel = (ym) => {
+    const [y, m] = ym.split("-");
+    return MONTHS[Math.max(0, Math.min(11, parseInt(m, 10) - 1))] + " " + y.slice(2);
+  };
+  const fullMonthLabel = (ym) => {
     const [y, m] = ym.split("-");
     return MONTHS[Math.max(0, Math.min(11, parseInt(m, 10) - 1))] + " " + y;
   };
 
-  const chartData = useMemo(() => {
-    if (viewMode === "month") {
-      const byMonth = new Map();
-      const ensure = (ym) => {
-        if (!byMonth.has(ym)) byMonth.set(ym, {
-          month: ym, name: monthLabel(ym),
-          "SMA-0": 0, "SMA-1": 0, "SMA-2": 0, "NPA": 0,
-          currentTotal: 0,
-        });
-        return byMonth.get(ym);
-      };
-      for (const e of entries) {
-        if (!matchesFilters(e)) continue;
-        const d = e.date || "";
-        if (!d) continue;
-        if (dateFrom && d < dateFrom) continue;
-        if (dateTo && d > dateTo) continue;
-        const ym = d.slice(0, 7);
-        const slot = ensure(ym);
-        const amt = getPaid(e);
-        slot.currentTotal += amt;
-        slot[validBucket(e)] += amt;
-      }
-      return Array.from(byMonth.values()).sort((a, b) => a.month.localeCompare(b.month));
+  // ── Aggregations per view mode ────────────────────────────────────────
+  // Bucket mode: one row per bucket, columns = per-month + total + avg.
+  const bucketChartData = useMemo(() => {
+    const byBucket = new Map();
+    for (const b of BUCKETS) {
+      const slot = { bucket: b, name: b };
+      for (const ym of monthsInRange) slot[shortMonthLabel(ym)] = 0;
+      slot._total = 0;
+      byBucket.set(b, slot);
     }
+    for (const e of entries) {
+      if (!matchesFilters(e)) continue;
+      const d = e.date || "";
+      if (dateFrom && d < dateFrom) continue;
+      if (dateTo && d > dateTo) continue;
+      const ym = d.slice(0, 7);
+      const b = validBucket(e);
+      if (!b || !byBucket.has(b)) continue;
+      const slot = byBucket.get(b);
+      const key = shortMonthLabel(ym);
+      if (slot[key] === undefined) continue; // month outside generated range
+      const amt = getPaid(e);
+      slot[key] += amt;
+      slot._total += amt;
+    }
+    // Compute total + avg keys with dynamic labels (N-Month Total/Average).
+    const n = monthsInRange.length || 1;
+    const out = [];
+    for (const b of BUCKETS) {
+      const slot = byBucket.get(b);
+      slot.total = slot._total;
+      slot.avg = slot._total / n;
+      delete slot._total;
+      out.push(slot);
+    }
+    return out;
+  }, [entries, matchesFilters, dateFrom, dateTo, monthsInRange]);
 
-    // viewMode === "staff"
+  // Staff mode: existing implementation.
+  const staffChartData = useMemo(() => {
     const byStaff = new Map();
     const accounts = new Map();
     const ensure = (sid) => {
@@ -4326,9 +4349,7 @@ function CollectionPerformanceWidget({ user, entries }) {
         if (!accounts.has(sid)) accounts.set(sid, new Set());
         accounts.get(sid).add(e.loanAccountNo || e.customerId || e.id);
       }
-      if (inPrior) {
-        ensure(sid).prior90 += getPaid(e);
-      }
+      if (inPrior) ensure(sid).prior90 += getPaid(e);
     }
     for (const [sid, slot] of byStaff) {
       slot.accountCount = (accounts.get(sid) || new Set()).size;
@@ -4337,7 +4358,44 @@ function CollectionPerformanceWidget({ user, entries }) {
     return Array.from(byStaff.values())
       .filter(s => s.currentTotal > 0)
       .sort((a, b) => b.currentTotal - a.currentTotal);
-  }, [viewMode, entries, dateFrom, dateTo, threeMonthsStart, matchesFilters, staffNameById]);
+  }, [entries, dateFrom, dateTo, threeMonthsStart, matchesFilters, staffNameById]);
+
+  // Month mode: existing implementation.
+  const monthChartData = useMemo(() => {
+    const byMonth = new Map();
+    const ensure = (ym) => {
+      if (!byMonth.has(ym)) byMonth.set(ym, {
+        month: ym, name: fullMonthLabel(ym),
+        "SMA-0": 0, "SMA-1": 0, "SMA-2": 0, "NPA": 0,
+        currentTotal: 0,
+      });
+      return byMonth.get(ym);
+    };
+    for (const e of entries) {
+      if (!matchesFilters(e)) continue;
+      const d = e.date || "";
+      if (!d) continue;
+      if (dateFrom && d < dateFrom) continue;
+      if (dateTo && d > dateTo) continue;
+      const ym = d.slice(0, 7);
+      const slot = ensure(ym);
+      const amt = getPaid(e);
+      slot.currentTotal += amt;
+      slot[validBucket(e)] += amt;
+    }
+    return Array.from(byMonth.values()).sort((a, b) => a.month.localeCompare(b.month));
+  }, [entries, dateFrom, dateTo, matchesFilters]);
+
+  const chartData = viewMode === "bucket" ? bucketChartData
+                  : viewMode === "month"  ? monthChartData
+                  : staffChartData;
+
+  // Has any bucket data to display at all (Bucket mode shows zero rows
+  // even when nothing matches because we pre-seed the 4 buckets).
+  const hasBucketData = useMemo(
+    () => bucketChartData.some(r => r.total > 0),
+    [bucketChartData]
+  );
 
   const monthlyAvgRef = useMemo(() => {
     if (viewMode !== "month" || !showAvg || !threeMonthsStart) return 0;
@@ -4350,9 +4408,40 @@ function CollectionPerformanceWidget({ user, entries }) {
     return total / 3;
   }, [viewMode, showAvg, threeMonthsStart, entries, matchesFilters, dateFrom]);
 
+  // Dynamic labels: "3-Month Total" if 3 months in range, "2-Month Total" otherwise.
+  const n = monthsInRange.length || 1;
+  const totalLabel = n + "-Month Total";
+  const avgLabel = n + "-Month Average";
+
   const renderTooltip = ({ active, payload, label }) => {
     if (!active || !payload || payload.length === 0) return null;
     const d = payload[0].payload || {};
+    if (viewMode === "bucket") {
+      return (
+        <div className="bg-white p-3 border border-gray-200 rounded-lg shadow-md text-xs min-w-[200px]">
+          <div className="font-semibold text-gray-900 mb-2">
+            <span className="inline-block w-2 h-2 rounded-sm mr-1.5 align-middle" style={{ background: BUCKET_COLOR[d.bucket] }} />
+            {d.bucket}
+          </div>
+          {monthsInRange.map(ym => {
+            const k = shortMonthLabel(ym);
+            const v = d[k] || 0;
+            return v > 0 ? (
+              <div key={ym} className="flex justify-between gap-3">
+                <span className="text-gray-600">{fullMonthLabel(ym)}</span>
+                <span className="font-medium text-gray-800">{formatINR(v)}</span>
+              </div>
+            ) : null;
+          })}
+          <div className="border-t border-gray-200 mt-2 pt-1.5 flex justify-between font-semibold">
+            <span>{totalLabel}</span><span>{formatINR(d.total)}</span>
+          </div>
+          <div className="flex justify-between text-teal-700 mt-0.5">
+            <span>{avgLabel}</span><span>{formatINR(Math.round(d.avg || 0))}</span>
+          </div>
+        </div>
+      );
+    }
     return (
       <div className="bg-white p-3 border border-gray-200 rounded-lg shadow-md text-xs min-w-[200px]">
         <div className="font-semibold text-gray-900 mb-1">{d.name}</div>
@@ -4363,7 +4452,7 @@ function CollectionPerformanceWidget({ user, entries }) {
           (d[k] || 0) > 0 ? (
             <div key={k} className="flex justify-between gap-3">
               <span className="text-gray-600">
-                <span className="inline-block w-2 h-2 rounded-sm mr-1.5 align-middle" style={{ background: COLOR[k] }} />
+                <span className="inline-block w-2 h-2 rounded-sm mr-1.5 align-middle" style={{ background: BUCKET_COLOR[k] }} />
                 {k}
               </span>
               <span className="font-medium text-gray-800">{formatINR(d[k])}</span>
@@ -4393,7 +4482,15 @@ function CollectionPerformanceWidget({ user, entries }) {
     }
     const q = v => '"' + String(v == null ? "" : v).replace(/"/g, '""') + '"';
     let headers, lines;
-    if (viewMode === "month") {
+    if (viewMode === "bucket") {
+      headers = ["Bucket", ...monthsInRange.map(fullMonthLabel), totalLabel, avgLabel];
+      lines = [headers, ...chartData.map(d => [
+        d.bucket,
+        ...monthsInRange.map(ym => d[shortMonthLabel(ym)] || 0),
+        d.total,
+        Math.round(d.avg),
+      ])];
+    } else if (viewMode === "month") {
       headers = ["Month", "SMA-0", "SMA-1", "SMA-2", "NPA", "Total Amount Collected"];
       lines = [headers, ...chartData.map(d => [
         d.name, d["SMA-0"], d["SMA-1"], d["SMA-2"], d["NPA"], d.currentTotal,
@@ -4434,20 +4531,31 @@ function CollectionPerformanceWidget({ user, entries }) {
     setBranchSearch(""); setStaffSearch("");
   };
 
+  // Number of "rows" the chart renders — drives the dynamic height.
+  const visibleRowCount = viewMode === "bucket"
+    ? (hasBucketData ? chartData.length : 0)
+    : chartData.length;
+
   return (
     <div className="bg-white rounded-xl border p-4 mb-6">
       <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
         <h3 className="text-sm font-semibold text-gray-700 flex items-center gap-2">
           <TrendingUp size={16} className="text-teal-600" />
           Collection Performance — by Bucket
-          <span className="text-[11px] font-normal text-gray-400">
-            {chartData.length} {viewMode === "month" ? "month" : "staff"}{chartData.length === 1 ? "" : "s"}
-          </span>
+          {viewMode === "bucket" && n > 0 && (
+            <span className="text-[11px] font-normal text-gray-400">
+              {n} month{n === 1 ? "" : "s"} in range
+            </span>
+          )}
         </h3>
         <div className="flex items-center gap-2 flex-wrap">
           <div className="inline-flex rounded-lg border border-gray-200 overflow-hidden text-[11px]">
+            <button onClick={() => setViewMode("bucket")}
+              className={"px-2.5 py-1 " + (viewMode === "bucket" ? "bg-teal-600 text-white" : "bg-white text-gray-700 hover:bg-gray-50")}>
+              By Bucket
+            </button>
             <button onClick={() => setViewMode("staff")}
-              className={"px-2.5 py-1 " + (viewMode === "staff" ? "bg-teal-600 text-white" : "bg-white text-gray-700 hover:bg-gray-50")}>
+              className={"px-2.5 py-1 border-l border-gray-200 " + (viewMode === "staff" ? "bg-teal-600 text-white" : "bg-white text-gray-700 hover:bg-gray-50")}>
               By Staff
             </button>
             <button onClick={() => setViewMode("month")}
@@ -4455,17 +4563,20 @@ function CollectionPerformanceWidget({ user, entries }) {
               By Month
             </button>
           </div>
-          <button onClick={() => setShowAvg(s => !s)}
-            className={"text-[11px] px-2 py-1 rounded border transition-colors " + (showAvg ? "bg-teal-600 text-white border-teal-600" : "bg-white text-teal-700 border-teal-300 hover:bg-teal-50")}>
-            {showAvg ? "✓ 3-Month Avg" : "Show 3-Month Avg"}
-          </button>
+          {/* Toggle hidden in Bucket mode — Total + Avg are always shown there */}
+          {viewMode !== "bucket" && (
+            <button onClick={() => setShowAvg(s => !s)}
+              className={"text-[11px] px-2 py-1 rounded border transition-colors " + (showAvg ? "bg-teal-600 text-white border-teal-600" : "bg-white text-teal-700 border-teal-300 hover:bg-teal-50")}>
+              {showAvg ? "✓ 3-Month Avg" : "Show 3-Month Avg"}
+            </button>
+          )}
           <button onClick={presetLast30} className="text-[11px] text-teal-700 hover:text-teal-900 underline">30d</button>
           <button onClick={presetLast90} className="text-[11px] text-teal-700 hover:text-teal-900 underline">90d</button>
           <button onClick={resetAll} className="text-[11px] text-gray-600 hover:text-red-600 underline">Reset</button>
           {isAdminOrElevated && (
             <button onClick={handleExport}
-              disabled={chartData.length === 0}
-              className={"inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium rounded " + (chartData.length === 0 ? "bg-gray-200 text-gray-400 cursor-not-allowed" : "bg-teal-600 text-white hover:bg-teal-700")}>
+              disabled={visibleRowCount === 0}
+              className={"inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium rounded " + (visibleRowCount === 0 ? "bg-gray-200 text-gray-400 cursor-not-allowed" : "bg-teal-600 text-white hover:bg-teal-700")}>
               <Download size={11} /> Export CSV
             </button>
           )}
@@ -4494,27 +4605,53 @@ function CollectionPerformanceWidget({ user, entries }) {
           value={selBuckets} onChange={setSelBuckets} />
       </div>
 
-      {chartData.length === 0 ? (
+      {visibleRowCount === 0 ? (
         <div className="py-10 text-center text-gray-500 text-sm border border-dashed border-gray-200 rounded">
           No collections match the selected filters.
         </div>
       ) : (
         <ResponsiveContainer width="100%"
-          height={Math.max(320, 60 + chartData.length * (viewMode === "month" ? 60 : 28))}>
+          height={viewMode === "bucket" ? 400
+                : Math.max(320, 60 + chartData.length * (viewMode === "month" ? 60 : 28))}>
           <ComposedChart data={chartData} margin={{ top: 10, right: 16, bottom: 30, left: 0 }}>
             <CartesianGrid strokeDasharray="3 3" />
-            <XAxis dataKey="name" tick={{ fontSize: 11 }}
-              angle={viewMode === "month" ? 0 : -30}
-              textAnchor={viewMode === "month" ? "middle" : "end"}
+            <XAxis dataKey={viewMode === "bucket" ? "bucket" : "name"}
+              tick={{ fontSize: 11 }}
+              angle={viewMode === "staff" ? -30 : 0}
+              textAnchor={viewMode === "staff" ? "end" : "middle"}
               interval={0}
-              height={viewMode === "month" ? 40 : 70} />
+              height={viewMode === "staff" ? 70 : 40} />
             <YAxis tickFormatter={v => formatLakhs(v)} tick={{ fontSize: 11 }} />
             <Tooltip content={renderTooltip} cursor={{ fill: "rgba(15, 118, 110, 0.04)" }} />
             <Legend wrapperStyle={{ fontSize: 11 }} />
-            <Bar dataKey="SMA-0" name="SMA-0" fill={COLOR["SMA-0"]} radius={[3, 3, 0, 0]} />
-            <Bar dataKey="SMA-1" name="SMA-1" fill={COLOR["SMA-1"]} radius={[3, 3, 0, 0]} />
-            <Bar dataKey="SMA-2" name="SMA-2" fill={COLOR["SMA-2"]} radius={[3, 3, 0, 0]} />
-            <Bar dataKey="NPA"   name="NPA"   fill={COLOR["NPA"]}   radius={[3, 3, 0, 0]} />
+
+            {viewMode === "bucket" && monthsInRange.map((ym, i) => (
+              <Bar key={ym}
+                dataKey={shortMonthLabel(ym)}
+                name={shortMonthLabel(ym)}
+                fill={MONTH_PALETTE[i % MONTH_PALETTE.length]}
+                radius={[3, 3, 0, 0]} />
+            ))}
+            {viewMode === "bucket" && (
+              <Bar dataKey="total" name={totalLabel} fill={TOTAL_COLOR} radius={[3, 3, 0, 0]} />
+            )}
+            {viewMode === "bucket" && (
+              <Bar dataKey="avg" name={avgLabel} fill={AVG_COLOR} radius={[3, 3, 0, 0]} />
+            )}
+
+            {viewMode !== "bucket" && (
+              <Bar dataKey="SMA-0" name="SMA-0" fill={BUCKET_COLOR["SMA-0"]} radius={[3, 3, 0, 0]} />
+            )}
+            {viewMode !== "bucket" && (
+              <Bar dataKey="SMA-1" name="SMA-1" fill={BUCKET_COLOR["SMA-1"]} radius={[3, 3, 0, 0]} />
+            )}
+            {viewMode !== "bucket" && (
+              <Bar dataKey="SMA-2" name="SMA-2" fill={BUCKET_COLOR["SMA-2"]} radius={[3, 3, 0, 0]} />
+            )}
+            {viewMode !== "bucket" && (
+              <Bar dataKey="NPA" name="NPA" fill={BUCKET_COLOR["NPA"]} radius={[3, 3, 0, 0]} />
+            )}
+
             {viewMode === "staff" && showAvg && (
               <Line type="monotone" dataKey="avg3m" name="3-Month Avg"
                 stroke="#0d9488" strokeWidth={2}
@@ -4531,9 +4668,11 @@ function CollectionPerformanceWidget({ user, entries }) {
 
       <div className="text-[11px] text-gray-500 mt-2 space-y-0.5">
         <div>
-          {viewMode === "staff"
-            ? "Each staff shows one bar per bucket (SMA-0 / SMA-1 / SMA-2 / NPA). The teal line overlays the 3-Month Average (90 days before the start date, ÷ 3). Staff with no current-period collections are hidden."
-            : "Bars show monthly collections per bucket within the selected range. The dashed teal line marks the average monthly collection over the 90 days before the start date."}
+          {viewMode === "bucket"
+            ? "Each bucket shows one bar per month in the selected range, plus a " + totalLabel + " bar and an " + avgLabel + " bar so you can compare month-wise performance, total recovery, and average recovery side-by-side."
+            : viewMode === "staff"
+              ? "Each staff shows one bar per bucket. The teal line overlays the 3-Month Average (90 days before the start date, ÷ 3). Staff with no current-period collections are hidden."
+              : "Bars show monthly collections per bucket within the selected range. The dashed teal line marks the average monthly collection over the 90 days before the start date."}
         </div>
         {excludedSummary.total > 0 && (
           <div className="text-gray-400">
