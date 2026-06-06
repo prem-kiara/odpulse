@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useCallback, useRef } from "react";
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend, LineChart, Line } from "recharts";
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend, LineChart, Line, ReferenceLine } from "recharts";
 import { Plus, Trash2, LogOut, Settings, Users, GitBranch, LayoutDashboard, FileText, ChevronDown, ChevronRight, ArrowLeft, Search, Eye, EyeOff, Edit2, Save, X, AlertTriangle, CheckCircle, Database, Shield, UserPlus, ChevronUp, Download, Calendar, Tag, Lock, Upload, Bell, Clock, CreditCard, TrendingUp, Activity } from "lucide-react";
 import { CustomerInfoPanel, DataUploadPage, CollectionDashboard } from "./OdInsights.jsx";
 import ReportsAnalytics from "./ReportsAnalytics.jsx";
@@ -4027,28 +4027,49 @@ function Dashboard({ user, entries, branches, config }) {
 }
 
 // ─── Collection Performance: reusable multi-select filter ──────────────────
-// Used by the Collection Performance widget. Shows a checkbox list with
-// Select All / Clear / search, plus removable chips below for selected
-// values. Defined at module level so it isn't re-created per parent render.
+// Controlled dropdown that auto-closes on outside-click. Earlier this used
+// <details> which has native open/close but does NOT close when the user
+// clicks elsewhere on the page — that was leaving the dropdown open and
+// obscuring the chart. The new pattern owns its `open` state and listens
+// for mousedown events on document; clicks outside the rootRef close it.
 function CPMultiSelectFilter({ label, options, value, onChange, search, setSearch, renderLabel }) {
   const rl = renderLabel || ((v) => v);
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e) => {
+      if (rootRef.current && !rootRef.current.contains(e.target)) setOpen(false);
+    };
+    const onKey = (e) => { if (e.key === "Escape") setOpen(false); };
+    document.addEventListener("mousedown", onDown);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onDown);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
   const filtered = (search && search.trim())
     ? options.filter(o => String(rl(o)).toLowerCase().includes(search.trim().toLowerCase()))
     : options;
+
+  const summaryText = value.length === 0 ? "All " + label
+    : value.length === 1 ? String(rl(value[0]))
+    : value.length + " selected";
+
   return (
-    <div>
+    <div ref={rootRef} className="relative">
       <label className="block text-[10px] font-semibold text-gray-600 uppercase mb-1">
         {label}{value.length > 0 ? ` (${value.length})` : ""}
       </label>
-      <details className="relative">
-        <summary className="w-full px-2 py-1.5 border rounded text-xs bg-white cursor-pointer list-none flex items-center justify-between">
-          <span className="truncate text-gray-700">
-            {value.length === 0 ? "All " + label :
-             value.length === 1 ? String(rl(value[0])) :
-             value.length + " selected"}
-          </span>
-          <ChevronDown size={12} className="text-gray-400 ml-1 shrink-0" />
-        </summary>
+      <button type="button" onClick={() => setOpen(o => !o)}
+        className="w-full px-2 py-1.5 border rounded text-xs bg-white text-left flex items-center justify-between hover:bg-gray-50">
+        <span className="truncate text-gray-700">{summaryText}</span>
+        <ChevronDown size={12} className={"text-gray-400 ml-1 shrink-0 transition-transform " + (open ? "rotate-180" : "")} />
+      </button>
+      {open && (
         <div className="absolute z-30 mt-1 left-0 right-0 min-w-[220px] bg-white border border-gray-200 rounded-lg shadow-lg p-2">
           <div className="flex gap-1 mb-2">
             <button type="button" onClick={() => onChange([...options])}
@@ -4091,7 +4112,7 @@ function CPMultiSelectFilter({ label, options, value, onChange, search, setSearc
             })}
           </div>
         </div>
-      </details>
+      )}
       {value.length > 0 && (
         <div className="flex flex-wrap gap-1 mt-1">
           {value.map(v => (
@@ -4109,36 +4130,35 @@ function CPMultiSelectFilter({ label, options, value, onChange, search, setSearc
 }
 
 // ─── Collection Performance Widget ─────────────────────────────────────────
-// Dashboard analytics widget. Visual bar chart (NOT a table) that compares
-// collection performance across staff with:
-//   • Stacked bars per staff broken down by Bucket Category
-//     (SMA-0 / SMA-1 / SMA-2 / NPA / No-Bucket — colour-coded)
-//   • Optional 3-Month Avg overlay bar (toggle button) — sum of the same
-//     staff's collections over the 90 days immediately preceding the
-//     selected start date, divided by 3
+// Dashboard analytics widget — interactive bar chart (NOT a table) showing
+// collection performance across staff and months, broken down by bucket.
 //
-// Filters (multi-select with Select All + search where useful):
-//   • Branch / Staff / Bucket — each defaults to "all"
-//   • Date Range — defaults to the last 30 days
+// View modes (segmented toggle):
+//   • Staff  — X-axis = staff name. Each bucket is a separate side-by-side
+//              bar so SMA-0 / SMA-1 / SMA-2 / NPA / No-Bucket are directly
+//              comparable. Optional 3-Month Avg overlay shown as an extra
+//              teal bar per staff.
+//   • Month  — X-axis = month within the selected range. Each bucket is a
+//              separate bar so trend per bucket is visible. The 3-Month
+//              Avg appears as a horizontal ReferenceLine for the global
+//              monthly comparison level.
 //
-// Style match: same `bg-white rounded-xl border p-4` card and recharts
-// BarChart used by the existing Monthly Recovery Trend / Recovery by
-// Payment Mode charts directly above.
-//
-// RBAC: Export CSV button is shown only to Administrator + MIS Staff.
+// Filters: Branch / Staff / Bucket (multi-select with Select All + click-
+// outside auto-close) + Date Range. RBAC: Export CSV visible to Admin + MIS.
 function CollectionPerformanceWidget({ user, entries }) {
   const isAdminOrElevated = user.role === "admin" || user.role === "elevated_staff";
 
-  // Users for staff-name lookup (Dashboard prop signature doesn't include them).
+  // Users for staff-name lookup.
   const users = useMemo(() => {
     try { return JSON.parse(localStorage.getItem(STORAGE_KEYS.users) || "[]"); }
     catch { return []; }
   }, []);
 
-  // Default range = last 30 days inclusive.
+  // Default = last 90 days (3 months) so the Month view shows a meaningful
+  // multi-month comparison out of the box.
   const defaultTo = useMemo(() => nowDate(), []);
   const defaultFrom = useMemo(() => {
-    const d = new Date(); d.setDate(d.getDate() - 30);
+    const d = new Date(); d.setDate(d.getDate() - 90);
     return d.toISOString().slice(0, 10);
   }, []);
   const [dateFrom, setDateFrom] = useState(defaultFrom);
@@ -4150,7 +4170,8 @@ function CollectionPerformanceWidget({ user, entries }) {
   const [branchSearch, setBranchSearch] = useState("");
   const [staffSearch, setStaffSearch] = useState("");
 
-  // Toggle for the 3-month-average overlay bar.
+  // "staff" | "month" — segmented toggle. Defaults to staff.
+  const [viewMode, setViewMode] = useState("staff");
   const [showAvg, setShowAvg] = useState(true);
 
   const branchOptions = useMemo(() => Array.from(new Set(
@@ -4178,12 +4199,14 @@ function CollectionPerformanceWidget({ user, entries }) {
   }, [staffOptions]);
 
   const BUCKETS = ["SMA-0", "SMA-1", "SMA-2", "NPA", "(no bucket)"];
+  const COLOR = { "SMA-0": "#3b82f6", "SMA-1": "#eab308", "SMA-2": "#f97316", "NPA": "#ef4444", "Other": "#94a3b8" };
 
   const getPaid = (e) =>
     Number(e.totalPaidAmount ?? e.paidAmount ?? e.groupOdPaidAmount ?? e.customerShare ?? 0) || 0;
   const bucketOf = (e) => e.smaBucket || "(no bucket)";
+  const bucketKey = (b) =>
+    b === "SMA-0" ? "SMA-0" : b === "SMA-1" ? "SMA-1" : b === "SMA-2" ? "SMA-2" : b === "NPA" ? "NPA" : "Other";
 
-  // 3-month-prior window: 90 days strictly BEFORE dateFrom (uniform divisor).
   const threeMonthsStart = useMemo(() => {
     if (!dateFrom) return "";
     const d = new Date(dateFrom);
@@ -4198,72 +4221,103 @@ function CollectionPerformanceWidget({ user, entries }) {
     return true;
   }, [selBranches, selStaff, selBuckets]);
 
-  // Aggregate per staff: one chart datum per staff with bucket breakdowns
-  // + accountCount + prior-90 total. avg3m = prior90 / 3.
+  // Month-label helper: "2026-04" → "Apr 2026"
+  const monthLabel = (ym) => {
+    if (!ym) return "";
+    const [y, m] = ym.split("-");
+    return MONTHS[Math.max(0, Math.min(11, parseInt(m, 10) - 1))] + " " + y;
+  };
+
+  // Aggregate per current view mode.
   const chartData = useMemo(() => {
+    if (viewMode === "month") {
+      const byMonth = new Map();
+      const ensure = (ym) => {
+        if (!byMonth.has(ym)) byMonth.set(ym, {
+          month: ym, name: monthLabel(ym),
+          "SMA-0": 0, "SMA-1": 0, "SMA-2": 0, "NPA": 0, "Other": 0,
+          currentTotal: 0,
+        });
+        return byMonth.get(ym);
+      };
+      for (const e of entries) {
+        if (!matchesFilters(e)) continue;
+        const d = e.date || "";
+        if (!d) continue;
+        if (dateFrom && d < dateFrom) continue;
+        if (dateTo && d > dateTo) continue;
+        const ym = d.slice(0, 7);
+        const slot = ensure(ym);
+        const amt = getPaid(e);
+        slot.currentTotal += amt;
+        slot[bucketKey(bucketOf(e))] += amt;
+      }
+      return Array.from(byMonth.values()).sort((a, b) => a.month.localeCompare(b.month));
+    }
+
+    // viewMode === "staff"
     const byStaff = new Map();
-    const accounts = new Map(); // staffId -> Set of distinct accounts
+    const accounts = new Map();
     const ensure = (sid) => {
       if (!byStaff.has(sid)) byStaff.set(sid, {
         staffId: sid,
         name: staffNameById.get(sid) || sid || "—",
         branch: "",
         "SMA-0": 0, "SMA-1": 0, "SMA-2": 0, "NPA": 0, "Other": 0,
-        currentTotal: 0,
-        accountCount: 0,
-        prior90: 0,
-        avg3m: 0,
+        currentTotal: 0, accountCount: 0, prior90: 0, avg3m: 0,
       });
       return byStaff.get(sid);
     };
-
     for (const e of entries) {
       if (!matchesFilters(e)) continue;
       const sid = e.enteredBy || "(unknown)";
       const d = e.date || "";
       const inCur = (!dateFrom || d >= dateFrom) && (!dateTo || d <= dateTo);
       const inPrior = threeMonthsStart && d >= threeMonthsStart && (!dateFrom || d < dateFrom);
-
       if (inCur) {
         const slot = ensure(sid);
         slot.branch = e.branch || slot.branch;
         const amt = getPaid(e);
         slot.currentTotal += amt;
-        const b = bucketOf(e);
-        if (b === "SMA-0") slot["SMA-0"] += amt;
-        else if (b === "SMA-1") slot["SMA-1"] += amt;
-        else if (b === "SMA-2") slot["SMA-2"] += amt;
-        else if (b === "NPA") slot["NPA"] += amt;
-        else slot["Other"] += amt;
+        slot[bucketKey(bucketOf(e))] += amt;
         if (!accounts.has(sid)) accounts.set(sid, new Set());
         accounts.get(sid).add(e.loanAccountNo || e.customerId || e.id);
       }
       if (inPrior) {
-        const slot = ensure(sid);
-        slot.prior90 += getPaid(e);
+        ensure(sid).prior90 += getPaid(e);
       }
     }
     for (const [sid, slot] of byStaff) {
       slot.accountCount = (accounts.get(sid) || new Set()).size;
       slot.avg3m = slot.prior90 / 3;
     }
-    // Drop staff with absolutely zero in both windows so the chart isn't noisy.
     return Array.from(byStaff.values())
       .filter(s => s.currentTotal > 0 || s.avg3m > 0)
       .sort((a, b) => b.currentTotal - a.currentTotal);
-  }, [entries, dateFrom, dateTo, threeMonthsStart, matchesFilters, staffNameById]);
+  }, [viewMode, entries, dateFrom, dateTo, threeMonthsStart, matchesFilters, staffNameById]);
 
-  // Bucket palette — matches the existing SMA badge colours used elsewhere.
-  const COLOR = { "SMA-0": "#3b82f6", "SMA-1": "#eab308", "SMA-2": "#f97316", "NPA": "#ef4444", "Other": "#94a3b8" };
+  // Global 3-Month Avg amount per month for the ReferenceLine in Month mode.
+  // Sums the same filters across the prior-90-day window and divides by 3.
+  const monthlyAvgRef = useMemo(() => {
+    if (viewMode !== "month" || !showAvg || !threeMonthsStart) return 0;
+    let total = 0;
+    for (const e of entries) {
+      if (!matchesFilters(e)) continue;
+      const d = e.date || "";
+      if (d >= threeMonthsStart && (!dateFrom || d < dateFrom)) total += getPaid(e);
+    }
+    return total / 3;
+  }, [viewMode, showAvg, threeMonthsStart, entries, matchesFilters, dateFrom]);
 
-  // Custom tooltip — shows full staff + branch + per-bucket breakdown + avg.
   const renderTooltip = ({ active, payload, label }) => {
     if (!active || !payload || payload.length === 0) return null;
     const d = payload[0].payload || {};
     return (
-      <div className="bg-white p-3 border border-gray-200 rounded-lg shadow-md text-xs min-w-[180px]">
+      <div className="bg-white p-3 border border-gray-200 rounded-lg shadow-md text-xs min-w-[200px]">
         <div className="font-semibold text-gray-900 mb-1">{d.name}</div>
-        <div className="text-gray-500 mb-2">Branch: {d.branch || "—"} · Accounts: {d.accountCount || 0}</div>
+        {viewMode === "staff" && (
+          <div className="text-gray-500 mb-2">Branch: {d.branch || "—"} · Accounts: {d.accountCount || 0}</div>
+        )}
         {["SMA-0", "SMA-1", "SMA-2", "NPA", "Other"].map(k => (
           (d[k] || 0) > 0 ? (
             <div key={k} className="flex justify-between gap-3">
@@ -4278,7 +4332,7 @@ function CollectionPerformanceWidget({ user, entries }) {
         <div className="border-t border-gray-200 mt-2 pt-1.5 flex justify-between font-semibold">
           <span>Total</span><span>{formatINR(d.currentTotal)}</span>
         </div>
-        {showAvg && (
+        {viewMode === "staff" && showAvg && (
           <div className="flex justify-between text-teal-700 mt-0.5">
             <span>3-Month Avg</span><span>{formatINR(Math.round(d.avg3m || 0))}</span>
           </div>
@@ -4296,22 +4350,27 @@ function CollectionPerformanceWidget({ user, entries }) {
       alert("No data to export. Adjust filters and try again.");
       return;
     }
-    const headers = [
-      "Staff Name", "Branch",
-      "SMA-0", "SMA-1", "SMA-2", "NPA", "No Bucket",
-      "Total Amount Collected", "Accounts Collected", "3-Month Avg",
-    ];
     const q = v => '"' + String(v == null ? "" : v).replace(/"/g, '""') + '"';
-    const lines = [headers, ...chartData.map(d => [
-      d.name, d.branch,
-      d["SMA-0"], d["SMA-1"], d["SMA-2"], d["NPA"], d["Other"],
-      d.currentTotal, d.accountCount, Math.round(d.avg3m),
-    ])];
+    let headers, lines;
+    if (viewMode === "month") {
+      headers = ["Month", "SMA-0", "SMA-1", "SMA-2", "NPA", "No Bucket", "Total Amount Collected"];
+      lines = [headers, ...chartData.map(d => [
+        d.name, d["SMA-0"], d["SMA-1"], d["SMA-2"], d["NPA"], d["Other"], d.currentTotal,
+      ])];
+    } else {
+      headers = ["Staff Name", "Branch", "SMA-0", "SMA-1", "SMA-2", "NPA", "No Bucket",
+                 "Total Amount Collected", "Accounts Collected", "3-Month Avg"];
+      lines = [headers, ...chartData.map(d => [
+        d.name, d.branch,
+        d["SMA-0"], d["SMA-1"], d["SMA-2"], d["NPA"], d["Other"],
+        d.currentTotal, d.accountCount, Math.round(d.avg3m),
+      ])];
+    }
     const csv = lines.map(row => row.map(q).join(",")).join("\n");
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
-    a.href = url; a.download = "collection-performance-" + nowDate() + ".csv";
+    a.href = url; a.download = "collection-performance-" + viewMode + "-" + nowDate() + ".csv";
     document.body.appendChild(a); a.click(); document.body.removeChild(a);
     setTimeout(() => URL.revokeObjectURL(url), 5000);
   };
@@ -4319,6 +4378,12 @@ function CollectionPerformanceWidget({ user, entries }) {
   const presetLast30 = () => {
     const to = new Date();
     const from = new Date(); from.setDate(from.getDate() - 30);
+    setDateFrom(from.toISOString().slice(0, 10));
+    setDateTo(to.toISOString().slice(0, 10));
+  };
+  const presetLast90 = () => {
+    const to = new Date();
+    const from = new Date(); from.setDate(from.getDate() - 90);
     setDateFrom(from.toISOString().slice(0, 10));
     setDateTo(to.toISOString().slice(0, 10));
   };
@@ -4333,15 +4398,29 @@ function CollectionPerformanceWidget({ user, entries }) {
       <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
         <h3 className="text-sm font-semibold text-gray-700 flex items-center gap-2">
           <TrendingUp size={16} className="text-teal-600" />
-          Collection Performance — Staff × Bucket
-          <span className="text-[11px] font-normal text-gray-400">{chartData.length} staff</span>
+          Collection Performance — by Bucket
+          <span className="text-[11px] font-normal text-gray-400">
+            {chartData.length} {viewMode === "month" ? "month" : "staff"}{chartData.length === 1 ? "" : "s"}
+          </span>
         </h3>
         <div className="flex items-center gap-2 flex-wrap">
+          {/* View toggle: Staff vs Month */}
+          <div className="inline-flex rounded-lg border border-gray-200 overflow-hidden text-[11px]">
+            <button onClick={() => setViewMode("staff")}
+              className={"px-2.5 py-1 " + (viewMode === "staff" ? "bg-teal-600 text-white" : "bg-white text-gray-700 hover:bg-gray-50")}>
+              By Staff
+            </button>
+            <button onClick={() => setViewMode("month")}
+              className={"px-2.5 py-1 border-l border-gray-200 " + (viewMode === "month" ? "bg-teal-600 text-white" : "bg-white text-gray-700 hover:bg-gray-50")}>
+              By Month
+            </button>
+          </div>
           <button onClick={() => setShowAvg(s => !s)}
             className={"text-[11px] px-2 py-1 rounded border transition-colors " + (showAvg ? "bg-teal-600 text-white border-teal-600" : "bg-white text-teal-700 border-teal-300 hover:bg-teal-50")}>
             {showAvg ? "✓ 3-Month Avg" : "Show 3-Month Avg"}
           </button>
-          <button onClick={presetLast30} className="text-[11px] text-teal-700 hover:text-teal-900 underline">Last 30 days</button>
+          <button onClick={presetLast30} className="text-[11px] text-teal-700 hover:text-teal-900 underline">30d</button>
+          <button onClick={presetLast90} className="text-[11px] text-teal-700 hover:text-teal-900 underline">90d</button>
           <button onClick={resetAll} className="text-[11px] text-gray-600 hover:text-red-600 underline">Reset</button>
           {isAdminOrElevated && (
             <button onClick={handleExport}
@@ -4353,7 +4432,6 @@ function CollectionPerformanceWidget({ user, entries }) {
         </div>
       </div>
 
-      {/* Filter row — same dropdown style as Notifications export */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3 mb-4">
         <div>
           <label className="block text-[10px] font-semibold text-gray-600 uppercase mb-1">Date From</label>
@@ -4376,34 +4454,47 @@ function CollectionPerformanceWidget({ user, entries }) {
           value={selBuckets} onChange={setSelBuckets} />
       </div>
 
-      {/* Chart */}
       {chartData.length === 0 ? (
         <div className="py-10 text-center text-gray-500 text-sm border border-dashed border-gray-200 rounded">
           No collections match the selected filters.
         </div>
       ) : (
-        <ResponsiveContainer width="100%" height={Math.max(320, 60 + chartData.length * 28)}>
+        <ResponsiveContainer width="100%"
+          height={Math.max(320, 60 + chartData.length * (viewMode === "month" ? 60 : 28))}>
           <BarChart data={chartData} margin={{ top: 10, right: 16, bottom: 30, left: 0 }}>
             <CartesianGrid strokeDasharray="3 3" />
-            <XAxis dataKey="name" tick={{ fontSize: 11 }} angle={-30} textAnchor="end" interval={0} height={70} />
+            <XAxis dataKey="name" tick={{ fontSize: 11 }}
+              angle={viewMode === "month" ? 0 : -30}
+              textAnchor={viewMode === "month" ? "middle" : "end"}
+              interval={0}
+              height={viewMode === "month" ? 40 : 70} />
             <YAxis tickFormatter={v => formatLakhs(v)} tick={{ fontSize: 11 }} />
             <Tooltip content={renderTooltip} cursor={{ fill: "rgba(15, 118, 110, 0.04)" }} />
             <Legend wrapperStyle={{ fontSize: 11 }} />
-            {/* Stacked bars per bucket — current period */}
-            <Bar dataKey="SMA-0" name="SMA-0" stackId="cur" fill={COLOR["SMA-0"]} />
-            <Bar dataKey="SMA-1" name="SMA-1" stackId="cur" fill={COLOR["SMA-1"]} />
-            <Bar dataKey="SMA-2" name="SMA-2" stackId="cur" fill={COLOR["SMA-2"]} />
-            <Bar dataKey="NPA"   name="NPA"   stackId="cur" fill={COLOR["NPA"]} radius={[4, 4, 0, 0]} />
-            <Bar dataKey="Other" name="No Bucket" stackId="cur" fill={COLOR["Other"]} />
-            {/* Optional rolling-3-month average overlay (separate bar group) */}
-            {showAvg && <Bar dataKey="avg3m" name="3-Month Avg" fill="#0d9488" radius={[4, 4, 0, 0]} />}
+            {/* GROUPED (not stacked) bars per bucket — each bucket gets its
+                own side-by-side bar so they're directly comparable. */}
+            <Bar dataKey="SMA-0" name="SMA-0" fill={COLOR["SMA-0"]} radius={[3, 3, 0, 0]} />
+            <Bar dataKey="SMA-1" name="SMA-1" fill={COLOR["SMA-1"]} radius={[3, 3, 0, 0]} />
+            <Bar dataKey="SMA-2" name="SMA-2" fill={COLOR["SMA-2"]} radius={[3, 3, 0, 0]} />
+            <Bar dataKey="NPA"   name="NPA"   fill={COLOR["NPA"]}   radius={[3, 3, 0, 0]} />
+            <Bar dataKey="Other" name="No Bucket" fill={COLOR["Other"]} radius={[3, 3, 0, 0]} />
+            {/* Staff mode: per-staff 3-Month Avg as an extra bar. */}
+            {viewMode === "staff" && showAvg && (
+              <Bar dataKey="avg3m" name="3-Month Avg" fill="#0d9488" radius={[3, 3, 0, 0]} />
+            )}
+            {/* Month mode: global 3-Month Avg as a horizontal reference line. */}
+            {viewMode === "month" && showAvg && monthlyAvgRef > 0 && (
+              <ReferenceLine y={monthlyAvgRef} stroke="#0d9488" strokeDasharray="4 4"
+                label={{ value: "3-Month Avg: " + formatINR(Math.round(monthlyAvgRef)), position: "right", fill: "#0d9488", fontSize: 10 }} />
+            )}
           </BarChart>
         </ResponsiveContainer>
       )}
 
       <p className="text-[11px] text-gray-500 mt-2">
-        Stacked bars = collections by bucket per staff in the selected period. The teal bar overlays the rolling 3-month average
-        (sum of collections in the 90 days immediately before the start date, divided by 3). Hover for branch + per-bucket detail.
+        {viewMode === "staff"
+          ? "Each staff has one bar per bucket — colors match SMA badges. Toggle 3-Month Avg to compare against the average of the 90 days before the selected start date."
+          : "Bars show monthly collections per bucket within the selected range. The dashed teal line marks the average monthly collection over the 90 days before the start date."}
       </p>
     </div>
   );
