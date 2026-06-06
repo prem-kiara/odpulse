@@ -4127,25 +4127,21 @@ function CPMultiSelectFilter({ label, options, value, onChange, search, setSearc
 // Interactive chart showing collection performance by staff and month,
 // broken down per bucket.
 //
-// What changed vs the previous version (and why):
-//   • Previous behaviour: a staff member with NO collections in the selected
-//     period but with prior-90-day data would still appear, rendering five
-//     zero-height bucket bars and only the avg3m bar visible. The user saw
-//     "only the 3-Month Average bar is showing". Fix: in Staff mode, only
-//     include staff with currentTotal > 0. Every visible staff has real
-//     bucket data to display.
-//   • Previous chart used a Bar for avg3m next to five bucket bars — the
-//     avg bar was typically the SUM, so it dwarfed each individual bucket
-//     bar and gave the impression buckets weren't rendering. Fix: switch
-//     to a ComposedChart and render avg3m as a Line series (teal, with
-//     dots) overlaid across staff. The line stops competing for bar width
-//     and acts as a clear visual reference.
-//   • Buckets are NOT stacked (no stackId). Five side-by-side bars per
-//     staff, colour-coded SMA-0 / SMA-1 / SMA-2 / NPA / No Bucket.
+// Exclusions (intentional, business-driven):
+//   • Administrator role — admins don't collect; including them skews
+//     averages, rankings, totals. Excluded from the staff filter, the
+//     aggregation, and the CSV export.
+//   • Entries with no smaBucket — the chart is "by Bucket". Entries that
+//     have no bucket assignment (most Group OD entries by design, plus
+//     Individual OD entries where the user skipped the optional dropdown,
+//     plus bulk-uploaded rows whose source column didn't match a known
+//     bucket string) are excluded. A counter under the chart shows how
+//     many records were dropped so the exclusion is transparent. To
+//     include them, an admin needs to either assign a bucket in the entry
+//     form or fix the source CSV mapping during bulk upload.
 //
 // Filters: Branch / Staff / Bucket (multi-select, click-outside close,
-// count-only summary — no chip row) + Date Range. RBAC: Export CSV visible
-// to Admin + MIS only.
+// count-only summary) + Date Range. RBAC: Export CSV is Admin + MIS only.
 function CollectionPerformanceWidget({ user, entries }) {
   const isAdminOrElevated = user.role === "admin" || user.role === "elevated_staff";
 
@@ -4153,6 +4149,16 @@ function CollectionPerformanceWidget({ user, entries }) {
     try { return JSON.parse(localStorage.getItem(STORAGE_KEYS.users) || "[]"); }
     catch { return []; }
   }, []);
+
+  // Build the set of user IDs that should be EXCLUDED from collection
+  // analytics. Currently only Administrator — if more roles need exclusion
+  // (e.g. "auditor"), add them here. The exclusion is purely role-based,
+  // so a user changing role flows through automatically on next render.
+  const excludedUserIds = useMemo(() => {
+    const s = new Set();
+    for (const u of users) if (u && u.role === "admin") s.add(u.id);
+    return s;
+  }, [users]);
 
   const defaultTo = useMemo(() => nowDate(), []);
   const defaultFrom = useMemo(() => {
@@ -4168,26 +4174,31 @@ function CollectionPerformanceWidget({ user, entries }) {
   const [branchSearch, setBranchSearch] = useState("");
   const [staffSearch, setStaffSearch] = useState("");
 
-  const [viewMode, setViewMode] = useState("staff"); // "staff" | "month"
+  const [viewMode, setViewMode] = useState("staff");
   const [showAvg, setShowAvg] = useState(true);
 
   const branchOptions = useMemo(() => Array.from(new Set(
     entries.map(e => e.branch).filter(Boolean)
   )).sort(), [entries]);
 
+  // Staff filter: only show users with role staff or elevated_staff (and a
+  // matching entry exists). Administrators are filtered out — they aren't
+  // collection staff, even if they happen to have created a bulk-upload
+  // entry that has their id on it.
   const staffOptions = useMemo(() => {
     const seen = new Set();
     const out = [];
     for (const e of entries) {
       const sid = e.enteredBy || "";
       if (!sid || seen.has(sid)) continue;
+      if (excludedUserIds.has(sid)) continue; // skip admins
       seen.add(sid);
       const u = users.find(x => x.id === sid);
       out.push({ id: sid, name: u ? u.name : (e.enteredByName || sid) });
     }
     out.sort((a, b) => a.name.localeCompare(b.name));
     return out;
-  }, [entries, users]);
+  }, [entries, users, excludedUserIds]);
   const staffIdOptions = useMemo(() => staffOptions.map(s => s.id), [staffOptions]);
   const staffNameById = useMemo(() => {
     const m = new Map();
@@ -4195,14 +4206,21 @@ function CollectionPerformanceWidget({ user, entries }) {
     return m;
   }, [staffOptions]);
 
-  const BUCKETS = ["SMA-0", "SMA-1", "SMA-2", "NPA", "(no bucket)"];
-  const COLOR = { "SMA-0": "#3b82f6", "SMA-1": "#eab308", "SMA-2": "#f97316", "NPA": "#ef4444", "Other": "#94a3b8" };
+  // Valid buckets only — "No Bucket" intentionally removed from the filter.
+  // The chart shows bucket-classified collections; entries without buckets
+  // (most Group OD, partial Individual OD, unmapped bulk uploads) are
+  // counted separately as "excluded" and surfaced below the chart.
+  const BUCKETS = ["SMA-0", "SMA-1", "SMA-2", "NPA"];
+  const COLOR = { "SMA-0": "#3b82f6", "SMA-1": "#eab308", "SMA-2": "#f97316", "NPA": "#ef4444" };
 
   const getPaid = (e) =>
     Number(e.totalPaidAmount ?? e.paidAmount ?? e.groupOdPaidAmount ?? e.customerShare ?? 0) || 0;
-  const bucketOf = (e) => e.smaBucket || "(no bucket)";
-  const bucketKey = (b) =>
-    b === "SMA-0" ? "SMA-0" : b === "SMA-1" ? "SMA-1" : b === "SMA-2" ? "SMA-2" : b === "NPA" ? "NPA" : "Other";
+  // Validates an entry's bucket. Returns the bucket string if it's one of
+  // the four supported categories, otherwise null. null = "exclude from chart".
+  const validBucket = (e) => {
+    const b = e && e.smaBucket;
+    return (b === "SMA-0" || b === "SMA-1" || b === "SMA-2" || b === "NPA") ? b : null;
+  };
 
   const threeMonthsStart = useMemo(() => {
     if (!dateFrom) return "";
@@ -4211,12 +4229,42 @@ function CollectionPerformanceWidget({ user, entries }) {
     return d.toISOString().slice(0, 10);
   }, [dateFrom]);
 
+  // Core matcher: applies the user's filters AND the analytics exclusions
+  // (admin + no-bucket). One central place keeps the rules consistent across
+  // chart, tooltip, export.
   const matchesFilters = useCallback((e) => {
+    if (!e) return false;
+    if (excludedUserIds.has(e.enteredBy)) return false;
     if (selBranches.length > 0 && !selBranches.includes(e.branch || "")) return false;
     if (selStaff.length > 0 && !selStaff.includes(e.enteredBy || "")) return false;
-    if (selBuckets.length > 0 && !selBuckets.includes(bucketOf(e))) return false;
+    const b = validBucket(e);
+    if (!b) return false; // exclude no-bucket entries
+    if (selBuckets.length > 0 && !selBuckets.includes(b)) return false;
     return true;
-  }, [selBranches, selStaff, selBuckets]);
+  }, [selBranches, selStaff, selBuckets, excludedUserIds]);
+
+  // Count of entries we DROPPED inside the user's selected date+branch+staff
+  // window but didn't include because they lacked a valid bucket or were
+  // admin-authored. Surfaced as a footnote so the exclusion is transparent.
+  const excludedSummary = useMemo(() => {
+    let noBucket = 0;
+    let adminAuthored = 0;
+    let total = 0;
+    for (const e of entries) {
+      if (!e) continue;
+      const d = e.date || "";
+      if (dateFrom && d && d < dateFrom) continue;
+      if (dateTo && d && d > dateTo) continue;
+      if (selBranches.length > 0 && !selBranches.includes(e.branch || "")) continue;
+      if (selStaff.length > 0 && !selStaff.includes(e.enteredBy || "")) continue;
+      // Within scope but excluded?
+      const isAdminAuth = excludedUserIds.has(e.enteredBy);
+      const noB = !validBucket(e);
+      if (isAdminAuth) { adminAuthored++; total++; }
+      else if (noB)     { noBucket++; total++; }
+    }
+    return { noBucket, adminAuthored, total };
+  }, [entries, dateFrom, dateTo, selBranches, selStaff, excludedUserIds]);
 
   const monthLabel = (ym) => {
     if (!ym) return "";
@@ -4230,7 +4278,7 @@ function CollectionPerformanceWidget({ user, entries }) {
       const ensure = (ym) => {
         if (!byMonth.has(ym)) byMonth.set(ym, {
           month: ym, name: monthLabel(ym),
-          "SMA-0": 0, "SMA-1": 0, "SMA-2": 0, "NPA": 0, "Other": 0,
+          "SMA-0": 0, "SMA-1": 0, "SMA-2": 0, "NPA": 0,
           currentTotal: 0,
         });
         return byMonth.get(ym);
@@ -4245,7 +4293,7 @@ function CollectionPerformanceWidget({ user, entries }) {
         const slot = ensure(ym);
         const amt = getPaid(e);
         slot.currentTotal += amt;
-        slot[bucketKey(bucketOf(e))] += amt;
+        slot[validBucket(e)] += amt;
       }
       return Array.from(byMonth.values()).sort((a, b) => a.month.localeCompare(b.month));
     }
@@ -4258,7 +4306,7 @@ function CollectionPerformanceWidget({ user, entries }) {
         staffId: sid,
         name: staffNameById.get(sid) || sid || "—",
         branch: "",
-        "SMA-0": 0, "SMA-1": 0, "SMA-2": 0, "NPA": 0, "Other": 0,
+        "SMA-0": 0, "SMA-1": 0, "SMA-2": 0, "NPA": 0,
         currentTotal: 0, accountCount: 0, prior90: 0, avg3m: 0,
       });
       return byStaff.get(sid);
@@ -4274,7 +4322,7 @@ function CollectionPerformanceWidget({ user, entries }) {
         slot.branch = e.branch || slot.branch;
         const amt = getPaid(e);
         slot.currentTotal += amt;
-        slot[bucketKey(bucketOf(e))] += amt;
+        slot[validBucket(e)] += amt;
         if (!accounts.has(sid)) accounts.set(sid, new Set());
         accounts.get(sid).add(e.loanAccountNo || e.customerId || e.id);
       }
@@ -4286,16 +4334,11 @@ function CollectionPerformanceWidget({ user, entries }) {
       slot.accountCount = (accounts.get(sid) || new Set()).size;
       slot.avg3m = slot.prior90 / 3;
     }
-    // STRICT filter: only include staff with current-period activity. Earlier
-    // we OR-ed with avg3m > 0, which let prior-only staff in and produced
-    // the "only the avg bar shows" symptom. If you want to see prior-only
-    // staff, widen the date range.
     return Array.from(byStaff.values())
       .filter(s => s.currentTotal > 0)
       .sort((a, b) => b.currentTotal - a.currentTotal);
   }, [viewMode, entries, dateFrom, dateTo, threeMonthsStart, matchesFilters, staffNameById]);
 
-  // Global 3-Month Avg for Month-mode ReferenceLine.
   const monthlyAvgRef = useMemo(() => {
     if (viewMode !== "month" || !showAvg || !threeMonthsStart) return 0;
     let total = 0;
@@ -4316,12 +4359,12 @@ function CollectionPerformanceWidget({ user, entries }) {
         {viewMode === "staff" && (
           <div className="text-gray-500 mb-2">Branch: {d.branch || "—"} · Accounts: {d.accountCount || 0}</div>
         )}
-        {["SMA-0", "SMA-1", "SMA-2", "NPA", "Other"].map(k => (
+        {["SMA-0", "SMA-1", "SMA-2", "NPA"].map(k => (
           (d[k] || 0) > 0 ? (
             <div key={k} className="flex justify-between gap-3">
               <span className="text-gray-600">
                 <span className="inline-block w-2 h-2 rounded-sm mr-1.5 align-middle" style={{ background: COLOR[k] }} />
-                {k === "Other" ? "No Bucket" : k}
+                {k}
               </span>
               <span className="font-medium text-gray-800">{formatINR(d[k])}</span>
             </div>
@@ -4351,16 +4394,16 @@ function CollectionPerformanceWidget({ user, entries }) {
     const q = v => '"' + String(v == null ? "" : v).replace(/"/g, '""') + '"';
     let headers, lines;
     if (viewMode === "month") {
-      headers = ["Month", "SMA-0", "SMA-1", "SMA-2", "NPA", "No Bucket", "Total Amount Collected"];
+      headers = ["Month", "SMA-0", "SMA-1", "SMA-2", "NPA", "Total Amount Collected"];
       lines = [headers, ...chartData.map(d => [
-        d.name, d["SMA-0"], d["SMA-1"], d["SMA-2"], d["NPA"], d["Other"], d.currentTotal,
+        d.name, d["SMA-0"], d["SMA-1"], d["SMA-2"], d["NPA"], d.currentTotal,
       ])];
     } else {
-      headers = ["Staff Name", "Branch", "SMA-0", "SMA-1", "SMA-2", "NPA", "No Bucket",
+      headers = ["Staff Name", "Branch", "SMA-0", "SMA-1", "SMA-2", "NPA",
                  "Total Amount Collected", "Accounts Collected", "3-Month Avg"];
       lines = [headers, ...chartData.map(d => [
         d.name, d.branch,
-        d["SMA-0"], d["SMA-1"], d["SMA-2"], d["NPA"], d["Other"],
+        d["SMA-0"], d["SMA-1"], d["SMA-2"], d["NPA"],
         d.currentTotal, d.accountCount, Math.round(d.avg3m),
       ])];
     }
@@ -4458,9 +4501,6 @@ function CollectionPerformanceWidget({ user, entries }) {
       ) : (
         <ResponsiveContainer width="100%"
           height={Math.max(320, 60 + chartData.length * (viewMode === "month" ? 60 : 28))}>
-          {/* ComposedChart so we can mix grouped Bars (per bucket) with a
-              Line (3-Month Avg). The Line doesn't compete for bar width and
-              acts as a clear visual reference across staff. */}
           <ComposedChart data={chartData} margin={{ top: 10, right: 16, bottom: 30, left: 0 }}>
             <CartesianGrid strokeDasharray="3 3" />
             <XAxis dataKey="name" tick={{ fontSize: 11 }}
@@ -4471,21 +4511,16 @@ function CollectionPerformanceWidget({ user, entries }) {
             <YAxis tickFormatter={v => formatLakhs(v)} tick={{ fontSize: 11 }} />
             <Tooltip content={renderTooltip} cursor={{ fill: "rgba(15, 118, 110, 0.04)" }} />
             <Legend wrapperStyle={{ fontSize: 11 }} />
-            {/* GROUPED bars — each bucket gets its own side-by-side bar */}
             <Bar dataKey="SMA-0" name="SMA-0" fill={COLOR["SMA-0"]} radius={[3, 3, 0, 0]} />
             <Bar dataKey="SMA-1" name="SMA-1" fill={COLOR["SMA-1"]} radius={[3, 3, 0, 0]} />
             <Bar dataKey="SMA-2" name="SMA-2" fill={COLOR["SMA-2"]} radius={[3, 3, 0, 0]} />
             <Bar dataKey="NPA"   name="NPA"   fill={COLOR["NPA"]}   radius={[3, 3, 0, 0]} />
-            <Bar dataKey="Other" name="No Bucket" fill={COLOR["Other"]} radius={[3, 3, 0, 0]} />
-            {/* Staff mode: avg3m as a Line overlay so it doesn't visually
-                consume bar width or dwarf the per-bucket bars. */}
             {viewMode === "staff" && showAvg && (
               <Line type="monotone" dataKey="avg3m" name="3-Month Avg"
                 stroke="#0d9488" strokeWidth={2}
                 dot={{ r: 4, fill: "#0d9488", strokeWidth: 0 }}
                 activeDot={{ r: 5 }} />
             )}
-            {/* Month mode: dashed horizontal ReferenceLine for the global avg. */}
             {viewMode === "month" && showAvg && monthlyAvgRef > 0 && (
               <ReferenceLine y={monthlyAvgRef} stroke="#0d9488" strokeDasharray="4 4"
                 label={{ value: "3-Month Avg: " + formatINR(Math.round(monthlyAvgRef)), position: "right", fill: "#0d9488", fontSize: 10 }} />
@@ -4494,11 +4529,22 @@ function CollectionPerformanceWidget({ user, entries }) {
         </ResponsiveContainer>
       )}
 
-      <p className="text-[11px] text-gray-500 mt-2">
-        {viewMode === "staff"
-          ? "Each staff shows one bar per bucket (SMA-0 / SMA-1 / SMA-2 / NPA / No Bucket). The teal line overlays the 3-Month Average (90 days before the start date, ÷ 3). Staff with no current-period collections are hidden — widen the date range to include them."
-          : "Bars show monthly collections per bucket within the selected range. The dashed teal line marks the average monthly collection over the 90 days before the start date."}
-      </p>
+      <div className="text-[11px] text-gray-500 mt-2 space-y-0.5">
+        <div>
+          {viewMode === "staff"
+            ? "Each staff shows one bar per bucket (SMA-0 / SMA-1 / SMA-2 / NPA). The teal line overlays the 3-Month Average (90 days before the start date, ÷ 3). Staff with no current-period collections are hidden."
+            : "Bars show monthly collections per bucket within the selected range. The dashed teal line marks the average monthly collection over the 90 days before the start date."}
+        </div>
+        {excludedSummary.total > 0 && (
+          <div className="text-gray-400">
+            <span className="font-medium">Excluded from chart:</span>{" "}
+            {excludedSummary.adminAuthored > 0 && <span>{excludedSummary.adminAuthored} admin-authored</span>}
+            {excludedSummary.adminAuthored > 0 && excludedSummary.noBucket > 0 && <span> · </span>}
+            {excludedSummary.noBucket > 0 && <span>{excludedSummary.noBucket} without bucket assignment</span>}
+            <span> (assign SMA-0/1/2/NPA on the entry to include them)</span>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
