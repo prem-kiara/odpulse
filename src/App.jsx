@@ -4193,8 +4193,11 @@ function CollectionPerformanceWidget({ user, entries }) {
     // RBAC: staff users can't use By Staff view (would only show themselves).
     if (user.role === "staff" && viewMode === "staff") setViewMode("bucket");
   }, [user.role, viewMode]);
-  const [showTable, setShowTable] = useState(true);
-  const [showProductivity, setShowProductivity] = useState(true);
+  // Default detail tables to collapsed so the dashboard shows just the
+  // chart + KPI tiles. Toggle buttons in the action bar expand each panel
+  // on demand ("Show Data Table" / "Show Staff Productivity").
+  const [showTable, setShowTable] = useState(false);
+  const [showProductivity, setShowProductivity] = useState(false);
   const [showCountsInTable, setShowCountsInTable] = useState(false);
 
   const branchOptions = useMemo(() => Array.from(new Set(
@@ -5854,24 +5857,81 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
 
   const [editBranchName, setEditBranchName] = useState("");
 
-  const handleAddUser = () => {
+  const handleAddUser = async () => {
     if (!newUser.username || !newUser.password || !newUser.name) { alert("Fill in all fields."); return; }
     if (users.some(u => u.username === newUser.username)) { alert("Username already exists."); return; }
     const u = { ...newUser, id: generateId(), active: true, mustChangePassword: true };
+    try {
+      const res = await fetch(`${API_BASE}/users/add`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-od-user": user.id, "x-od-role": user.role || "" },
+        body: JSON.stringify(u),
+      });
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({}));
+        alert("Could not add user: " + (j.error || `HTTP ${res.status}`));
+        return;
+      }
+    } catch (err) {
+      console.error("[handleAddUser] network error:", err);
+      alert("Network error while adding user. Please try again.");
+      return;
+    }
     const updated = [...users, u];
-    setUsers(updated); saveData(STORAGE_KEYS.users, updated);
+    setUsers(updated);
+    localStorage.setItem(STORAGE_KEYS.users, JSON.stringify(updated));
     setNewUser({ username: "", password: "Dhanam@123", name: "", role: "staff", branch: "" });
   };
 
-  const toggleUser = (id) => {
-    const updated = users.map(u => u.id === id ? { ...u, active: !u.active } : u);
-    setUsers(updated); saveData(STORAGE_KEYS.users, updated);
+  const toggleUser = async (id) => {
+    // Targeted server-side merge (PATCH) — preserves password,
+    // mustChangePassword, and every other field on the user record.
+    // Eliminates the clobber bug where a full-array POST from this admin
+    // session was rolling back staff users' completed password changes.
+    const cur = users.find(u => u.id === id);
+    if (!cur) return;
+    const next = !cur.active;
+    try {
+      const res = await fetch(`${API_BASE}/users/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", "x-od-user": user.id, "x-od-role": user.role || "" },
+        body: JSON.stringify({ active: next }),
+      });
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({}));
+        alert("Could not update user: " + (j.error || `HTTP ${res.status}`));
+        return;
+      }
+    } catch (err) {
+      console.error("[toggleUser] network error:", err);
+      alert("Network error while updating user. Please try again.");
+      return;
+    }
+    const updated = users.map(u => u.id === id ? { ...u, active: next } : u);
+    setUsers(updated);
+    localStorage.setItem(STORAGE_KEYS.users, JSON.stringify(updated));
   };
 
-  const deleteUser = (id) => {
+  const deleteUser = async (id) => {
     if (!confirm("Delete this user?")) return;
+    try {
+      const res = await fetch(`${API_BASE}/users/${encodeURIComponent(id)}`, {
+        method: "DELETE",
+        headers: { "x-od-user": user.id, "x-od-role": user.role || "" },
+      });
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({}));
+        alert("Could not delete user: " + (j.error || `HTTP ${res.status}`));
+        return;
+      }
+    } catch (err) {
+      console.error("[deleteUser] network error:", err);
+      alert("Network error while deleting user. Please try again.");
+      return;
+    }
     const updated = users.filter(u => u.id !== id);
-    setUsers(updated); saveData(STORAGE_KEYS.users, updated);
+    setUsers(updated);
+    localStorage.setItem(STORAGE_KEYS.users, JSON.stringify(updated));
   };
 
   const addBranch = () => {

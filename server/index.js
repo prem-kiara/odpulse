@@ -603,6 +603,121 @@ app.get("/api/admin/duplicate-users", (req, res) => {
 // Effect: every entry where enteredBy === duplicateId is re-attributed to
 // canonicalId (and enteredByName is updated to the canonical's name). The
 // duplicate user is marked active:false. Idempotent on repeat calls.
+// ─── PATCH /api/users/:id ──────────────────────────────────────────────
+// Targeted user-fields update — merges selected non-credential fields
+// (active, role, branch, name, username) into the existing user record
+// while preserving password + mustChangePassword + every other field.
+//
+// Why this exists: the legacy AdminPanel handlers (toggleUser, etc.) used
+// to POST the entire users array via /api/users which replaced users.json
+// wholesale. That meant any staff user who had finished changing their
+// password between when the admin loaded the page and when the admin
+// clicked Save would get their mustChangePassword silently reset to true
+// (because admin's in-memory copy was stale). This endpoint fixes that
+// race once and for all — admin saves only touch the targeted fields on
+// the targeted user.
+//
+// Authorization: caller must be an admin (x-od-role === "admin"). Password
+// changes still go through /api/users/:id/password (which has its own
+// self-or-admin authz).
+app.patch("/api/users/:id", (req, res) => {
+  try {
+    const targetId = String(req.params.id || "");
+    const callerRole = req.header("x-od-role") || "";
+    if (!targetId) return res.status(400).json({ error: "Missing user id" });
+    if (callerRole !== "admin") {
+      return res.status(403).json({ error: "Only Administrators can update user records." });
+    }
+    const users = loadJSON("users.json", []);
+    const idx = users.findIndex(u => u && u.id === targetId);
+    if (idx === -1) return res.status(404).json({ error: "User not found" });
+    // Whitelist of fields admins can change here. Password is intentionally
+    // excluded — that has its own endpoint with stricter validation.
+    const ALLOWED = ["active", "role", "branch", "name", "username", "mustChangePassword"];
+    const patch = {};
+    for (const k of ALLOWED) {
+      if (req.body && Object.prototype.hasOwnProperty.call(req.body, k)) {
+        patch[k] = req.body[k];
+      }
+    }
+    if (Object.keys(patch).length === 0) {
+      return res.status(400).json({ error: "No allowed fields supplied in patch" });
+    }
+    users[idx] = { ...users[idx], ...patch };
+    saveJSON("users.json", users);
+    console.log(`[users/patch] ${targetId} fields=${Object.keys(patch).join(",")} by ${req.header("x-od-user") || "(unknown)"}`);
+    res.json({ ok: true, user: users[idx] });
+  } catch (err) {
+    console.error("[/api/users/:id PATCH] failed:", err);
+    res.status(500).json({ error: "Failed to update user: " + (err.message || err) });
+  }
+});
+
+// ─── DELETE /api/users/:id ─────────────────────────────────────────────
+// Removes a single user. Same authz as PATCH (admin only). Prevents
+// accidental clobber of other users' records because only the targeted
+// row is touched.
+app.delete("/api/users/:id", (req, res) => {
+  try {
+    const targetId = String(req.params.id || "");
+    const callerRole = req.header("x-od-role") || "";
+    if (!targetId) return res.status(400).json({ error: "Missing user id" });
+    if (callerRole !== "admin") {
+      return res.status(403).json({ error: "Only Administrators can delete users." });
+    }
+    if (targetId === "admin") {
+      return res.status(400).json({ error: "The admin user cannot be deleted." });
+    }
+    const users = loadJSON("users.json", []);
+    const idx = users.findIndex(u => u && u.id === targetId);
+    if (idx === -1) return res.status(404).json({ error: "User not found" });
+    const removed = users.splice(idx, 1)[0];
+    saveJSON("users.json", users);
+    console.log(`[users/delete] ${targetId} (${removed.username || removed.name}) by ${req.header("x-od-user") || "(unknown)"}`);
+    res.json({ ok: true, userId: targetId });
+  } catch (err) {
+    console.error("[/api/users/:id DELETE] failed:", err);
+    res.status(500).json({ error: "Failed to delete user: " + (err.message || err) });
+  }
+});
+
+// ─── POST /api/users/add ───────────────────────────────────────────────
+// Adds a single user — won't clobber others. Admin-only.
+app.post("/api/users/add", (req, res) => {
+  try {
+    const callerRole = req.header("x-od-role") || "";
+    if (callerRole !== "admin") {
+      return res.status(403).json({ error: "Only Administrators can add users." });
+    }
+    const u = req.body;
+    if (!u || typeof u !== "object") return res.status(400).json({ error: "Missing user body" });
+    if (!u.id || !u.username || !u.name) {
+      return res.status(400).json({ error: "id, username, name are required" });
+    }
+    const users = loadJSON("users.json", []);
+    if (users.some(x => x && (x.id === u.id || x.username === u.username))) {
+      return res.status(409).json({ error: "User with this id or username already exists" });
+    }
+    const newUser = {
+      id: String(u.id),
+      username: String(u.username),
+      password: String(u.password || "Dhanam@123"),
+      name: String(u.name),
+      role: String(u.role || "staff"),
+      branch: String(u.branch || ""),
+      active: u.active !== false,
+      mustChangePassword: u.mustChangePassword !== false,
+    };
+    users.push(newUser);
+    saveJSON("users.json", users);
+    console.log(`[users/add] ${newUser.id} (${newUser.username}, role=${newUser.role}) by ${req.header("x-od-user") || "(unknown)"}`);
+    res.json({ ok: true, user: newUser });
+  } catch (err) {
+    console.error("[/api/users/add POST] failed:", err);
+    res.status(500).json({ error: "Failed to add user: " + (err.message || err) });
+  }
+});
+
 // ─── PATCH /api/users/:id/password ─────────────────────────────────────
 // Focused password-update endpoint. Avoids the full-array-replace pattern
 // that POST /api/:collection uses — that pattern is dangerous because any
