@@ -6,6 +6,7 @@ import ReportsAnalytics from "./ReportsAnalytics.jsx";
 import { SortableSection, PaginatedSortableSection } from "./tableSort.jsx";
 import { usePagination, PaginationBar } from "./Pagination";
 import { enqueueEntry, enqueueEntryUpdate, enqueueEntryDelete, listQueuedEntries, drainEntryQueue, listDeadLetters } from "./entryQueue";
+import * as XLSX from "xlsx";
 
 // ─── Constants & Helpers ────────────────────────────────────────────────────
 const COLORS = ["#0f766e", "#06b6d4", "#8b5cf6", "#f59e0b", "#ef4444", "#10b981", "#ec4899", "#6366f1", "#14b8a6", "#f97316"];
@@ -4523,14 +4524,29 @@ function CollectionPerformanceWidget({ user, entries }) {
         staffId: sid,
         name: staffNameById.get(sid) || e.enteredByName || sid,
         accounts: new Set(), amount: 0,
-        ptpCreated: 0, ptpKept: 0,
+        // Per-bucket account sets + amount tallies so the Staff Contribution
+        // sheet can show SMA-0/1/2/NPA + Other breakdowns per staff per branch.
+        acctByBucket: { "SMA-0": new Set(), "SMA-1": new Set(), "SMA-2": new Set(), "NPA": new Set(), "Other": new Set() },
+        amtByBucket:  { "SMA-0": 0, "SMA-1": 0, "SMA-2": 0, "NPA": 0, "Other": 0 },
+        ptpCreated: 0, ptpKept: 0, ptpBroken: 0,
       });
       const sslot = slot.byStaff.get(sid);
       sslot.accounts.add(ak);
       sslot.amount += amt;
+      const sbk = b || "Other";
+      if (sslot.acctByBucket[sbk]) {
+        sslot.acctByBucket[sbk].add(ak);
+        sslot.amtByBucket[sbk] += amt;
+      }
       if (e.ptpDate) {
         sslot.ptpCreated++;
+        // BROKEN PTP DEFINITION (same logic the branch + tooltip use):
+        //   A PTP is "broken" iff (status !== "paid") AND (ptpDate < today).
+        //   i.e. the customer committed to pay by ptpDate, that date has
+        //   passed, and we have not recorded a paid status. Active PTPs
+        //   (status pending, ptpDate today/future) do NOT count as broken.
         if (e.ptpStatus === "paid") sslot.ptpKept++;
+        else if (e.ptpDate < today) sslot.ptpBroken++;
       }
     }
     const rows = [];
@@ -4543,8 +4559,18 @@ function CollectionPerformanceWidget({ user, entries }) {
           accountsCollected: ss.accounts.size,
           amount: ss.amount,
           contributionPct: s.collectionAmt > 0 ? (ss.amount / s.collectionAmt) * 100 : 0,
+          // Per-bucket numbers (account counts + amounts) for Sheet 2.
+          acctByBucket: {
+            "SMA-0": ss.acctByBucket["SMA-0"].size,
+            "SMA-1": ss.acctByBucket["SMA-1"].size,
+            "SMA-2": ss.acctByBucket["SMA-2"].size,
+            "NPA":   ss.acctByBucket["NPA"].size,
+            "Other": ss.acctByBucket["Other"].size,
+          },
+          amtByBucket: ss.amtByBucket,
           ptpCreated: ss.ptpCreated,
           ptpKept: ss.ptpKept,
+          ptpBroken: ss.ptpBroken,
         });
       }
       staffRows.sort((a, b) => b.amount - a.amount);
@@ -4992,7 +5018,7 @@ function CollectionPerformanceWidget({ user, entries }) {
       })];
     }
     if (lines.length <= 1) { alert("No rows to export."); return; }
-    const csv = lines.map(row => row.map(q).join(",")).join("\n");
+    const csv = "\uFEFF" + lines.map(row => row.map(q).join(",")).join("\n");
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -5017,7 +5043,7 @@ function CollectionPerformanceWidget({ user, entries }) {
       Math.round(r.totalAmount), Math.round(r.threeMonthTotal), Math.round(r.threeMonthAvg),
       Math.round(r.avgAmountPerDay), r.avgAccountsPerDay.toFixed(2),
     ])];
-    const csv = lines.map(row => row.map(q).join(",")).join("\n");
+    const csv = "\uFEFF" + lines.map(row => row.map(q).join(",")).join("\n");
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -5026,33 +5052,32 @@ function CollectionPerformanceWidget({ user, entries }) {
     setTimeout(() => URL.revokeObjectURL(url), 5000);
   };
 
-  // Comprehensive Branch Performance Report — multi-section CSV.
-  // Section 1: per-branch metrics (collections, DPD breakdown, modes, PTPs)
-  // Section 2: staff contribution rows nested under each branch
+  // Comprehensive Branch Performance Report — XLSX with TWO sheets.
+  //
+  // Sheet 1: "Branch Performance Summary"
+  //   One row per branch with collection / DPD-amount / DPD-accounts /
+  //   per-mode amount + count / full PTP stats. Ends with a TOTAL row.
+  //
+  // Sheet 2: "Staff Contribution Summary"
+  //   One row per (branch, staff) showing accounts collected, amount,
+  //   % of branch total, per-bucket account counts AND amounts (SMA-0/1/2/
+  //   NPA/Other), plus PTPs Created/Kept/Broken/Success%.
+  //
+  // Why XLSX (not CSV): users asked for two real sheets. Also avoids the
+  // mojibake (â€—) bug that happens when Excel guesses the wrong code page
+  // on em-dashes / ₹ — XLSX is binary UTF-8 by spec so encoding is correct
+  // by construction. Uses SheetJS (`xlsx` package, see package.json).
   const handleExportBranchReport = () => {
     if (!isAdminOrElevated) { alert("Export is restricted to Administrator and MIS Staff roles."); return; }
     if (branchReport.length === 0) { alert("No branch data to export. Adjust filters and try again."); return; }
-    const q = v => '"' + String(v == null ? "" : v).replace(/"/g, '""') + '"';
-    // Discover all payment modes present so the CSV has a column per mode.
+
+    // Discover all payment modes actually present so columns are dynamic.
     const allModes = new Set();
     for (const r of branchReport) for (const k of Object.keys(r.modes)) allModes.add(k);
     const modeCols = Array.from(allModes).sort();
 
-    const out = [];
-    const push = (cells) => out.push(cells.map(q).join(","));
-
-    // ── Header block ──────────────────────────────────────────────────
-    push(["Branch Performance Report"]);
-    push(["Period: " + dateFrom + " to " + dateTo + " (" + daysInRange + " day" + (daysInRange === 1 ? "" : "s") + ", " + n + " month" + (n === 1 ? "" : "s") + ")"]);
-    push(["Generated: " + nowDate()]);
-    if (selBranches.length > 0) push(["Branch filter: " + selBranches.join("; ")]);
-    if (selStaff.length > 0) push(["Staff filter: " + selStaff.map(sid => staffNameById.get(sid) || sid).join("; ")]);
-    if (selBuckets.length > 0) push(["Bucket filter: " + selBuckets.join("; ")]);
-    push([]);
-
-    // ── SECTION 1: Branch Summary ────────────────────────────────────
-    push(["=== SECTION 1: BRANCH SUMMARY ==="]);
-    const branchHeaders = [
+    // ── Sheet 1 — Branch Performance Summary ───────────────────────────
+    const s1Headers = [
       "Branch", "Accounts Worked", "Accounts Collected",
       "Total Collection", "Recovery Amount", "Waiver Amount",
       "SMA-0 Accts", "SMA-0 Amount",
@@ -5060,17 +5085,22 @@ function CollectionPerformanceWidget({ user, entries }) {
       "SMA-2 Accts", "SMA-2 Amount",
       "NPA Accts",   "NPA Amount",
     ];
-    for (const m of modeCols) {
-      branchHeaders.push(m + " Amount");
-      branchHeaders.push(m + " Accounts");
-    }
-    branchHeaders.push("PTPs Created", "PTP Promised Amt",
+    for (const m of modeCols) { s1Headers.push(m + " Amount"); s1Headers.push(m + " Accounts"); }
+    s1Headers.push("PTPs Created", "PTP Promised Amt",
       "PTP Collected", "PTP Pending Amt",
       "PTPs Kept", "PTPs Broken", "PTPs Active", "PTP Success %");
-    push(branchHeaders);
 
+    const s1Rows = [s1Headers];
+    const tot = {
+      worked: 0, collected: 0, collection: 0, recovery: 0, waiver: 0,
+      bAcct: { "SMA-0": 0, "SMA-1": 0, "SMA-2": 0, "NPA": 0 },
+      bAmt:  { "SMA-0": 0, "SMA-1": 0, "SMA-2": 0, "NPA": 0 },
+      modes: {},
+      ptpC: 0, ptpP: 0, ptpCol: 0, ptpPend: 0, ptpK: 0, ptpB: 0, ptpA: 0,
+    };
+    for (const m of modeCols) tot.modes[m] = { amount: 0, count: 0 };
     for (const r of branchReport) {
-      const cells = [
+      const row = [
         r.branch, r.accountsWorked, r.accountsCollected,
         Math.round(r.collectionAmt), Math.round(r.recoveryAmt), Math.round(r.waiverAmt),
         r.acctByBucket["SMA-0"], Math.round(r.amtByBucket["SMA-0"]),
@@ -5080,87 +5110,97 @@ function CollectionPerformanceWidget({ user, entries }) {
       ];
       for (const m of modeCols) {
         const mv = r.modes[m] || { amount: 0, count: 0 };
-        cells.push(Math.round(mv.amount));
-        cells.push(mv.count);
+        row.push(Math.round(mv.amount));
+        row.push(mv.count);
+        tot.modes[m].amount += mv.amount;
+        tot.modes[m].count  += mv.count;
       }
-      cells.push(r.ptp.created, Math.round(r.ptp.promised),
+      row.push(r.ptp.created, Math.round(r.ptp.promised),
         Math.round(r.ptp.collected), Math.round(r.ptp.pending),
         r.ptp.kept, r.ptp.broken, r.ptp.active,
-        r.ptp.successRate.toFixed(1) + "%");
-      push(cells);
-    }
-
-    // ── Totals row ──────────────────────────────────────────────────
-    const totals = {
-      worked: 0, collected: 0, collection: 0, recovery: 0, waiver: 0,
-      bAcct: { "SMA-0": 0, "SMA-1": 0, "SMA-2": 0, "NPA": 0 },
-      bAmt:  { "SMA-0": 0, "SMA-1": 0, "SMA-2": 0, "NPA": 0 },
-      modes: {},
-      ptpC: 0, ptpP: 0, ptpCol: 0, ptpPend: 0, ptpK: 0, ptpB: 0, ptpA: 0,
-    };
-    for (const m of modeCols) totals.modes[m] = { amount: 0, count: 0 };
-    for (const r of branchReport) {
-      totals.worked += r.accountsWorked;
-      totals.collected += r.accountsCollected;
-      totals.collection += r.collectionAmt;
-      totals.recovery += r.recoveryAmt;
-      totals.waiver += r.waiverAmt;
+        (r.ptp.successRate || 0).toFixed(1) + "%");
+      s1Rows.push(row);
+      tot.worked += r.accountsWorked;
+      tot.collected += r.accountsCollected;
+      tot.collection += r.collectionAmt;
+      tot.recovery += r.recoveryAmt;
+      tot.waiver += r.waiverAmt;
       for (const b of ["SMA-0","SMA-1","SMA-2","NPA"]) {
-        totals.bAcct[b] += r.acctByBucket[b];
-        totals.bAmt[b]  += r.amtByBucket[b];
+        tot.bAcct[b] += r.acctByBucket[b];
+        tot.bAmt[b]  += r.amtByBucket[b];
       }
-      for (const m of modeCols) {
-        const mv = r.modes[m] || { amount: 0, count: 0 };
-        totals.modes[m].amount += mv.amount;
-        totals.modes[m].count  += mv.count;
-      }
-      totals.ptpC += r.ptp.created; totals.ptpP += r.ptp.promised;
-      totals.ptpCol += r.ptp.collected; totals.ptpPend += r.ptp.pending;
-      totals.ptpK += r.ptp.kept; totals.ptpB += r.ptp.broken; totals.ptpA += r.ptp.active;
+      tot.ptpC += r.ptp.created; tot.ptpP += r.ptp.promised;
+      tot.ptpCol += r.ptp.collected; tot.ptpPend += r.ptp.pending;
+      tot.ptpK += r.ptp.kept; tot.ptpB += r.ptp.broken; tot.ptpA += r.ptp.active;
     }
     const totalsRow = [
-      "TOTAL (" + branchReport.length + " branches)", totals.worked, totals.collected,
-      Math.round(totals.collection), Math.round(totals.recovery), Math.round(totals.waiver),
-      totals.bAcct["SMA-0"], Math.round(totals.bAmt["SMA-0"]),
-      totals.bAcct["SMA-1"], Math.round(totals.bAmt["SMA-1"]),
-      totals.bAcct["SMA-2"], Math.round(totals.bAmt["SMA-2"]),
-      totals.bAcct["NPA"],   Math.round(totals.bAmt["NPA"]),
+      "TOTAL (" + branchReport.length + " branches)", tot.worked, tot.collected,
+      Math.round(tot.collection), Math.round(tot.recovery), Math.round(tot.waiver),
+      tot.bAcct["SMA-0"], Math.round(tot.bAmt["SMA-0"]),
+      tot.bAcct["SMA-1"], Math.round(tot.bAmt["SMA-1"]),
+      tot.bAcct["SMA-2"], Math.round(tot.bAmt["SMA-2"]),
+      tot.bAcct["NPA"],   Math.round(tot.bAmt["NPA"]),
     ];
     for (const m of modeCols) {
-      totalsRow.push(Math.round(totals.modes[m].amount));
-      totalsRow.push(totals.modes[m].count);
+      totalsRow.push(Math.round(tot.modes[m].amount));
+      totalsRow.push(tot.modes[m].count);
     }
-    const totalRate = totals.ptpC > 0 ? (totals.ptpK / totals.ptpC) * 100 : 0;
-    totalsRow.push(totals.ptpC, Math.round(totals.ptpP),
-      Math.round(totals.ptpCol), Math.round(totals.ptpPend),
-      totals.ptpK, totals.ptpB, totals.ptpA, totalRate.toFixed(1) + "%");
-    push(totalsRow);
+    const totalRate = tot.ptpC > 0 ? (tot.ptpK / tot.ptpC) * 100 : 0;
+    totalsRow.push(tot.ptpC, Math.round(tot.ptpP),
+      Math.round(tot.ptpCol), Math.round(tot.ptpPend),
+      tot.ptpK, tot.ptpB, tot.ptpA, totalRate.toFixed(1) + "%");
+    s1Rows.push(totalsRow);
 
-    push([]); push([]);
-
-    // ── SECTION 2: Staff Contribution by Branch ──────────────────────
-    push(["=== SECTION 2: STAFF CONTRIBUTION BY BRANCH ==="]);
-    push(["Branch", "Staff Name", "Accounts Collected", "Amount Collected",
-      "% of Branch Total", "PTPs Created", "PTPs Kept", "PTP Success %"]);
+    // ── Sheet 2 — Staff Contribution Summary ──────────────────────────
+    const s2Headers = [
+      "Branch", "Staff Name", "Accounts Collected", "Amount Collected", "% of Branch Total",
+      "SMA-0 Accts", "SMA-0 Amount",
+      "SMA-1 Accts", "SMA-1 Amount",
+      "SMA-2 Accts", "SMA-2 Amount",
+      "NPA Accts",   "NPA Amount",
+      "Other Accts", "Other Amount",
+      "PTPs Created", "PTPs Kept", "PTPs Broken", "PTP Success %",
+    ];
+    const s2Rows = [s2Headers];
     for (const r of branchReport) {
-      for (const s of r.staff) {
-        const sRate = s.ptpCreated > 0 ? (s.ptpKept / s.ptpCreated) * 100 : 0;
-        push([
-          r.branch, s.name, s.accountsCollected, Math.round(s.amount),
-          s.contributionPct.toFixed(1) + "%",
-          s.ptpCreated, s.ptpKept,
-          s.ptpCreated > 0 ? sRate.toFixed(1) + "%" : "—",
+      for (const ss of r.staff) {
+        const sRate = ss.ptpCreated > 0 ? (ss.ptpKept / ss.ptpCreated) * 100 : 0;
+        s2Rows.push([
+          r.branch, ss.name, ss.accountsCollected, Math.round(ss.amount),
+          ss.contributionPct.toFixed(1) + "%",
+          ss.acctByBucket["SMA-0"], Math.round(ss.amtByBucket["SMA-0"]),
+          ss.acctByBucket["SMA-1"], Math.round(ss.amtByBucket["SMA-1"]),
+          ss.acctByBucket["SMA-2"], Math.round(ss.amtByBucket["SMA-2"]),
+          ss.acctByBucket["NPA"],   Math.round(ss.amtByBucket["NPA"]),
+          ss.acctByBucket["Other"], Math.round(ss.amtByBucket["Other"]),
+          ss.ptpCreated, ss.ptpKept, ss.ptpBroken,
+          ss.ptpCreated > 0 ? sRate.toFixed(1) + "%" : "",
         ]);
       }
     }
 
-    const csv = out.join("\n");
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url; a.download = "branch-performance-report-" + nowDate() + ".csv";
-    document.body.appendChild(a); a.click(); document.body.removeChild(a);
-    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    // Build workbook + autosize columns roughly so headers don't crop.
+    const wb = XLSX.utils.book_new();
+    const ws1 = XLSX.utils.aoa_to_sheet(s1Rows);
+    const ws2 = XLSX.utils.aoa_to_sheet(s2Rows);
+    const colWidths = (rows) => {
+      const widths = [];
+      for (let c = 0; c < rows[0].length; c++) {
+        let max = 0;
+        for (const r of rows) {
+          const v = r[c];
+          const len = v == null ? 0 : String(v).length;
+          if (len > max) max = len;
+        }
+        widths.push({ wch: Math.min(40, Math.max(8, max + 2)) });
+      }
+      return widths;
+    };
+    ws1["!cols"] = colWidths(s1Rows);
+    ws2["!cols"] = colWidths(s2Rows);
+    XLSX.utils.book_append_sheet(wb, ws1, "Branch Performance Summary");
+    XLSX.utils.book_append_sheet(wb, ws2, "Staff Contribution Summary");
+    XLSX.writeFile(wb, "branch-performance-report-" + nowDate() + ".xlsx");
   };
 
   const presetLast30 = () => { const to = new Date(); const from = new Date(); from.setDate(from.getDate() - 30); setDateFrom(from.toISOString().slice(0, 10)); setDateTo(to.toISOString().slice(0, 10)); };
