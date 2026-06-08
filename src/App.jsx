@@ -65,6 +65,38 @@ const authorizedWaiverOf = (e) => isAuthorizedWaiver(e) ? (Number(e.waiver) || 0
 const generateId = () => Date.now().toString(36) + Math.random().toString(36).substr(2, 9);
 const nowDate = () => new Date().toISOString().split("T")[0];
 const nowTime = () => new Date().toTimeString().slice(0, 5);
+
+// ── Payment Mode normalisation — single source of truth used by every
+// report/table/tooltip so case + whitespace + vendor names all roll up into
+// one canonical mode label. Add new synonyms here when ingesting new
+// payment methods.
+//   • "cash" / "CASH" / "Cash " → Cash
+//   • "upi" / "gpay" / "phonepe" / "paytm" / "bhim" / "paid in link" /
+//     "payment link" / "link" / "upi link" / "paid via link" → UPI
+//   • "neft" / "rtgs" / "imps" / "bank transfer" / "online" → Bank Transfer
+//   • "cheque" / "check" / "dd" / "demand draft" → Cheque
+//   • Unknown → title-cased original (keeps display consistent without
+//     destroying information)
+const normalizePaymentMode = (raw) => {
+  if (raw == null) return "Other";
+  const s = String(raw).trim();
+  if (!s) return "Other";
+  const lc = s.toLowerCase();
+  if (lc === "cash") return "Cash";
+  if (lc === "upi" || lc === "gpay" || lc === "g-pay" || lc === "google pay"
+    || lc === "phonepe" || lc === "phone pe" || lc === "paytm" || lc === "bhim"
+    || lc === "paid in link" || lc === "payment link" || lc === "link"
+    || lc === "upi link" || lc === "paid via link" || lc === "paid via upi") return "UPI";
+  if (lc === "bank transfer" || lc === "bank" || lc === "neft"
+    || lc === "rtgs" || lc === "imps" || lc === "online"
+    || lc === "online transfer" || lc === "wire") return "Bank Transfer";
+  if (lc === "cheque" || lc === "check" || lc === "dd"
+    || lc === "demand draft") return "Cheque";
+  if (lc === "other" || lc === "others" || lc === "n/a" || lc === "na") return "Other";
+  return s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
+};
+const PAYMENT_MODE_OPTIONS = ["Cash", "UPI", "Bank Transfer", "Cheque", "Other"];
+
 const formatDateDMY = (isoDate) => {
   if (!isoDate) return "";
   const [y, m, d] = isoDate.split("-");
@@ -2413,7 +2445,48 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
   const [expandedId, setExpandedId] = useState(null);
-  const [ptpPaymentEntry, setPtpPaymentEntry] = useState(null); // entry being paid
+  const [ptpPaymentEntry, setPtpPaymentEntry] = useState(null);
+  // Admin-only: in-progress payment-mode correction.
+  // { entryId, oldMode, newMode, reason, saving } when active; null otherwise.
+  const [pmEdit, setPmEdit] = useState(null);
+  const canCorrectPaymentMode = user.role === "admin";
+  const submitPmCorrection = async () => {
+    if (!pmEdit || !pmEdit.entryId || !pmEdit.newMode) return;
+    setPmEdit(s => ({ ...s, saving: true }));
+    try {
+      const res = await fetch(`${API_BASE}/entries/${encodeURIComponent(pmEdit.entryId)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", "x-od-user": user.id, "x-od-role": user.role || "" },
+        // _correctedBy / _previousMode are audit-trail breadcrumbs the
+        // server-side auditEntrySave will pick up. paymentMode itself is
+        // the canonical write — this is what the rest of the app reads.
+        body: JSON.stringify({
+          paymentMode: pmEdit.newMode,
+          _correctedBy: user.name || user.username || user.id,
+          _correctedAt: new Date().toISOString(),
+          _previousPaymentMode: pmEdit.oldMode || "",
+          _correctionReason: pmEdit.reason || "",
+        }),
+      });
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({}));
+        alert("Could not save payment-mode correction: " + (j.error || `HTTP ${res.status}`));
+        setPmEdit(s => ({ ...s, saving: false }));
+        return;
+      }
+      // Reflect locally so the row updates without a full reload.
+      const updatedEntries = entries.map(en => en.id === pmEdit.entryId
+        ? { ...en, paymentMode: pmEdit.newMode }
+        : en);
+      setEntries(updatedEntries);
+      try { localStorage.setItem(STORAGE_KEYS.entries, JSON.stringify(updatedEntries)); } catch {}
+      setPmEdit(null);
+    } catch (err) {
+      console.error("[pmCorrection] network error:", err);
+      alert("Network error while saving payment-mode correction.");
+      setPmEdit(s => ({ ...s, saving: false }));
+    }
+  }; // entry being paid
 
   const canSeeAll = user.role === "admin" || user.role === "elevated_staff";
 
@@ -2881,7 +2954,50 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
                           <div className={`p-3 rounded-lg border ${e.ptpStatus === "pending" ? "bg-orange-50 border-orange-200" : "bg-blue-50 border-blue-100"}`}>
                             <p className={`text-xs font-semibold mb-2 uppercase tracking-wide ${e.ptpStatus === "pending" ? "text-orange-700" : "text-blue-700"}`}>Payment Details</p>
                             <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 text-sm">
-                              {e.paymentMode && <div><span className="text-gray-500">Payment Mode:</span> <span className="font-medium">{e.ptpPaymentMode || e.paymentMode}</span></div>}
+                              {(e.paymentMode || canCorrectPaymentMode) && (
+                                <div>
+                                  <span className="text-gray-500">Payment Mode:</span>{" "}
+                                  {pmEdit && pmEdit.entryId === e.id ? (
+                                    <span className="inline-flex items-center gap-1.5 flex-wrap">
+                                      <select value={pmEdit.newMode}
+                                        onChange={ev => setPmEdit(s => ({ ...s, newMode: ev.target.value }))}
+                                        className="px-1.5 py-0.5 border rounded text-xs bg-white">
+                                        {PAYMENT_MODE_OPTIONS.map(m => <option key={m} value={m}>{m}</option>)}
+                                      </select>
+                                      <input type="text" placeholder="Reason (optional)"
+                                        value={pmEdit.reason || ""}
+                                        onChange={ev => setPmEdit(s => ({ ...s, reason: ev.target.value }))}
+                                        className="px-1.5 py-0.5 border rounded text-[11px] bg-white w-32" />
+                                      <button onClick={submitPmCorrection}
+                                        disabled={pmEdit.saving || !pmEdit.newMode || pmEdit.newMode === pmEdit.oldMode}
+                                        className={"text-[11px] px-2 py-0.5 rounded " + (pmEdit.saving ? "bg-gray-200 text-gray-400" : "bg-teal-600 text-white hover:bg-teal-700")}>
+                                        {pmEdit.saving ? "Saving…" : "Save"}
+                                      </button>
+                                      <button onClick={() => setPmEdit(null)}
+                                        className="text-[11px] px-2 py-0.5 rounded bg-gray-100 text-gray-700 hover:bg-gray-200">
+                                        Cancel
+                                      </button>
+                                    </span>
+                                  ) : (
+                                    <>
+                                      <span className="font-medium">{normalizePaymentMode(e.ptpPaymentMode || e.paymentMode) || "—"}</span>
+                                      {canCorrectPaymentMode && (
+                                        <button type="button"
+                                          onClick={() => setPmEdit({
+                                            entryId: e.id,
+                                            oldMode: normalizePaymentMode(e.ptpPaymentMode || e.paymentMode),
+                                            newMode: normalizePaymentMode(e.ptpPaymentMode || e.paymentMode) || "Cash",
+                                            reason: "",
+                                          })}
+                                          title="Correct payment mode (admin only — audit-logged)"
+                                          className="ml-1 text-[10px] text-teal-700 hover:text-teal-900 underline">
+                                          edit
+                                        </button>
+                                      )}
+                                    </>
+                                  )}
+                                </div>
+                              )}
                               {e.upiReference && <div><span className="text-gray-500">UPI Reference:</span> <span className="font-medium">{e.upiReference}</span></div>}
                               {e.ptpDate && <div><span className="text-gray-500">PTP Date:</span> <span className="font-medium">{formatDateDMY(e.ptpDate)} {e.ptpTime || ""}</span></div>}
                               {e.ptpStatus && <div><span className="text-gray-500">PTP Status:</span> <span className={`font-medium ${e.ptpStatus === "pending" ? "text-orange-600" : e.ptpStatus === "paid" ? "text-green-600" : ""}`}>{e.ptpStatus === "pending" ? "Awaiting Payment" : e.ptpStatus === "paid" ? "Paid" : "N/A"}</span></div>}
@@ -4241,28 +4357,12 @@ function CollectionPerformanceWidget({ user, entries }) {
   };
   const accountKey = (e) => e.loanAccountNo || e.customerId || e.id;
 
-  // ── Payment-mode normalisation ────────────────────────────────────────
-  // Root-cause fix for duplicate "Cash" / "Cash " / "cash" categories:
-  // trim, lowercase, match against canonical synonyms, fall back to a
-  // title-cased version of the original so display stays consistent.
-  const normalizeMode = (raw) => {
-    if (raw == null) return "Other";
-    const s = String(raw).trim();
-    if (!s) return "Other";
-    const lc = s.toLowerCase();
-    if (lc === "cash") return "Cash";
-    if (lc === "upi" || lc === "gpay" || lc === "g-pay" || lc === "google pay"
-      || lc === "phonepe" || lc === "phone pe" || lc === "paytm" || lc === "bhim") return "UPI";
-    if (lc === "bank transfer" || lc === "bank" || lc === "neft"
-      || lc === "rtgs" || lc === "imps" || lc === "online" || lc === "online transfer") return "Bank Transfer";
-    if (lc === "cheque" || lc === "check" || lc === "dd" || lc === "demand draft") return "Cheque";
-    if (lc === "other" || lc === "others") return "Other";
-    return s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
-  };
+  // Use module-level normalizePaymentMode (single source of truth — also
+  // handles "Paid in Link", "Payment Link" etc. → UPI).
   const modeOf = (e) => {
     if (e && e.ptpDate) return "PTP";
     const raw = e && (e.ptpPaymentMode || e.paymentMode);
-    return normalizeMode(raw);
+    return normalizePaymentMode(raw);
   };
 
   const daysInRange = useMemo(() => {
@@ -6909,6 +7009,24 @@ function LoginScreen({ onLogin, users, setUsers }) {
 // ─── Main App ───────────────────────────────────────────────────────────────
 export default function App() {
   const [user, setUser] = useState(null);
+
+  // ── Auto-refresh — opt-in periodic re-fetch of entries + notifications.
+  // State persists across reloads via localStorage. When enabled, a setInterval
+  // re-fetches both collections at the chosen cadence; setting up the timer is
+  // gated on `autoRefresh.enabled` so disabling immediately tears it down.
+  const [autoRefresh, setAutoRefresh] = useState(() => {
+    try {
+      const raw = localStorage.getItem("odpulse_auto_refresh");
+      if (!raw) return { enabled: false, intervalSec: 60 };
+      const parsed = JSON.parse(raw);
+      return { enabled: !!parsed.enabled, intervalSec: Number(parsed.intervalSec) || 60 };
+    } catch { return { enabled: false, intervalSec: 60 }; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem("odpulse_auto_refresh", JSON.stringify(autoRefresh)); }
+    catch {}
+  }, [autoRefresh]);
+  const [refreshTickAt, setRefreshTickAt] = useState(null);
   const [page, setPage] = useState("dashboard");
   const [entries, setEntries] = useState([]);
   const [users, setUsers] = useState([]);
@@ -7082,6 +7200,35 @@ export default function App() {
   const handleLogin = (u) => { setUser(u); setPage("dashboard"); };
   const handleLogout = () => { setUser(null); setPage("dashboard"); setSidebarOpen(false); };
 
+  // refreshAllData — used by the manual refresh button + auto-refresh timer.
+  // Re-fetches entries + notifications from the server, mirrors to
+  // localStorage, and updates the timestamp shown next to the toggle.
+  const refreshAllData = useCallback(async () => {
+    try {
+      const [apiEntries, apiNotifs] = await Promise.all([
+        fetchAPI("entries", null),
+        fetchAPI("notifications", null),
+      ]);
+      if (Array.isArray(apiEntries)) {
+        setEntries(apiEntries);
+        try { localStorage.setItem(STORAGE_KEYS.entries, JSON.stringify(apiEntries)); } catch {}
+      }
+      if (Array.isArray(apiNotifs)) {
+        setNotifications(apiNotifs);
+        try { localStorage.setItem(STORAGE_KEYS.notifications, JSON.stringify(apiNotifs)); } catch {}
+      }
+      setRefreshTickAt(Date.now());
+    } catch (err) {
+      console.warn("[autoRefresh] tick failed:", err && err.message);
+    }
+  }, []);
+  useEffect(() => {
+    if (!autoRefresh.enabled) return;
+    const ms = Math.max(10, Number(autoRefresh.intervalSec) || 60) * 1000;
+    const id = setInterval(refreshAllData, ms);
+    return () => clearInterval(id);
+  }, [autoRefresh.enabled, autoRefresh.intervalSec, refreshAllData]);
+
   if (!user) return <LoginScreen onLogin={handleLogin} users={users} setUsers={setUsers} />;
 
   const isAdmin = user.role === "admin";
@@ -7125,6 +7272,32 @@ export default function App() {
             <div className="text-right hidden sm:block">
               <p className="text-sm font-medium text-gray-700">{user.name}</p>
               <p className="text-xs text-gray-400">{user.role === "elevated_staff" ? "MIS Staff" : user.role} • {user.branch || "All Branches"}</p>
+            </div>
+            {/* Auto-refresh control: opt-in periodic re-fetch of entries +
+                notifications. Stored in localStorage so the preference
+                persists across sessions. */}
+            <div className="hidden sm:flex items-center gap-1.5 text-[11px] text-gray-600 border border-gray-200 rounded-lg px-2 py-1">
+              <label className="flex items-center gap-1 cursor-pointer">
+                <input type="checkbox" checked={autoRefresh.enabled}
+                  onChange={e => setAutoRefresh(s => ({ ...s, enabled: e.target.checked }))}
+                  className="rounded text-teal-600 focus:ring-teal-500" />
+                Auto-refresh
+              </label>
+              {autoRefresh.enabled && (
+                <select value={autoRefresh.intervalSec}
+                  onChange={e => setAutoRefresh(s => ({ ...s, intervalSec: parseInt(e.target.value, 10) || 60 }))}
+                  className="bg-white border border-gray-200 rounded text-[11px] px-1 py-0.5">
+                  <option value={30}>30s</option>
+                  <option value={60}>1m</option>
+                  <option value={300}>5m</option>
+                  <option value={600}>10m</option>
+                </select>
+              )}
+              {refreshTickAt && (
+                <span className="text-[10px] text-gray-400" title={"Last refreshed at " + new Date(refreshTickAt).toLocaleTimeString()}>
+                  • {new Date(refreshTickAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+                </span>
+              )}
             </div>
             <button onClick={handleLogout} className="flex items-center gap-1 px-3 py-1.5 text-sm text-red-600 hover:bg-red-50 rounded-lg transition-colors">
               <LogOut size={16} /> Logout
