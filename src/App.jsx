@@ -4189,6 +4189,10 @@ function CollectionPerformanceWidget({ user, entries }) {
     // to By Month in Group-only mode so the user always sees something useful.
     if (odTypeFilter === "group" && viewMode === "bucket") setViewMode("month");
   }, [odTypeFilter, viewMode]);
+  useEffect(() => {
+    // RBAC: staff users can't use By Staff view (would only show themselves).
+    if (user.role === "staff" && viewMode === "staff") setViewMode("bucket");
+  }, [user.role, viewMode]);
   const [showTable, setShowTable] = useState(true);
   const [showProductivity, setShowProductivity] = useState(true);
   const [showCountsInTable, setShowCountsInTable] = useState(false);
@@ -4267,22 +4271,25 @@ function CollectionPerformanceWidget({ user, entries }) {
 
   // Distinguishes Individual OD from anything else (Group OD or legacy).
   const isIndividualOd = (e) => e && e.odType === "Individual OD";
+  // RBAC: regular staff can only see their OWN collection data. Single
+  // source-of-truth gate so chart / KPIs / productivity / branch report
+  // are all auto-scoped. UI elements that enable cross-staff comparison
+  // are hidden for staff users below.
+  const isStaffOnly = user.role === "staff";
   const matchesFilters = useCallback((e) => {
     if (!e) return false;
+    if (isStaffOnly && e.enteredBy !== user.id) return false;
     if (excludedUserIds.has(e.enteredBy)) return false;
     if (selBranches.length > 0 && !selBranches.includes(e.branch || "")) return false;
     if (selStaff.length > 0 && !selStaff.includes(e.enteredBy || "")) return false;
     if (odTypeFilter === "individual" && !isIndividualOd(e)) return false;
     if (odTypeFilter === "group" && isIndividualOd(e)) return false;
-    // Bucket filter only enforced when user picked specific buckets AND the
-    // entry has one — Group OD entries (no bucket) naturally pass when no
-    // bucket filter is set, so they contribute to collection totals.
     if (selBuckets.length > 0) {
       const b = validBucket(e);
       if (!b || !selBuckets.includes(b)) return false;
     }
     return true;
-  }, [selBranches, selStaff, selBuckets, excludedUserIds, odTypeFilter]);
+  }, [selBranches, selStaff, selBuckets, excludedUserIds, odTypeFilter, isStaffOnly, user.id]);
 
   const excludedSummary = useMemo(() => {
     let noBucket = 0;
@@ -4966,7 +4973,7 @@ function CollectionPerformanceWidget({ user, entries }) {
   };
 
   const handleExport = () => {
-    if (!isAdminOrElevated) { alert("Export is restricted to Administrator and MIS Staff roles."); return; }
+    if (!isAdminOrElevated || isStaffOnly) { alert("Export is restricted to Administrator and MIS Staff roles."); return; }
     const q = v => '"' + String(v == null ? "" : v).replace(/"/g, '""') + '"';
     // Discover all modes actually used so the CSV has a column per mode.
     const allModes = new Set();
@@ -5057,7 +5064,7 @@ function CollectionPerformanceWidget({ user, entries }) {
   };
 
   const handleExportProductivity = () => {
-    if (!isAdminOrElevated) { alert("Export is restricted to Administrator and MIS Staff roles."); return; }
+    if (!isAdminOrElevated || isStaffOnly) { alert("Export is restricted to Administrator and MIS Staff roles."); return; }
     if (productivity.rows.length === 0) { alert("No staff productivity data to export."); return; }
     const q = v => '"' + String(v == null ? "" : v).replace(/"/g, '""') + '"';
     const headers = [
@@ -5097,7 +5104,7 @@ function CollectionPerformanceWidget({ user, entries }) {
   // on em-dashes / ₹ — XLSX is binary UTF-8 by spec so encoding is correct
   // by construction. Uses SheetJS (`xlsx` package, see package.json).
   const handleExportBranchReport = () => {
-    if (!isAdminOrElevated) { alert("Export is restricted to Administrator and MIS Staff roles."); return; }
+    if (!isAdminOrElevated || isStaffOnly) { alert("Export is restricted to Administrator and MIS Staff roles."); return; }
     if (branchReport.length === 0) { alert("No branch data to export. Adjust filters and try again."); return; }
 
     // Discover all payment modes actually present so columns are dynamic.
@@ -5290,7 +5297,7 @@ function CollectionPerformanceWidget({ user, entries }) {
       <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
         <h3 className="text-sm font-semibold text-gray-700 flex items-center gap-2">
           <TrendingUp size={16} className="text-teal-600" />
-          Collection Performance — by Bucket
+          {isStaffOnly ? "My Collection Performance" : "Collection Performance — by Bucket"}
           {viewMode === "bucket" && (
             <span className="text-[11px] font-normal text-gray-400">
               {n} month{n === 1 ? "" : "s"} in range · {daysInRange} day{daysInRange === 1 ? "" : "s"} · hover bars for mode + PTP details
@@ -5310,7 +5317,9 @@ function CollectionPerformanceWidget({ user, entries }) {
               disabled={odTypeFilter === "group"}
               title={odTypeFilter === "group" ? "Bucket view is not available for Group OD (no DPD classifications)" : ""}
               className={"px-2.5 py-1 " + (odTypeFilter === "group" ? "bg-gray-100 text-gray-400 cursor-not-allowed" : (viewMode === "bucket" ? "bg-teal-600 text-white" : "bg-white text-gray-700 hover:bg-gray-50"))}>By Bucket</button>
-            <button onClick={() => setViewMode("staff")} className={"px-2.5 py-1 border-l border-gray-200 " + (viewMode === "staff" ? "bg-teal-600 text-white" : "bg-white text-gray-700 hover:bg-gray-50")}>By Staff</button>
+            {!isStaffOnly && (
+              <button onClick={() => setViewMode("staff")} className={"px-2.5 py-1 border-l border-gray-200 " + (viewMode === "staff" ? "bg-teal-600 text-white" : "bg-white text-gray-700 hover:bg-gray-50")}>By Staff</button>
+            )}
             <button onClick={() => setViewMode("month")} className={"px-2.5 py-1 border-l border-gray-200 " + (viewMode === "month" ? "bg-teal-600 text-white" : "bg-white text-gray-700 hover:bg-gray-50")}>By Month</button>
           </div>
           {viewMode !== "bucket" && (
@@ -5328,9 +5337,11 @@ function CollectionPerformanceWidget({ user, entries }) {
               {showCountsInTable ? "✓ Show Accounts" : "Show Accounts"}
             </button>
           )}
-          <button onClick={() => setShowProductivity(s => !s)} className={"text-[11px] px-2 py-1 rounded border transition-colors " + (showProductivity ? "bg-teal-600 text-white border-teal-600" : "bg-white text-teal-700 border-teal-300 hover:bg-teal-50")}>
-            {showProductivity ? "✓ Staff Productivity" : "Show Staff Productivity"}
-          </button>
+          {!isStaffOnly && (
+            <button onClick={() => setShowProductivity(s => !s)} className={"text-[11px] px-2 py-1 rounded border transition-colors " + (showProductivity ? "bg-teal-600 text-white border-teal-600" : "bg-white text-teal-700 border-teal-300 hover:bg-teal-50")}>
+              {showProductivity ? "✓ Staff Productivity" : "Show Staff Productivity"}
+            </button>
+          )}
           <button onClick={presetLast30} className="text-[11px] text-teal-700 hover:text-teal-900 underline">30d</button>
           <button onClick={presetLast90} className="text-[11px] text-teal-700 hover:text-teal-900 underline">90d</button>
           <button onClick={resetAll} className="text-[11px] text-gray-600 hover:text-red-600 underline">Reset</button>
@@ -5361,7 +5372,10 @@ function CollectionPerformanceWidget({ user, entries }) {
           <input type="date" value={dateTo} onChange={e => setDateTo(e.target.value)} className="w-full px-2 py-1.5 border rounded text-xs bg-white" />
         </div>
         <CPMultiSelectFilter label="Branches" options={branchOptions} value={selBranches} onChange={setSelBranches} search={branchSearch} setSearch={setBranchSearch} />
-        <CPMultiSelectFilter label="Staff" options={staffIdOptions} value={selStaff} onChange={setSelStaff} search={staffSearch} setSearch={setStaffSearch} renderLabel={(id) => staffNameById.get(id) || id} />
+        {/* Staff filter hidden for regular staff users (RBAC). */}
+        {!isStaffOnly && (
+          <CPMultiSelectFilter label="Staff" options={staffIdOptions} value={selStaff} onChange={setSelStaff} search={staffSearch} setSearch={setStaffSearch} renderLabel={(id) => staffNameById.get(id) || id} />
+        )}
         <CPMultiSelectFilter label="Buckets" options={BUCKETS} value={selBuckets} onChange={setSelBuckets} />
       </div>
 
@@ -5465,7 +5479,7 @@ function CollectionPerformanceWidget({ user, entries }) {
         </div>
       )}
 
-      {showProductivity && productivity.rows.length > 0 && (
+      {!isStaffOnly && showProductivity && productivity.rows.length > 0 && (
         <div className="mt-5">
           <div className="flex items-center justify-between mb-2 flex-wrap gap-2">
             <h4 className="text-xs font-semibold text-gray-700 uppercase tracking-wide flex items-center gap-2">

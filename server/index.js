@@ -3501,11 +3501,25 @@ app.get("/api/pool/search", (req, res) => {
 // ── Generic CRUD (wildcard — must be LAST) ──
 
 // GET /api/:collection
+// RBAC: when collection === "entries" AND the caller is a regular staff
+// user (x-od-role header === "staff"), the response is filtered server-side
+// to only entries authored by that staff (enteredBy === x-od-user header).
+// Admin + MIS staff see the full collection.
+// Defense-in-depth: matches client-side scoping so a direct curl /
+// DevTools fetch can't surface another staff member's collection rows.
 app.get("/api/:collection", (req, res) => {
   const file = COLLECTIONS[req.params.collection];
   if (!file) return res.status(404).json({ error: "Unknown collection" });
   const fallback = req.params.collection === "config" ? DEFAULT_CONFIG : [];
-  res.json(loadJSON(file, fallback));
+  let data = loadJSON(file, fallback);
+  if (req.params.collection === "entries") {
+    const role = req.header("x-od-role") || "";
+    const userId = req.header("x-od-user") || "";
+    if (role === "staff" && userId) {
+      data = Array.isArray(data) ? data.filter(e => e && e.enteredBy === userId) : data;
+    }
+  }
+  res.json(data);
 });
 
 // POST /api/:collection — full replace
