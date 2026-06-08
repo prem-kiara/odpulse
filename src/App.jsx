@@ -4829,6 +4829,10 @@ function CollectionPerformanceWidget({ user, entries }) {
   const n = monthsInRange.length || 1;
   const totalLabel = n + "-Month Total";
   const avgLabel = n + "-Month Average";
+  // UI gate — when Group OD only, suppress bucket bars + tooltip sections +
+  // PTP tooltip blocks + productivity table bucket columns. Renders a single
+  // "Collection" bar per X tick in Staff/Month views instead of 4 bucket bars.
+  const isGroupMode = odTypeFilter === "group";
 
   // Mode/PTP renderer reused across tooltips for all three views.
   const renderModeAndPtp = (d) => {
@@ -4854,7 +4858,7 @@ function CollectionPerformanceWidget({ user, entries }) {
             ))}
           </div>
         )}
-        {p.created > 0 && (
+        {!isGroupMode && p.created > 0 && (
           <div className="border-t border-gray-200 mt-2 pt-1.5">
             <div className="text-[10px] uppercase font-semibold text-gray-500 mb-1">PTP Performance</div>
             <div className="grid grid-cols-2 gap-x-3 gap-y-0.5">
@@ -4915,7 +4919,7 @@ function CollectionPerformanceWidget({ user, entries }) {
         <div className="bg-white p-3 border border-gray-200 rounded-lg shadow-md text-xs min-w-[260px] max-w-[340px]">
           <div className="font-semibold text-gray-900 mb-1">{d.name}</div>
           <div className="text-gray-500 mb-2">Branch: {d.branch || "—"} · Accounts: {d.accountCount || 0}</div>
-          {["SMA-0", "SMA-1", "SMA-2", "NPA"].map(k => (
+          {!isGroupMode && ["SMA-0", "SMA-1", "SMA-2", "NPA"].map(k => (
             (d[k] || 0) > 0 ? (
               <div key={k} className="flex justify-between gap-3">
                 <span className="text-gray-600">
@@ -4942,7 +4946,7 @@ function CollectionPerformanceWidget({ user, entries }) {
     return (
       <div className="bg-white p-3 border border-gray-200 rounded-lg shadow-md text-xs min-w-[260px] max-w-[340px]">
         <div className="font-semibold text-gray-900 mb-1">{d.name}</div>
-        {["SMA-0", "SMA-1", "SMA-2", "NPA"].map(k => (
+        {!isGroupMode && ["SMA-0", "SMA-1", "SMA-2", "NPA"].map(k => (
           (d[k] || 0) > 0 ? (
             <div key={k} className="flex justify-between gap-3">
               <span className="text-gray-600">
@@ -5394,10 +5398,13 @@ function CollectionPerformanceWidget({ user, entries }) {
             {viewMode === "bucket" && (
               <Line yAxisId="cnt" type="monotone" dataKey="totalAccts" name="Accounts (per bucket)" stroke={COUNT_LINE_COLOR} strokeWidth={2} dot={{ r: 4, fill: COUNT_LINE_COLOR, strokeWidth: 0 }} activeDot={{ r: 5 }} />
             )}
-            {viewMode !== "bucket" && (<Bar yAxisId="amt" dataKey="SMA-0" name="SMA-0" fill={BUCKET_COLOR["SMA-0"]} radius={[3, 3, 0, 0]} />)}
-            {viewMode !== "bucket" && (<Bar yAxisId="amt" dataKey="SMA-1" name="SMA-1" fill={BUCKET_COLOR["SMA-1"]} radius={[3, 3, 0, 0]} />)}
-            {viewMode !== "bucket" && (<Bar yAxisId="amt" dataKey="SMA-2" name="SMA-2" fill={BUCKET_COLOR["SMA-2"]} radius={[3, 3, 0, 0]} />)}
-            {viewMode !== "bucket" && (<Bar yAxisId="amt" dataKey="NPA" name="NPA" fill={BUCKET_COLOR["NPA"]} radius={[3, 3, 0, 0]} />)}
+            {/* Bucket bars only when bucket breakdown is meaningful (Individual OD or All). */}
+            {viewMode !== "bucket" && !isGroupMode && (<Bar yAxisId="amt" dataKey="SMA-0" name="SMA-0" fill={BUCKET_COLOR["SMA-0"]} radius={[3, 3, 0, 0]} />)}
+            {viewMode !== "bucket" && !isGroupMode && (<Bar yAxisId="amt" dataKey="SMA-1" name="SMA-1" fill={BUCKET_COLOR["SMA-1"]} radius={[3, 3, 0, 0]} />)}
+            {viewMode !== "bucket" && !isGroupMode && (<Bar yAxisId="amt" dataKey="SMA-2" name="SMA-2" fill={BUCKET_COLOR["SMA-2"]} radius={[3, 3, 0, 0]} />)}
+            {viewMode !== "bucket" && !isGroupMode && (<Bar yAxisId="amt" dataKey="NPA" name="NPA" fill={BUCKET_COLOR["NPA"]} radius={[3, 3, 0, 0]} />)}
+            {/* Group mode: a single Collection bar in place of the 4 bucket bars. */}
+            {viewMode !== "bucket" && isGroupMode && (<Bar yAxisId="amt" dataKey="currentTotal" name="Collection" fill={TOTAL_COLOR} radius={[3, 3, 0, 0]} />)}
             {viewMode === "staff" && showAvg && (
               <Line yAxisId="amt" type="monotone" dataKey="avg3m" name={avgLabel} stroke="#0d9488" strokeWidth={2} dot={{ r: 4, fill: "#0d9488", strokeWidth: 0 }} activeDot={{ r: 5 }} />
             )}
@@ -5479,10 +5486,10 @@ function CollectionPerformanceWidget({ user, entries }) {
                   <th className="px-3 py-2 text-left font-semibold text-gray-700">Staff</th>
                   <th className="px-3 py-2 text-right font-semibold text-gray-700">Branches</th>
                   <th className="px-3 py-2 text-right font-semibold text-gray-700">Total Accts</th>
-                  <th className="px-3 py-2 text-right font-semibold text-blue-700">SMA-0</th>
-                  <th className="px-3 py-2 text-right font-semibold text-yellow-700">SMA-1</th>
-                  <th className="px-3 py-2 text-right font-semibold text-orange-700">SMA-2</th>
-                  <th className="px-3 py-2 text-right font-semibold text-red-700">NPA</th>
+                  {!isGroupMode && (<th className="px-3 py-2 text-right font-semibold text-blue-700">SMA-0</th>)}
+                  {!isGroupMode && (<th className="px-3 py-2 text-right font-semibold text-yellow-700">SMA-1</th>)}
+                  {!isGroupMode && (<th className="px-3 py-2 text-right font-semibold text-orange-700">SMA-2</th>)}
+                  {!isGroupMode && (<th className="px-3 py-2 text-right font-semibold text-red-700">NPA</th>)}
                   <th className="px-3 py-2 text-right font-semibold text-gray-800">Total Amount</th>
                   <th className="px-3 py-2 text-right font-semibold text-teal-700">{totalLabel}</th>
                   <th className="px-3 py-2 text-right font-semibold text-teal-600">{avgLabel}</th>
@@ -5501,10 +5508,10 @@ function CollectionPerformanceWidget({ user, entries }) {
                     </td>
                     <td className="px-3 py-1.5 text-right num text-gray-700">{r.branchCount}</td>
                     <td className="px-3 py-1.5 text-right num font-semibold text-gray-900">{r.accountCount}</td>
-                    <td className="px-3 py-1.5 text-right num text-blue-700">{r.acctsByBucket["SMA-0"]}</td>
-                    <td className="px-3 py-1.5 text-right num text-yellow-700">{r.acctsByBucket["SMA-1"]}</td>
-                    <td className="px-3 py-1.5 text-right num text-orange-700">{r.acctsByBucket["SMA-2"]}</td>
-                    <td className="px-3 py-1.5 text-right num text-red-700">{r.acctsByBucket["NPA"]}</td>
+                    {!isGroupMode && (<td className="px-3 py-1.5 text-right num text-blue-700">{r.acctsByBucket["SMA-0"]}</td>)}
+                    {!isGroupMode && (<td className="px-3 py-1.5 text-right num text-yellow-700">{r.acctsByBucket["SMA-1"]}</td>)}
+                    {!isGroupMode && (<td className="px-3 py-1.5 text-right num text-orange-700">{r.acctsByBucket["SMA-2"]}</td>)}
+                    {!isGroupMode && (<td className="px-3 py-1.5 text-right num text-red-700">{r.acctsByBucket["NPA"]}</td>)}
                     <td className="px-3 py-1.5 text-right num font-semibold text-gray-900">{fmt(r.totalAmount)}</td>
                     <td className="px-3 py-1.5 text-right num text-teal-700">{fmt(r.threeMonthTotal)}</td>
                     <td className="px-3 py-1.5 text-right num text-teal-600">{fmt(r.threeMonthAvg)}</td>
@@ -5518,10 +5525,10 @@ function CollectionPerformanceWidget({ user, entries }) {
                   <td className="px-3 py-2 text-gray-800">Total ({productivity.rows.length} staff)</td>
                   <td className="px-3 py-2 text-right num text-gray-800">{productivity.aggregate.branchesCovered}</td>
                   <td className="px-3 py-2 text-right num text-gray-900">{productivity.aggregate.totalAccounts}</td>
-                  <td className="px-3 py-2 text-right num text-blue-800">{productivity.rows.reduce((a, r) => a + r.acctsByBucket["SMA-0"], 0)}</td>
-                  <td className="px-3 py-2 text-right num text-yellow-800">{productivity.rows.reduce((a, r) => a + r.acctsByBucket["SMA-1"], 0)}</td>
-                  <td className="px-3 py-2 text-right num text-orange-800">{productivity.rows.reduce((a, r) => a + r.acctsByBucket["SMA-2"], 0)}</td>
-                  <td className="px-3 py-2 text-right num text-red-800">{productivity.rows.reduce((a, r) => a + r.acctsByBucket["NPA"], 0)}</td>
+                  {!isGroupMode && (<td className="px-3 py-2 text-right num text-blue-800">{productivity.rows.reduce((a, r) => a + r.acctsByBucket["SMA-0"], 0)}</td>)}
+                  {!isGroupMode && (<td className="px-3 py-2 text-right num text-yellow-800">{productivity.rows.reduce((a, r) => a + r.acctsByBucket["SMA-1"], 0)}</td>)}
+                  {!isGroupMode && (<td className="px-3 py-2 text-right num text-orange-800">{productivity.rows.reduce((a, r) => a + r.acctsByBucket["SMA-2"], 0)}</td>)}
+                  {!isGroupMode && (<td className="px-3 py-2 text-right num text-red-800">{productivity.rows.reduce((a, r) => a + r.acctsByBucket["NPA"], 0)}</td>)}
                   <td className="px-3 py-2 text-right num text-gray-900">{fmt(productivity.aggregate.totalAmount)}</td>
                   <td className="px-3 py-2 text-right num text-teal-800">{fmt(productivity.aggregate.threeMonthTotal)}</td>
                   <td className="px-3 py-2 text-right num text-teal-700">{fmt(productivity.aggregate.threeMonthAvg)}</td>
@@ -5542,9 +5549,9 @@ function CollectionPerformanceWidget({ user, entries }) {
           <div className="text-gray-400">
             <span className="font-medium">Excluded:</span>{" "}
             {excludedSummary.adminAuthored > 0 && <span>{excludedSummary.adminAuthored} admin-authored</span>}
-            {excludedSummary.adminAuthored > 0 && excludedSummary.noBucket > 0 && <span> · </span>}
-            {excludedSummary.noBucket > 0 && <span>{excludedSummary.noBucket} without bucket assignment</span>}
-            <span> (assign SMA-0/1/2/NPA on the entry to include them).</span>
+            {!isGroupMode && excludedSummary.adminAuthored > 0 && excludedSummary.noBucket > 0 && <span> · </span>}
+            {!isGroupMode && excludedSummary.noBucket > 0 && <span>{excludedSummary.noBucket} without bucket assignment</span>}
+            {!isGroupMode && <span> (assign SMA-0/1/2/NPA on the entry to include them).</span>}
           </div>
         )}
       </div>
