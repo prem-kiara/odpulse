@@ -67,35 +67,28 @@ const nowDate = () => new Date().toISOString().split("T")[0];
 const nowTime = () => new Date().toTimeString().slice(0, 5);
 
 // ── Payment Mode normalisation — single source of truth used by every
-// report/table/tooltip so case + whitespace + vendor names all roll up into
-// one canonical mode label. Add new synonyms here when ingesting new
-// payment methods.
-//   • "cash" / "CASH" / "Cash " → Cash
-//   • "upi" / "gpay" / "phonepe" / "paytm" / "bhim" / "paid in link" /
-//     "payment link" / "link" / "upi link" / "paid via link" → UPI
-//   • "neft" / "rtgs" / "imps" / "bank transfer" / "online" → Bank Transfer
-//   • "cheque" / "check" / "dd" / "demand draft" → Cheque
-//   • Unknown → title-cased original (keeps display consistent without
-//     destroying information)
+// report/table/tooltip. Per business rule the system only recognises TWO
+// payment categories:
+//   • Cash — for any cash collection (any case/whitespace variant)
+//   • UPI  — for everything else (UPI proper, Paid in Link, Payment Link,
+//            Online Payment, QR Payment, GPay/PhonePe/Paytm, BHIM, NEFT,
+//            RTGS, IMPS, Bank Transfer, Cheque, Wire, etc.)
+//
+// Why so aggressive: the operations team has standardised on Cash vs UPI
+// (any non-cash electronic settlement) for reporting; sub-categorising
+// further was producing duplicate buckets that obscured trends.
 const normalizePaymentMode = (raw) => {
-  if (raw == null) return "Other";
+  if (raw == null) return "UPI";
   const s = String(raw).trim();
-  if (!s) return "Other";
+  if (!s) return "UPI";
   const lc = s.toLowerCase();
-  if (lc === "cash") return "Cash";
-  if (lc === "upi" || lc === "gpay" || lc === "g-pay" || lc === "google pay"
-    || lc === "phonepe" || lc === "phone pe" || lc === "paytm" || lc === "bhim"
-    || lc === "paid in link" || lc === "payment link" || lc === "link"
-    || lc === "upi link" || lc === "paid via link" || lc === "paid via upi") return "UPI";
-  if (lc === "bank transfer" || lc === "bank" || lc === "neft"
-    || lc === "rtgs" || lc === "imps" || lc === "online"
-    || lc === "online transfer" || lc === "wire") return "Bank Transfer";
-  if (lc === "cheque" || lc === "check" || lc === "dd"
-    || lc === "demand draft") return "Cheque";
-  if (lc === "other" || lc === "others" || lc === "n/a" || lc === "na") return "Other";
-  return s.charAt(0).toUpperCase() + s.slice(1).toLowerCase();
+  if (lc === "cash" || lc === "cash payment" || lc === "in cash"
+    || lc === "by cash" || lc === "cash collection") return "Cash";
+  // All other modes — including legacy values, vendor names, link/QR
+  // variants, bank transfers — roll up to UPI for reporting purposes.
+  return "UPI";
 };
-const PAYMENT_MODE_OPTIONS = ["Cash", "UPI", "Bank Transfer", "Cheque", "Other"];
+const PAYMENT_MODE_OPTIONS = ["Cash", "UPI"];
 
 const formatDateDMY = (isoDate) => {
   if (!isoDate) return "";
@@ -3711,10 +3704,13 @@ function Dashboard({ user, entries, branches, config }) {
     });
     const monthData = Object.values(byMonth).sort((a, b) => a.month.localeCompare(b.month));
 
-    // Payment mode breakdown
+    // Payment mode breakdown — keys normalised so "Cash" / "cash" / "CASH"
+    // and "UPI" / "Paid in Link" / "Payment Link" / "QR Payment" all roll
+    // up into their canonical category (Cash or UPI). Eliminates the
+    // duplicate-bucket issue the Recovery chart used to show.
     const byPaymentMode = {};
     visibleEntries.forEach(e => {
-      const mode = e.ptpPaymentMode || e.paymentMode || "Not Specified";
+      const mode = normalizePaymentMode(e.ptpPaymentMode || e.paymentMode);
       if (!byPaymentMode[mode]) byPaymentMode[mode] = { mode, recovered: 0, waiver: 0, count: 0 };
       byPaymentMode[mode].recovered += getEntryPaid(e);
       byPaymentMode[mode].waiver += authorizedWaiverOf(e);
@@ -4347,7 +4343,8 @@ function CollectionPerformanceWidget({ user, entries }) {
   const TOTAL_COLOR = "#0f766e";
   const AVG_COLOR = "#5eead4";
   const COUNT_LINE_COLOR = "#374151";
-  const MODE_COLOR = { Cash: "#10b981", UPI: "#6366f1", PTP: "#f59e0b", "Bank Transfer": "#0ea5e9", Cheque: "#a855f7", Other: "#94a3b8" };
+  // Only two modes survive normalisation; keep both colours distinct.
+  const MODE_COLOR = { Cash: "#10b981", UPI: "#6366f1" };
 
   const getPaid = (e) =>
     Number(e.totalPaidAmount ?? e.paidAmount ?? e.groupOdPaidAmount ?? e.customerShare ?? 0) || 0;
@@ -4357,13 +4354,11 @@ function CollectionPerformanceWidget({ user, entries }) {
   };
   const accountKey = (e) => e.loanAccountNo || e.customerId || e.id;
 
-  // Use module-level normalizePaymentMode (single source of truth — also
-  // handles "Paid in Link", "Payment Link" etc. → UPI).
-  const modeOf = (e) => {
-    if (e && e.ptpDate) return "PTP";
-    const raw = e && (e.ptpPaymentMode || e.paymentMode);
-    return normalizePaymentMode(raw);
-  };
+  // Use module-level normalizePaymentMode (single source of truth — every
+  // mode rolls up to Cash or UPI). PTP is NOT a payment mode — it's
+  // tracked separately in the PTP Performance block of every tooltip, so
+  // we look at the actual paymentMode field even on PTP-flagged entries.
+  const modeOf = (e) => normalizePaymentMode(e && (e.ptpPaymentMode || e.paymentMode));
 
   const daysInRange = useMemo(() => {
     if (!dateFrom || !dateTo) return 1;
