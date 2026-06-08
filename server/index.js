@@ -124,6 +124,59 @@ loadJSON("notifications.json", []);
   }
 })();
 
+// ─── ensureAdminUser ───────────────────────────────────────────────────────
+// Safety net so the Administrator account can never get locked out of the
+// system. Mirrors ensureSeedBranches: runs once per server boot, is fully
+// idempotent (only mutates users.json when something is actually wrong).
+// Specifically:
+//   • If no user with id === "admin" exists → re-create from DEFAULT_USERS.
+//     This restores the admin row if users.json was somehow wiped, truncated,
+//     or the admin entry was accidentally deleted.
+//   • If the admin user exists but active === false → re-activate it. An
+//     admin should never be disabled (only another admin could ever do it
+//     intentionally, and even then they should never lock everyone out).
+//   • If the admin user exists but role !== "admin" → restore role to admin.
+//   • Password is INTENTIONALLY NOT touched. If the admin changed their
+//     password legitimately, this preserves that change. If the password
+//     was forgotten, the only fix is to edit users.json directly on the
+//     server (e.g. `node -e 'const fs=require("fs"); const p="data/users.json";
+//     const u=JSON.parse(fs.readFileSync(p)); u.find(x=>x.id==="admin").password
+//     ="admin123"; fs.writeFileSync(p, JSON.stringify(u, null, 2));'`).
+(function ensureAdminUser() {
+  try {
+    const current = loadJSON("users.json", DEFAULT_USERS);
+    const defaultAdmin = DEFAULT_USERS.find(u => u && u.id === "admin");
+    if (!defaultAdmin) {
+      console.warn("[startup] ensureAdminUser: DEFAULT_USERS has no admin entry — skipping safety net");
+      return;
+    }
+    const idx = current.findIndex(u => u && u.id === "admin");
+    let changed = false;
+    if (idx === -1) {
+      current.unshift({ ...defaultAdmin });
+      changed = true;
+      console.log("[startup] users.json: admin user was missing — restored from defaults");
+    } else {
+      const admin = current[idx];
+      if (admin.active !== true) {
+        admin.active = true;
+        changed = true;
+        console.log("[startup] users.json: admin user was inactive — reactivated");
+      }
+      if (admin.role !== "admin") {
+        const prevRole = admin.role;
+        admin.role = "admin";
+        changed = true;
+        console.log(`[startup] users.json: admin user role was "${prevRole}" — restored to "admin"`);
+      }
+      // Password is preserved on purpose. See header comment.
+    }
+    if (changed) saveJSON("users.json", current);
+  } catch (e) {
+    console.warn("[startup] ensureAdminUser failed:", e?.message);
+  }
+})();
+
 // ─── Middleware ──────────────────────────────────────────────────────────────
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
