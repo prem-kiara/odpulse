@@ -4176,6 +4176,19 @@ function CollectionPerformanceWidget({ user, entries }) {
 
   const [viewMode, setViewMode] = useState("bucket");
   const [showAvg, setShowAvg] = useState(true);
+  // OD Type segmentation: "all" | "individual" | "group".
+  //   • all        — both OD types feed collection totals; bucket + PTP
+  //                  analytics still reflect Individual OD only (Group OD
+  //                  has no buckets and PTP isn't tracked for group loans).
+  //   • individual — only Individual OD; full analytics active.
+  //   • group      — only Group OD; bucket + PTP sections hidden in UI
+  //                  and stripped from the Branch Report.
+  const [odTypeFilter, setOdTypeFilter] = useState("all");
+  useEffect(() => {
+    // Bucket view only makes sense when Individual OD is in play; auto-flip
+    // to By Month in Group-only mode so the user always sees something useful.
+    if (odTypeFilter === "group" && viewMode === "bucket") setViewMode("month");
+  }, [odTypeFilter, viewMode]);
   const [showTable, setShowTable] = useState(true);
   const [showProductivity, setShowProductivity] = useState(true);
   const [showCountsInTable, setShowCountsInTable] = useState(false);
@@ -4252,16 +4265,24 @@ function CollectionPerformanceWidget({ user, entries }) {
     return Math.max(1, Math.floor((b - a) / 86400000) + 1);
   }, [dateFrom, dateTo]);
 
+  // Distinguishes Individual OD from anything else (Group OD or legacy).
+  const isIndividualOd = (e) => e && e.odType === "Individual OD";
   const matchesFilters = useCallback((e) => {
     if (!e) return false;
     if (excludedUserIds.has(e.enteredBy)) return false;
     if (selBranches.length > 0 && !selBranches.includes(e.branch || "")) return false;
     if (selStaff.length > 0 && !selStaff.includes(e.enteredBy || "")) return false;
-    const b = validBucket(e);
-    if (!b) return false;
-    if (selBuckets.length > 0 && !selBuckets.includes(b)) return false;
+    if (odTypeFilter === "individual" && !isIndividualOd(e)) return false;
+    if (odTypeFilter === "group" && isIndividualOd(e)) return false;
+    // Bucket filter only enforced when user picked specific buckets AND the
+    // entry has one — Group OD entries (no bucket) naturally pass when no
+    // bucket filter is set, so they contribute to collection totals.
+    if (selBuckets.length > 0) {
+      const b = validBucket(e);
+      if (!b || !selBuckets.includes(b)) return false;
+    }
     return true;
-  }, [selBranches, selStaff, selBuckets, excludedUserIds]);
+  }, [selBranches, selStaff, selBuckets, excludedUserIds, odTypeFilter]);
 
   const excludedSummary = useMemo(() => {
     let noBucket = 0;
@@ -4346,7 +4367,9 @@ function CollectionPerformanceWidget({ user, entries }) {
         slot.modeAmount.set(mode, (slot.modeAmount.get(mode) || 0) + amt);
         if (!slot.modeAccts.has(mode)) slot.modeAccts.set(mode, new Set());
         slot.modeAccts.get(mode).add(ak);
-        if (e.ptpDate) {
+        // PTP analytics — Individual OD only. Group OD collection counts
+        // still flow into mode/amount above; the PTP block is skipped.
+        if (isIndividualOd(e) && e.ptpDate) {
           slot.ptpCreated++;
           const status = e.ptpStatus || "";
           if (status === "paid") {
@@ -4504,7 +4527,8 @@ function CollectionPerformanceWidget({ user, entries }) {
       slot.modeAmount.set(mode, (slot.modeAmount.get(mode) || 0) + amt);
       if (!slot.modeAccts.has(mode)) slot.modeAccts.set(mode, new Set());
       slot.modeAccts.get(mode).add(ak);
-      if (e.ptpDate) {
+      // PTP analytics — Individual OD only (Group OD doesn't track PTPs).
+      if (isIndividualOd(e) && e.ptpDate) {
         slot.ptpCreated++;
         const dueAmt = Number(e.amountDue ?? e.groupOdAmount ?? e.customerShare ?? 0) || 0;
         slot.ptpPromised += dueAmt;
@@ -4538,13 +4562,14 @@ function CollectionPerformanceWidget({ user, entries }) {
         sslot.acctByBucket[sbk].add(ak);
         sslot.amtByBucket[sbk] += amt;
       }
-      if (e.ptpDate) {
+      // PTP analytics — Individual OD only.
+      // BROKEN PTP DEFINITION (kept consistent across branch + tooltip):
+      //   A PTP is "broken" iff (status !== "paid") AND (ptpDate < today).
+      //   The customer committed by ptpDate, that date has passed, and
+      //   we have not recorded a paid status. Active PTPs (status
+      //   pending, ptpDate today/future) do NOT count as broken.
+      if (isIndividualOd(e) && e.ptpDate) {
         sslot.ptpCreated++;
-        // BROKEN PTP DEFINITION (same logic the branch + tooltip use):
-        //   A PTP is "broken" iff (status !== "paid") AND (ptpDate < today).
-        //   i.e. the customer committed to pay by ptpDate, that date has
-        //   passed, and we have not recorded a paid status. Active PTPs
-        //   (status pending, ptpDate today/future) do NOT count as broken.
         if (e.ptpStatus === "paid") sslot.ptpKept++;
         else if (e.ptpDate < today) sslot.ptpBroken++;
       }
@@ -5077,18 +5102,27 @@ function CollectionPerformanceWidget({ user, entries }) {
     const modeCols = Array.from(allModes).sort();
 
     // ── Sheet 1 — Branch Performance Summary ───────────────────────────
+    // In Group OD mode, DPD bucket columns + PTP columns are stripped:
+    //   Group OD accounts have no bucket classification and PTPs aren't
+    //   tracked for group loans. In Individual / All modes the columns
+    //   appear; in All mode they reflect Individual OD entries only.
+    const isGroupOnly = odTypeFilter === "group";
     const s1Headers = [
       "Branch", "Accounts Worked", "Accounts Collected",
       "Total Collection", "Recovery Amount", "Waiver Amount",
-      "SMA-0 Accts", "SMA-0 Amount",
-      "SMA-1 Accts", "SMA-1 Amount",
-      "SMA-2 Accts", "SMA-2 Amount",
-      "NPA Accts",   "NPA Amount",
+      ...(isGroupOnly ? [] : [
+        "SMA-0 Accts", "SMA-0 Amount",
+        "SMA-1 Accts", "SMA-1 Amount",
+        "SMA-2 Accts", "SMA-2 Amount",
+        "NPA Accts",   "NPA Amount",
+      ]),
     ];
     for (const m of modeCols) { s1Headers.push(m + " Amount"); s1Headers.push(m + " Accounts"); }
-    s1Headers.push("PTPs Created", "PTP Promised Amt",
-      "PTP Collected", "PTP Pending Amt",
-      "PTPs Kept", "PTPs Broken", "PTPs Active", "PTP Success %");
+    if (!isGroupOnly) {
+      s1Headers.push("PTPs Created", "PTP Promised Amt",
+        "PTP Collected", "PTP Pending Amt",
+        "PTPs Kept", "PTPs Broken", "PTPs Active", "PTP Success %");
+    }
 
     const s1Rows = [s1Headers];
     const tot = {
@@ -5103,10 +5137,12 @@ function CollectionPerformanceWidget({ user, entries }) {
       const row = [
         r.branch, r.accountsWorked, r.accountsCollected,
         Math.round(r.collectionAmt), Math.round(r.recoveryAmt), Math.round(r.waiverAmt),
-        r.acctByBucket["SMA-0"], Math.round(r.amtByBucket["SMA-0"]),
-        r.acctByBucket["SMA-1"], Math.round(r.amtByBucket["SMA-1"]),
-        r.acctByBucket["SMA-2"], Math.round(r.amtByBucket["SMA-2"]),
-        r.acctByBucket["NPA"],   Math.round(r.amtByBucket["NPA"]),
+        ...(isGroupOnly ? [] : [
+          r.acctByBucket["SMA-0"], Math.round(r.amtByBucket["SMA-0"]),
+          r.acctByBucket["SMA-1"], Math.round(r.amtByBucket["SMA-1"]),
+          r.acctByBucket["SMA-2"], Math.round(r.amtByBucket["SMA-2"]),
+          r.acctByBucket["NPA"],   Math.round(r.amtByBucket["NPA"]),
+        ]),
       ];
       for (const m of modeCols) {
         const mv = r.modes[m] || { amount: 0, count: 0 };
@@ -5115,10 +5151,12 @@ function CollectionPerformanceWidget({ user, entries }) {
         tot.modes[m].amount += mv.amount;
         tot.modes[m].count  += mv.count;
       }
-      row.push(r.ptp.created, Math.round(r.ptp.promised),
-        Math.round(r.ptp.collected), Math.round(r.ptp.pending),
-        r.ptp.kept, r.ptp.broken, r.ptp.active,
-        (r.ptp.successRate || 0).toFixed(1) + "%");
+      if (!isGroupOnly) {
+        row.push(r.ptp.created, Math.round(r.ptp.promised),
+          Math.round(r.ptp.collected), Math.round(r.ptp.pending),
+          r.ptp.kept, r.ptp.broken, r.ptp.active,
+          (r.ptp.successRate || 0).toFixed(1) + "%");
+      }
       s1Rows.push(row);
       tot.worked += r.accountsWorked;
       tot.collected += r.accountsCollected;
@@ -5136,46 +5174,57 @@ function CollectionPerformanceWidget({ user, entries }) {
     const totalsRow = [
       "TOTAL (" + branchReport.length + " branches)", tot.worked, tot.collected,
       Math.round(tot.collection), Math.round(tot.recovery), Math.round(tot.waiver),
-      tot.bAcct["SMA-0"], Math.round(tot.bAmt["SMA-0"]),
-      tot.bAcct["SMA-1"], Math.round(tot.bAmt["SMA-1"]),
-      tot.bAcct["SMA-2"], Math.round(tot.bAmt["SMA-2"]),
-      tot.bAcct["NPA"],   Math.round(tot.bAmt["NPA"]),
+      ...(isGroupOnly ? [] : [
+        tot.bAcct["SMA-0"], Math.round(tot.bAmt["SMA-0"]),
+        tot.bAcct["SMA-1"], Math.round(tot.bAmt["SMA-1"]),
+        tot.bAcct["SMA-2"], Math.round(tot.bAmt["SMA-2"]),
+        tot.bAcct["NPA"],   Math.round(tot.bAmt["NPA"]),
+      ]),
     ];
     for (const m of modeCols) {
       totalsRow.push(Math.round(tot.modes[m].amount));
       totalsRow.push(tot.modes[m].count);
     }
-    const totalRate = tot.ptpC > 0 ? (tot.ptpK / tot.ptpC) * 100 : 0;
-    totalsRow.push(tot.ptpC, Math.round(tot.ptpP),
-      Math.round(tot.ptpCol), Math.round(tot.ptpPend),
-      tot.ptpK, tot.ptpB, tot.ptpA, totalRate.toFixed(1) + "%");
+    if (!isGroupOnly) {
+      const totalRate = tot.ptpC > 0 ? (tot.ptpK / tot.ptpC) * 100 : 0;
+      totalsRow.push(tot.ptpC, Math.round(tot.ptpP),
+        Math.round(tot.ptpCol), Math.round(tot.ptpPend),
+        tot.ptpK, tot.ptpB, tot.ptpA, totalRate.toFixed(1) + "%");
+    }
     s1Rows.push(totalsRow);
 
     // ── Sheet 2 — Staff Contribution Summary ──────────────────────────
     const s2Headers = [
       "Branch", "Staff Name", "Accounts Collected", "Amount Collected", "% of Branch Total",
-      "SMA-0 Accts", "SMA-0 Amount",
-      "SMA-1 Accts", "SMA-1 Amount",
-      "SMA-2 Accts", "SMA-2 Amount",
-      "NPA Accts",   "NPA Amount",
-      "Other Accts", "Other Amount",
-      "PTPs Created", "PTPs Kept", "PTPs Broken", "PTP Success %",
+      ...(isGroupOnly ? [] : [
+        "SMA-0 Accts", "SMA-0 Amount",
+        "SMA-1 Accts", "SMA-1 Amount",
+        "SMA-2 Accts", "SMA-2 Amount",
+        "NPA Accts",   "NPA Amount",
+        "Other Accts", "Other Amount",
+        "PTPs Created", "PTPs Kept", "PTPs Broken", "PTP Success %",
+      ]),
     ];
     const s2Rows = [s2Headers];
     for (const r of branchReport) {
       for (const ss of r.staff) {
         const sRate = ss.ptpCreated > 0 ? (ss.ptpKept / ss.ptpCreated) * 100 : 0;
-        s2Rows.push([
+        const row = [
           r.branch, ss.name, ss.accountsCollected, Math.round(ss.amount),
           ss.contributionPct.toFixed(1) + "%",
-          ss.acctByBucket["SMA-0"], Math.round(ss.amtByBucket["SMA-0"]),
-          ss.acctByBucket["SMA-1"], Math.round(ss.amtByBucket["SMA-1"]),
-          ss.acctByBucket["SMA-2"], Math.round(ss.amtByBucket["SMA-2"]),
-          ss.acctByBucket["NPA"],   Math.round(ss.amtByBucket["NPA"]),
-          ss.acctByBucket["Other"], Math.round(ss.amtByBucket["Other"]),
-          ss.ptpCreated, ss.ptpKept, ss.ptpBroken,
-          ss.ptpCreated > 0 ? sRate.toFixed(1) + "%" : "",
-        ]);
+        ];
+        if (!isGroupOnly) {
+          row.push(
+            ss.acctByBucket["SMA-0"], Math.round(ss.amtByBucket["SMA-0"]),
+            ss.acctByBucket["SMA-1"], Math.round(ss.amtByBucket["SMA-1"]),
+            ss.acctByBucket["SMA-2"], Math.round(ss.amtByBucket["SMA-2"]),
+            ss.acctByBucket["NPA"],   Math.round(ss.amtByBucket["NPA"]),
+            ss.acctByBucket["Other"], Math.round(ss.amtByBucket["Other"]),
+            ss.ptpCreated, ss.ptpKept, ss.ptpBroken,
+            ss.ptpCreated > 0 ? sRate.toFixed(1) + "%" : "",
+          );
+        }
+        s2Rows.push(row);
       }
     }
 
@@ -5245,8 +5294,18 @@ function CollectionPerformanceWidget({ user, entries }) {
           )}
         </h3>
         <div className="flex items-center gap-2 flex-wrap">
+          {/* OD Type selector — primary segmentation. Group mode hides
+              bucket + PTP UI elements and disables Bucket view. */}
           <div className="inline-flex rounded-lg border border-gray-200 overflow-hidden text-[11px]">
-            <button onClick={() => setViewMode("bucket")} className={"px-2.5 py-1 " + (viewMode === "bucket" ? "bg-teal-600 text-white" : "bg-white text-gray-700 hover:bg-gray-50")}>By Bucket</button>
+            <button onClick={() => setOdTypeFilter("all")} className={"px-2.5 py-1 " + (odTypeFilter === "all" ? "bg-indigo-600 text-white" : "bg-white text-gray-700 hover:bg-gray-50")}>All OD</button>
+            <button onClick={() => setOdTypeFilter("individual")} className={"px-2.5 py-1 border-l border-gray-200 " + (odTypeFilter === "individual" ? "bg-indigo-600 text-white" : "bg-white text-gray-700 hover:bg-gray-50")}>Individual OD</button>
+            <button onClick={() => setOdTypeFilter("group")} className={"px-2.5 py-1 border-l border-gray-200 " + (odTypeFilter === "group" ? "bg-indigo-600 text-white" : "bg-white text-gray-700 hover:bg-gray-50")}>Group OD</button>
+          </div>
+          <div className="inline-flex rounded-lg border border-gray-200 overflow-hidden text-[11px]">
+            <button onClick={() => setViewMode("bucket")}
+              disabled={odTypeFilter === "group"}
+              title={odTypeFilter === "group" ? "Bucket view is not available for Group OD (no DPD classifications)" : ""}
+              className={"px-2.5 py-1 " + (odTypeFilter === "group" ? "bg-gray-100 text-gray-400 cursor-not-allowed" : (viewMode === "bucket" ? "bg-teal-600 text-white" : "bg-white text-gray-700 hover:bg-gray-50"))}>By Bucket</button>
             <button onClick={() => setViewMode("staff")} className={"px-2.5 py-1 border-l border-gray-200 " + (viewMode === "staff" ? "bg-teal-600 text-white" : "bg-white text-gray-700 hover:bg-gray-50")}>By Staff</button>
             <button onClick={() => setViewMode("month")} className={"px-2.5 py-1 border-l border-gray-200 " + (viewMode === "month" ? "bg-teal-600 text-white" : "bg-white text-gray-700 hover:bg-gray-50")}>By Month</button>
           </div>
