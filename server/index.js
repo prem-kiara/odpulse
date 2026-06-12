@@ -689,13 +689,51 @@ app.patch("/api/users/:id", (req, res) => {
     })).filter(c => c.oldValue !== c.newValue);
     users[idx] = { ...before, ...patch };
     saveJSON("users.json", users);
-    // Audit-log captures who, what, when, and the user-supplied reason
-    // (sent as _reason in the request body; sanitised to short string).
+
+    // ── Backfill: if the admin renamed this user, walk entries.json and
+    //    update the denormalised enteredByName on every historic record
+    //    authored by them. enteredBy (the id) is left untouched so record
+    //    ownership / identity is preserved; only the displayed name
+    //    changes. This is what makes the corrected name surface in every
+    //    report, dashboard, export, audit view, and tooltip — past AND
+    //    future — without creating duplicate staff records.
+    let entriesBackfilled = 0;
+    const nameChanged = changes.some(c => c.field === "name");
+    if (nameChanged) {
+      try {
+        const entries = loadJSON("entries.json", []);
+        const newName = String(patch.name || "");
+        const oldName = String(before.name || "");
+        let mutated = false;
+        for (const e of entries) {
+          if (!e || e.enteredBy !== targetId) continue;
+          if (e.enteredByName === newName) continue;
+          e.enteredByName = newName;
+          entriesBackfilled++;
+          mutated = true;
+        }
+        if (mutated) {
+          saveJSON("entries.json", entries);
+          console.log(`[users/patch] backfilled enteredByName on ${entriesBackfilled} entries for ${targetId} (${oldName} → ${newName})`);
+        }
+      } catch (bErr) {
+        console.error("[users/patch] enteredByName backfill failed:", bErr?.message);
+      }
+    }
+
+    // Audit-log captures who, what, when, the user-supplied reason
+    // (sent as _reason in the request body; sanitised to short string),
+    // and how many historic entries were backfilled (so we have a record
+    // of the rename's reach into past data).
     const callerId = req.header("x-od-user") || "";
     const reason = (req.body && typeof req.body._reason === "string") ? req.body._reason.slice(0, 500) : "";
-    auditUserChange(targetId, changes, callerId, reason, "update");
+    const auditChanges = changes.slice();
+    if (nameChanged && entriesBackfilled > 0) {
+      auditChanges.push({ field: "_enteredByName_backfill", oldValue: null, newValue: { entriesUpdated: entriesBackfilled } });
+    }
+    auditUserChange(targetId, auditChanges, callerId, reason, "update");
     console.log(`[users/patch] ${targetId} fields=${Object.keys(patch).join(",")} by ${callerId || "(unknown)"}`);
-    res.json({ ok: true, user: users[idx] });
+    res.json({ ok: true, user: users[idx], entriesBackfilled });
   } catch (err) {
     console.error("[/api/users/:id PATCH] failed:", err);
     res.status(500).json({ error: "Failed to update user: " + (err.message || err) });

@@ -6060,6 +6060,7 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
     if (!trimmed) { alert("Name cannot be empty."); return; }
     if (trimmed === userNameEdit.oldName) { setUserNameEdit(null); return; }
     setUserNameEdit(s => ({ ...s, saving: true }));
+    let backfilledCount = 0;
     try {
       const res = await fetch(`${API_BASE}/users/${encodeURIComponent(userNameEdit.userId)}`, {
         method: "PATCH",
@@ -6076,6 +6077,10 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
         setUserNameEdit(s => ({ ...s, saving: false }));
         return;
       }
+      try {
+        const body = await res.json();
+        backfilledCount = Number(body && body.entriesBackfilled) || 0;
+      } catch {}
     } catch (err) {
       console.error("[userNameEdit] network error:", err);
       alert("Network error while saving name change.");
@@ -6091,6 +6096,18 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
     const updated = users.map(u => u.id === userNameEdit.userId ? { ...u, name: trimmed } : u);
     setUsers(updated);
     try { localStorage.setItem(STORAGE_KEYS.users, JSON.stringify(updated)); } catch {}
+    // Mirror the backfilled enteredByName onto local entries too so the
+    // dashboard / records list updates immediately without a refetch.
+    if (backfilledCount > 0 && Array.isArray(entries)) {
+      const updatedEntries = entries.map(e => e && e.enteredBy === userNameEdit.userId
+        ? { ...e, enteredByName: trimmed }
+        : e);
+      setEntries(updatedEntries);
+      try { localStorage.setItem(STORAGE_KEYS.entries, JSON.stringify(updatedEntries)); } catch {}
+    }
+    if (backfilledCount > 0) {
+      alert(`Name updated to "${trimmed}". ${backfilledCount} historic entr${backfilledCount === 1 ? "y was" : "ies were"} also updated to reflect the new name.`);
+    }
     setUserNameEdit(null);
   };
 
