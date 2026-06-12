@@ -2443,6 +2443,65 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
   // { entryId, oldMode, newMode, reason, saving } when active; null otherwise.
   const [pmEdit, setPmEdit] = useState(null);
   const canCorrectPaymentMode = user.role === "admin";
+  // Admin-only: in-progress Recorded By (staff) reassignment. Reassigning
+  // is different from renaming — enteredBy (the id) actually changes, so
+  // the entry shifts attribution from Staff A to Staff B. enteredBy is
+  // the join key for KPIs/productivity/branch report/RBAC, so all
+  // downstream aggregations recalculate on next render automatically.
+  const [recordedByEdit, setRecordedByEdit] = useState(null);
+  const canReassignRecordedBy = user.role === "admin";
+  // Load users for the staff dropdown — RecordsTable doesn't get users as
+  // a prop, so read from localStorage (mirrors the Collection Performance
+  // widget pattern).
+  const allUsersForReassign = useMemo(() => {
+    try {
+      const arr = JSON.parse(localStorage.getItem(STORAGE_KEYS.users) || "[]");
+      return Array.isArray(arr) ? arr.filter(u => u && u.id && u.name) : [];
+    } catch { return []; }
+  }, []);
+  const submitRecordedByEdit = async () => {
+    if (!recordedByEdit || !recordedByEdit.entryId || !recordedByEdit.newEnteredBy) return;
+    if (recordedByEdit.newEnteredBy === recordedByEdit.oldEnteredBy) { setRecordedByEdit(null); return; }
+    const newUser = allUsersForReassign.find(u => u.id === recordedByEdit.newEnteredBy);
+    if (!newUser) { alert("Select a valid staff member."); return; }
+    setRecordedByEdit(s => ({ ...s, saving: true }));
+    try {
+      const res = await fetch(`${API_BASE}/entries/${encodeURIComponent(recordedByEdit.entryId)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", "x-od-user": user.id, "x-od-role": user.role || "" },
+        body: JSON.stringify({
+          enteredBy: newUser.id,
+          enteredByName: newUser.name,
+          _correctedBy: user.name || user.username || user.id,
+          _correctedAt: new Date().toISOString(),
+          _previousEnteredBy: recordedByEdit.oldEnteredBy || "",
+          _previousEnteredByName: recordedByEdit.oldEnteredByName || "",
+          _correctionReason: recordedByEdit.reason || "",
+        }),
+      });
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({}));
+        alert("Could not reassign staff: " + (j.error || `HTTP ${res.status}`));
+        setRecordedByEdit(s => ({ ...s, saving: false }));
+        return;
+      }
+    } catch (err) {
+      console.error("[recordedByEdit] network error:", err);
+      alert("Network error while reassigning staff.");
+      setRecordedByEdit(s => ({ ...s, saving: false }));
+      return;
+    }
+    // Mirror locally — enteredBy is the join key, so all aggregations
+    // (Collection Performance chart, productivity table, branch report,
+    // dashboard KPIs, staff-scoped RBAC) automatically reattribute on
+    // next render without any explicit cache flush.
+    const updatedEntries = entries.map(en => en.id === recordedByEdit.entryId
+      ? { ...en, enteredBy: newUser.id, enteredByName: newUser.name }
+      : en);
+    setEntries(updatedEntries);
+    try { localStorage.setItem(STORAGE_KEYS.entries, JSON.stringify(updatedEntries)); } catch {}
+    setRecordedByEdit(null);
+  };
   // Admin-only: in-progress entry-date correction (backdate / forward-date).
   //   { entryId, oldDate, newDate, reason, saving } when active.
   const [dateEdit, setDateEdit] = useState(null);
@@ -3046,7 +3105,52 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
                         )}
                         {/* Meta info */}
                         <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 text-sm">
-                          <div><span className="text-gray-500">Entered By:</span> <span className="font-medium">{e.enteredByName || e.enteredBy}</span></div>
+                          <div>
+                            <span className="text-gray-500">Entered By:</span>{" "}
+                            {recordedByEdit && recordedByEdit.entryId === e.id ? (
+                              <span className="inline-flex items-center gap-1.5 flex-wrap">
+                                <select value={recordedByEdit.newEnteredBy || ""}
+                                  onChange={ev => setRecordedByEdit(s => ({ ...s, newEnteredBy: ev.target.value }))}
+                                  className="px-1.5 py-0.5 border rounded text-xs bg-white">
+                                  <option value="">— Select staff —</option>
+                                  {allUsersForReassign.filter(u => u.role !== "admin").sort((a, b) => (a.name || "").localeCompare(b.name || "")).map(u => (
+                                    <option key={u.id} value={u.id}>{u.name}{u.username ? ` (${u.username})` : ""}</option>
+                                  ))}
+                                </select>
+                                <input type="text" placeholder="Reason (optional)"
+                                  value={recordedByEdit.reason || ""}
+                                  onChange={ev => setRecordedByEdit(s => ({ ...s, reason: ev.target.value }))}
+                                  className="px-1.5 py-0.5 border rounded text-[11px] bg-white w-32" />
+                                <button onClick={submitRecordedByEdit}
+                                  disabled={recordedByEdit.saving || !recordedByEdit.newEnteredBy || recordedByEdit.newEnteredBy === recordedByEdit.oldEnteredBy}
+                                  className={"text-[11px] px-2 py-0.5 rounded " + (recordedByEdit.saving ? "bg-gray-200 text-gray-400" : "bg-teal-600 text-white hover:bg-teal-700")}>
+                                  {recordedByEdit.saving ? "Saving…" : "Reassign"}
+                                </button>
+                                <button onClick={() => setRecordedByEdit(null)}
+                                  className="text-[11px] px-2 py-0.5 rounded bg-gray-100 text-gray-700 hover:bg-gray-200">
+                                  Cancel
+                                </button>
+                              </span>
+                            ) : (
+                              <>
+                                <span className="font-medium">{e.enteredByName || e.enteredBy}</span>
+                                {canReassignRecordedBy && (
+                                  <button type="button"
+                                    onClick={() => setRecordedByEdit({
+                                      entryId: e.id,
+                                      oldEnteredBy: e.enteredBy || "",
+                                      oldEnteredByName: e.enteredByName || "",
+                                      newEnteredBy: e.enteredBy || "",
+                                      reason: "",
+                                    })}
+                                    title="Reassign this entry to a different staff member — admin only, audit-logged"
+                                    className="ml-2 text-[10px] text-teal-700 hover:text-teal-900 underline">
+                                    reassign
+                                  </button>
+                                )}
+                              </>
+                            )}
+                          </div>
                           <div>
                             <span className="text-gray-500">Entry Time:</span>{" "}
                             {dateEdit && dateEdit.entryId === e.id ? (
