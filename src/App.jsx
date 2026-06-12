@@ -2443,6 +2443,45 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
   // { entryId, oldMode, newMode, reason, saving } when active; null otherwise.
   const [pmEdit, setPmEdit] = useState(null);
   const canCorrectPaymentMode = user.role === "admin";
+  // Admin-only: in-progress entry-date correction (backdate / forward-date).
+  //   { entryId, oldDate, newDate, reason, saving } when active.
+  const [dateEdit, setDateEdit] = useState(null);
+  const canCorrectEntryDate = user.role === "admin";
+  const submitDateCorrection = async () => {
+    if (!dateEdit || !dateEdit.entryId || !dateEdit.newDate) return;
+    if (dateEdit.newDate === dateEdit.oldDate) { setDateEdit(null); return; }
+    setDateEdit(s => ({ ...s, saving: true }));
+    try {
+      const res = await fetch(`${API_BASE}/entries/${encodeURIComponent(dateEdit.entryId)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", "x-od-user": user.id, "x-od-role": user.role || "" },
+        body: JSON.stringify({
+          date: dateEdit.newDate,
+          _correctedBy: user.name || user.username || user.id,
+          _correctedAt: new Date().toISOString(),
+          _previousDate: dateEdit.oldDate || "",
+          _correctionReason: dateEdit.reason || "",
+        }),
+      });
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({}));
+        alert("Could not save date correction: " + (j.error || `HTTP ${res.status}`));
+        setDateEdit(s => ({ ...s, saving: false }));
+        return;
+      }
+    } catch (err) {
+      console.error("[dateCorrection] network error:", err);
+      alert("Network error while saving date correction.");
+      setDateEdit(s => ({ ...s, saving: false }));
+      return;
+    }
+    const updatedEntries = entries.map(en => en.id === dateEdit.entryId
+      ? { ...en, date: dateEdit.newDate }
+      : en);
+    setEntries(updatedEntries);
+    try { localStorage.setItem(STORAGE_KEYS.entries, JSON.stringify(updatedEntries)); } catch {}
+    setDateEdit(null);
+  };
   const submitPmCorrection = async () => {
     if (!pmEdit || !pmEdit.entryId || !pmEdit.newMode) return;
     setPmEdit(s => ({ ...s, saving: true }));
@@ -3008,7 +3047,41 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
                         {/* Meta info */}
                         <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 text-sm">
                           <div><span className="text-gray-500">Entered By:</span> <span className="font-medium">{e.enteredByName || e.enteredBy}</span></div>
-                          <div><span className="text-gray-500">Entry Time:</span> <span className="font-medium">{formatDateDMY(e.date)} {e.time}</span></div>
+                          <div>
+                            <span className="text-gray-500">Entry Time:</span>{" "}
+                            {dateEdit && dateEdit.entryId === e.id ? (
+                              <span className="inline-flex items-center gap-1.5 flex-wrap">
+                                <input type="date" value={dateEdit.newDate || ""}
+                                  onChange={ev => setDateEdit(s => ({ ...s, newDate: ev.target.value }))}
+                                  className="px-1.5 py-0.5 border rounded text-xs bg-white" />
+                                <input type="text" placeholder="Reason (optional)"
+                                  value={dateEdit.reason || ""}
+                                  onChange={ev => setDateEdit(s => ({ ...s, reason: ev.target.value }))}
+                                  className="px-1.5 py-0.5 border rounded text-[11px] bg-white w-32" />
+                                <button onClick={submitDateCorrection}
+                                  disabled={dateEdit.saving || !dateEdit.newDate || dateEdit.newDate === dateEdit.oldDate}
+                                  className={"text-[11px] px-2 py-0.5 rounded " + (dateEdit.saving ? "bg-gray-200 text-gray-400" : "bg-teal-600 text-white hover:bg-teal-700")}>
+                                  {dateEdit.saving ? "Saving…" : "Save"}
+                                </button>
+                                <button onClick={() => setDateEdit(null)}
+                                  className="text-[11px] px-2 py-0.5 rounded bg-gray-100 text-gray-700 hover:bg-gray-200">
+                                  Cancel
+                                </button>
+                              </span>
+                            ) : (
+                              <>
+                                <span className="font-medium">{formatDateDMY(e.date)} {e.time}</span>
+                                {canCorrectEntryDate && (
+                                  <button type="button"
+                                    onClick={() => setDateEdit({ entryId: e.id, oldDate: e.date, newDate: e.date, reason: "" })}
+                                    title="Correct entry date — admin only, audit-logged"
+                                    className="ml-2 text-[10px] text-teal-700 hover:text-teal-900 underline">
+                                    edit date
+                                  </button>
+                                )}
+                              </>
+                            )}
+                          </div>
                           <div><span className="text-gray-500">Total Paid:</span> <span className="font-medium text-teal-700">{formatINR(paid)}</span></div>
                         </div>
                         {e.waiverApproval && (
@@ -5978,6 +6051,49 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
     setNewUser({ username: "", password: "Dhanam@123", name: "", role: "staff", branch: "" });
   };
 
+  // Admin-only: in-progress staff name correction.
+  //   { userId, oldName, newName, reason, saving } when active; null otherwise.
+  const [userNameEdit, setUserNameEdit] = useState(null);
+  const submitUserNameEdit = async () => {
+    if (!userNameEdit || !userNameEdit.userId) return;
+    const trimmed = (userNameEdit.newName || "").trim();
+    if (!trimmed) { alert("Name cannot be empty."); return; }
+    if (trimmed === userNameEdit.oldName) { setUserNameEdit(null); return; }
+    setUserNameEdit(s => ({ ...s, saving: true }));
+    try {
+      const res = await fetch(`${API_BASE}/users/${encodeURIComponent(userNameEdit.userId)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", "x-od-user": user.id, "x-od-role": user.role || "" },
+        body: JSON.stringify({
+          name: trimmed,
+          _previousName: userNameEdit.oldName || "",
+          _reason: userNameEdit.reason || "",
+        }),
+      });
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({}));
+        alert("Could not save name change: " + (j.error || `HTTP ${res.status}`));
+        setUserNameEdit(s => ({ ...s, saving: false }));
+        return;
+      }
+    } catch (err) {
+      console.error("[userNameEdit] network error:", err);
+      alert("Network error while saving name change.");
+      setUserNameEdit(s => ({ ...s, saving: false }));
+      return;
+    }
+    // Mirror locally so the UI updates without a refetch. We deliberately
+    // don't backfill historic entries' denormalised enteredByName — the
+    // dashboard / chart already prefers staffNameById from the users array,
+    // so new name shows up everywhere on next render. (If you ever need
+    // to backfill historical enteredByName fields, a server-side migration
+    // is the right tool — keeps the audit log clean.)
+    const updated = users.map(u => u.id === userNameEdit.userId ? { ...u, name: trimmed } : u);
+    setUsers(updated);
+    try { localStorage.setItem(STORAGE_KEYS.users, JSON.stringify(updated)); } catch {}
+    setUserNameEdit(null);
+  };
+
   const toggleUser = async (id) => {
     // Targeted server-side merge (PATCH) — preserves password,
     // mustChangePassword, and every other field on the user record.
@@ -6448,7 +6564,38 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
                 <tbody>
                   {sort.apply(users).map(u => (
                     <tr key={u.id} className="border-b">
-                      <td className="px-4 py-3 font-medium">{u.name}</td>
+                      <td className="px-4 py-3 font-medium">
+                        {userNameEdit && userNameEdit.userId === u.id ? (
+                          <span className="inline-flex items-center gap-1.5 flex-wrap">
+                            <input type="text" value={userNameEdit.newName || ""}
+                              onChange={ev => setUserNameEdit(s => ({ ...s, newName: ev.target.value }))}
+                              className="px-2 py-0.5 border rounded text-sm bg-white" />
+                            <input type="text" placeholder="Reason (optional)"
+                              value={userNameEdit.reason || ""}
+                              onChange={ev => setUserNameEdit(s => ({ ...s, reason: ev.target.value }))}
+                              className="px-1.5 py-0.5 border rounded text-[11px] bg-white w-32" />
+                            <button onClick={submitUserNameEdit}
+                              disabled={userNameEdit.saving}
+                              className={"text-[11px] px-2 py-0.5 rounded " + (userNameEdit.saving ? "bg-gray-200 text-gray-400" : "bg-teal-600 text-white hover:bg-teal-700")}>
+                              {userNameEdit.saving ? "Saving…" : "Save"}
+                            </button>
+                            <button onClick={() => setUserNameEdit(null)}
+                              className="text-[11px] px-2 py-0.5 rounded bg-gray-100 text-gray-700 hover:bg-gray-200">
+                              Cancel
+                            </button>
+                          </span>
+                        ) : (
+                          <>
+                            {u.name}
+                            <button type="button"
+                              onClick={() => setUserNameEdit({ userId: u.id, oldName: u.name, newName: u.name, reason: "" })}
+                              title="Correct staff name (audit-logged)"
+                              className="ml-2 text-[10px] text-teal-700 hover:text-teal-900 underline">
+                              edit
+                            </button>
+                          </>
+                        )}
+                      </td>
                       <td className="px-4 py-3">{u.username}</td>
                       <td className="px-4 py-3">
                         <div className="flex items-center gap-1">

@@ -603,6 +603,44 @@ app.get("/api/admin/duplicate-users", (req, res) => {
 // Effect: every entry where enteredBy === duplicateId is re-attributed to
 // canonicalId (and enteredByName is updated to the canonical's name). The
 // duplicate user is marked active:false. Idempotent on repeat calls.
+// ─── auditUserChange ───────────────────────────────────────────────────
+// Logs admin mutations to user records (name corrections, role updates,
+// active toggles, deletes, password resets) to users-audit.json. Mirrors
+// auditEntrySave: monthly rotation, hard-cap to prevent runaway growth.
+//
+// changes: array of { field, oldValue, newValue }
+// callerId: x-od-user header
+// reason: free-text reason captured from the client (optional)
+function auditUserChange(targetId, changes, callerId, reason, op) {
+  try {
+    const log = loadJSON("users-audit.json", []);
+    const todayYM = new Date().toISOString().slice(0, 7);
+    if (log.length > 0 && typeof log[0]?.ts === "string") {
+      const firstYM = log[0].ts.slice(0, 7);
+      if (firstYM !== todayYM) {
+        try {
+          saveJSON(`users-audit-${firstYM}.json`, log);
+          console.log(`[AUDIT] Rotated users-audit.json → users-audit-${firstYM}.json (${log.length} records)`);
+          log.length = 0;
+        } catch (rErr) {
+          console.error("[AUDIT] users-audit rotation failed:", rErr?.message);
+        }
+      }
+    }
+    log.unshift({
+      ts: new Date().toISOString(),
+      op: op || "update",
+      targetUserId: targetId || null,
+      changedBy: callerId || null,
+      reason: reason || null,
+      changes: Array.isArray(changes) ? changes : [],
+    });
+    saveJSON("users-audit.json", log.slice(0, 20000));
+  } catch (e) {
+    console.error("[AUDIT] users-audit write failed:", e?.message);
+  }
+}
+
 // ─── PATCH /api/users/:id ──────────────────────────────────────────────
 // Targeted user-fields update — merges selected non-credential fields
 // (active, role, branch, name, username) into the existing user record
@@ -643,9 +681,20 @@ app.patch("/api/users/:id", (req, res) => {
     if (Object.keys(patch).length === 0) {
       return res.status(400).json({ error: "No allowed fields supplied in patch" });
     }
-    users[idx] = { ...users[idx], ...patch };
+    const before = users[idx];
+    const changes = Object.keys(patch).map(f => ({
+      field: f,
+      oldValue: before[f],
+      newValue: patch[f],
+    })).filter(c => c.oldValue !== c.newValue);
+    users[idx] = { ...before, ...patch };
     saveJSON("users.json", users);
-    console.log(`[users/patch] ${targetId} fields=${Object.keys(patch).join(",")} by ${req.header("x-od-user") || "(unknown)"}`);
+    // Audit-log captures who, what, when, and the user-supplied reason
+    // (sent as _reason in the request body; sanitised to short string).
+    const callerId = req.header("x-od-user") || "";
+    const reason = (req.body && typeof req.body._reason === "string") ? req.body._reason.slice(0, 500) : "";
+    auditUserChange(targetId, changes, callerId, reason, "update");
+    console.log(`[users/patch] ${targetId} fields=${Object.keys(patch).join(",")} by ${callerId || "(unknown)"}`);
     res.json({ ok: true, user: users[idx] });
   } catch (err) {
     console.error("[/api/users/:id PATCH] failed:", err);
@@ -673,6 +722,9 @@ app.delete("/api/users/:id", (req, res) => {
     if (idx === -1) return res.status(404).json({ error: "User not found" });
     const removed = users.splice(idx, 1)[0];
     saveJSON("users.json", users);
+    auditUserChange(targetId, [
+      { field: "_user", oldValue: { id: removed.id, username: removed.username, name: removed.name, role: removed.role }, newValue: null },
+    ], req.header("x-od-user") || "", "", "delete");
     console.log(`[users/delete] ${targetId} (${removed.username || removed.name}) by ${req.header("x-od-user") || "(unknown)"}`);
     res.json({ ok: true, userId: targetId });
   } catch (err) {
@@ -710,6 +762,9 @@ app.post("/api/users/add", (req, res) => {
     };
     users.push(newUser);
     saveJSON("users.json", users);
+    auditUserChange(newUser.id, [
+      { field: "_user", oldValue: null, newValue: { username: newUser.username, name: newUser.name, role: newUser.role, branch: newUser.branch } },
+    ], req.header("x-od-user") || "", "", "create");
     console.log(`[users/add] ${newUser.id} (${newUser.username}, role=${newUser.role}) by ${req.header("x-od-user") || "(unknown)"}`);
     res.json({ ok: true, user: newUser });
   } catch (err) {
