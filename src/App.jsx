@@ -2502,6 +2502,61 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
     try { localStorage.setItem(STORAGE_KEYS.entries, JSON.stringify(updatedEntries)); } catch {}
     setRecordedByEdit(null);
   };
+  // Admin-only: in-progress Amount Collected correction. Updates the
+  // canonical totalPaidAmount + the OD-type specific paid field
+  // (paidAmount for Individual OD, groupOdPaidAmount for Group OD). Every
+  // downstream aggregation (KPIs, productivity, branch report, chart,
+  // dashboard tiles) keys off totalPaidAmount / paidAmount via getPaid(),
+  // so changing them auto-recalculates everything on the next render.
+  // { entryId, odType, oldAmount, newAmount, reason, saving } when active.
+  const [paidAmountEdit, setPaidAmountEdit] = useState(null);
+  const canCorrectPaidAmount = user.role === "admin";
+  const submitPaidAmountEdit = async () => {
+    if (!paidAmountEdit || !paidAmountEdit.entryId) return;
+    const newAmt = Number(paidAmountEdit.newAmount);
+    if (!Number.isFinite(newAmt) || newAmt < 0) { alert("Amount must be a non-negative number."); return; }
+    if (newAmt === Number(paidAmountEdit.oldAmount || 0)) { setPaidAmountEdit(null); return; }
+    setPaidAmountEdit(s => ({ ...s, saving: true }));
+    const isIndiv = paidAmountEdit.odType === "Individual OD";
+    const body = {
+      totalPaidAmount: newAmt,
+      _correctedBy: user.name || user.username || user.id,
+      _correctedAt: new Date().toISOString(),
+      _previousAmount: paidAmountEdit.oldAmount,
+      _correctionReason: paidAmountEdit.reason || "",
+    };
+    if (isIndiv) body.paidAmount = newAmt;
+    else body.groupOdPaidAmount = newAmt;
+    try {
+      const res = await fetch(`${API_BASE}/entries/${encodeURIComponent(paidAmountEdit.entryId)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", "x-od-user": user.id, "x-od-role": user.role || "" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({}));
+        alert("Could not save amount correction: " + (j.error || `HTTP ${res.status}`));
+        setPaidAmountEdit(s => ({ ...s, saving: false }));
+        return;
+      }
+    } catch (err) {
+      console.error("[paidAmountEdit] network error:", err);
+      alert("Network error while saving amount correction.");
+      setPaidAmountEdit(s => ({ ...s, saving: false }));
+      return;
+    }
+    // Mirror locally — update both totalPaidAmount and the OD-specific
+    // field so getPaid() / getEntryPaid() return the new value on next
+    // render. customerShare (per-member share of Group OD) is derived at
+    // display time and recomputes automatically.
+    const updatedEntries = entries.map(en => en.id === paidAmountEdit.entryId
+      ? { ...en, totalPaidAmount: newAmt, ...(isIndiv ? { paidAmount: newAmt } : { groupOdPaidAmount: newAmt }) }
+      : en);
+    setEntries(updatedEntries);
+    try { localStorage.setItem(STORAGE_KEYS.entries, JSON.stringify(updatedEntries)); } catch {}
+    setPaidAmountEdit(null);
+  };
+
   // Admin-only: in-progress entry-date correction (backdate / forward-date).
   //   { entryId, oldDate, newDate, reason, saving } when active.
   const [dateEdit, setDateEdit] = useState(null);
@@ -3186,7 +3241,48 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
                               </>
                             )}
                           </div>
-                          <div><span className="text-gray-500">Total Paid:</span> <span className="font-medium text-teal-700">{formatINR(paid)}</span></div>
+                          <div>
+                            <span className="text-gray-500">Total Paid:</span>{" "}
+                            {paidAmountEdit && paidAmountEdit.entryId === e.id ? (
+                              <span className="inline-flex items-center gap-1.5 flex-wrap">
+                                <input type="number" min="0" step="1"
+                                  value={paidAmountEdit.newAmount}
+                                  onChange={ev => setPaidAmountEdit(s => ({ ...s, newAmount: ev.target.value }))}
+                                  className="px-1.5 py-0.5 border rounded text-xs bg-white w-28" />
+                                <input type="text" placeholder="Reason (optional)"
+                                  value={paidAmountEdit.reason || ""}
+                                  onChange={ev => setPaidAmountEdit(s => ({ ...s, reason: ev.target.value }))}
+                                  className="px-1.5 py-0.5 border rounded text-[11px] bg-white w-32" />
+                                <button onClick={submitPaidAmountEdit}
+                                  disabled={paidAmountEdit.saving || paidAmountEdit.newAmount === "" || Number(paidAmountEdit.newAmount) === Number(paidAmountEdit.oldAmount || 0)}
+                                  className={"text-[11px] px-2 py-0.5 rounded " + (paidAmountEdit.saving ? "bg-gray-200 text-gray-400" : "bg-teal-600 text-white hover:bg-teal-700")}>
+                                  {paidAmountEdit.saving ? "Saving…" : "Save"}
+                                </button>
+                                <button onClick={() => setPaidAmountEdit(null)}
+                                  className="text-[11px] px-2 py-0.5 rounded bg-gray-100 text-gray-700 hover:bg-gray-200">
+                                  Cancel
+                                </button>
+                              </span>
+                            ) : (
+                              <>
+                                <span className="font-medium text-teal-700">{formatINR(paid)}</span>
+                                {canCorrectPaidAmount && (
+                                  <button type="button"
+                                    onClick={() => setPaidAmountEdit({
+                                      entryId: e.id,
+                                      odType: e.odType || "Group OD",
+                                      oldAmount: paid,
+                                      newAmount: String(paid),
+                                      reason: "",
+                                    })}
+                                    title="Correct Amount Collected — admin only, audit-logged"
+                                    className="ml-2 text-[10px] text-teal-700 hover:text-teal-900 underline">
+                                    edit amount
+                                  </button>
+                                )}
+                              </>
+                            )}
+                          </div>
                         </div>
                         {e.waiverApproval && (
                           <div className="p-3 bg-amber-50 rounded-lg border border-amber-200">
