@@ -573,6 +573,10 @@ export default function ReportsAnalytics({ user }) {
       if (view === "active" || view === "closed" || view === "pending" || view === "overdue") {
         p.set("status", view);
       }
+      // No cap — load every record matching the current filters so the table
+      // and its count reflect the complete filtered set. Pagination stays
+      // client-side.
+      p.set("limit", "0");
       const res = await fetch(`/api/od/disbursements?${p.toString()}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
@@ -771,7 +775,7 @@ export default function ReportsAnalytics({ user }) {
     if (expandedProducts.length > 0) p.set("product", expandedProducts.join(","));
     if (categoryFilter) p.set("category", categoryFilter);
     if (view === "active" || view === "closed" || view === "pending") p.set("status", view);
-    p.set("limit", "50000");
+    p.set("limit", "0");   // 0 = all matching rows, no cap — matches the table
     try {
       const res = await fetch(`/api/od/disbursements?${p.toString()}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -799,8 +803,9 @@ export default function ReportsAnalytics({ user }) {
       }
       return arr;
     } catch (e) {
-      console.warn("Export re-fetch failed, falling back to in-memory rows:", e);
-      return filteredRecent;
+      console.error("Export re-fetch failed:", e);
+      alert("Export could not load the full dataset — no file was downloaded, to avoid giving you a partial report. Please retry; if it persists, narrow the date range.");
+      throw e;   // never silently ship a truncated file
     }
   }, [fromDate, toDate, branchFilter, productFilter, categoryFilter, view, search, tableStatusFilters, filteredRecent]);
 

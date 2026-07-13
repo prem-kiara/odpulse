@@ -2901,7 +2901,14 @@ app.get("/api/od/disbursements", (req, res) => {
     // small. Export functions on the frontend explicitly request
     // limit=50000 to get the full set when downloading. Hard cap stays
     // at 50000 to protect against absurd payloads.
-    const limit = Math.min(50000, Math.max(100, parseInt(req.query.limit || "5000", 10)));
+    // Record cap. `limit=0` (or a non-positive/invalid value) means NO cap —
+    // return every row matching the filters, with no practical ceiling. A
+    // positive value caps to that many recent rows (legacy callers only).
+    // The table and the export both send limit=0, so they always return the
+    // complete filtered set and their counts match. Absent param keeps a
+    // light 5000 default, used only by the dropdown-options fetches on mount.
+    const _rawLimit = parseInt(req.query.limit || "5000", 10);
+    const limit = (Number.isFinite(_rawLimit) && _rawLimit > 0) ? _rawLimit : Infinity;
 
     const MONTHS = { jan: "01", feb: "02", mar: "03", apr: "04", may: "05", jun: "06",
                      jul: "07", aug: "08", sep: "09", oct: "10", nov: "11", dec: "12" };
