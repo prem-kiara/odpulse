@@ -35,6 +35,27 @@ const num = (v) => {
   return Number.isFinite(n) ? n : 0;
 };
 
+// ── Product-name remap ─────────────────────────────────────────────────
+// Some source product codes have been consolidated in reporting. This map
+// is applied at ingest time so upstream data using the OLD name still
+// lands in the DB under the NEW canonical name. To retire another code
+// in future, add its old → new entry here — no code changes needed
+// downstream.
+//
+//   Daily_Installment → VM_GPL   (Vinnamgudi / Erode-HO daily-instalment
+//                                  book folded into the VM Grameen PL line)
+//   6L_Temp_18_24     → KMCL_STBL (temporary 6L @ 18% p.a. product folded
+//                                   into the STBL family)
+const PRODUCT_NAME_REMAP = {
+  "Daily_Installment": "VM_GPL",
+  "6L_Temp_18_24":     "KMCL_STBL",
+};
+const remapProductName = (v) => {
+  if (v == null) return "";
+  const s = String(v).replace(/^"|"$/g, "").trim();
+  return PRODUCT_NAME_REMAP[s] || s;
+};
+
 const str = (v) => {
   if (v == null) return "";
   return String(v).replace(/^"|"$/g, "").trim();
@@ -303,7 +324,7 @@ function ingestPool(fileContent, opts) {
         date_of_birth: str(r["Date of Birth"]),
         officer_name: str(r["Officer Name"]),
         officer_code: str(r["Officer Employee Number"]),
-        product_name: str(r["Product Name"]),
+        product_name: remapProductName(r["Product Name"]),
         // "Category of Loan" from the Pool Report — values like "Group Loan" /
         // "Individual Loan". Drives the OD Insights Group vs Individual tab split.
         // Fallback: when the Pool export doesn't include this column (older
@@ -543,7 +564,7 @@ function ingestForeclosure(fileContent, opts) {
         customer_name: fcStr(r["CUSTOMER"]),
         branch,
         center_name: fcCenter,
-        product_name: fcStr(r["PRODUCT NAME"]),
+        product_name: remapProductName(r["PRODUCT NAME"]),
         loan_amount: fcNum(r["LOAN AMOUNT"]),
         disbursement_date: fcStr(r["DISBURSEMENT DATE"]),
         last_installment_date: fcStr(r["MATURITY DATE"]),
@@ -563,7 +584,7 @@ function ingestForeclosure(fileContent, opts) {
         center: fcStr(r["CENTER"]),
         customer_number: fcStr(r["CUSTOMER NUMBER"]),
         customer_name: fcStr(r["CUSTOMER"]),
-        product_name: fcStr(r["PRODUCT NAME"]),
+        product_name: remapProductName(r["PRODUCT NAME"]),
         loan_amount: fcNum(r["LOAN AMOUNT"]),
         cycle_number: Math.round(fcNum(r["CYCLE NUMBER"])),
         disbursement_date: fcStr(r["DISBURSEMENT DATE"]),
@@ -1080,7 +1101,7 @@ function ingestClientPeriod(fileContent, opts) {
         center_code: str(r["CENTER CODE"]),
         officer_name: str(r["RELATIONSHIP OFFICER"]),
         officer_code: str(r["EMPLOYEE NUMBER"]),
-        product_name: str(r["PRODUCT NAME"]),
+        product_name: remapProductName(r["PRODUCT NAME"]),
         account_status: str(r["ACCOUNT STATUS"]),
         disbursement_date: toIsoDate(r["DISB DATE"]),
         closing_date: toIsoDate(r["CLOSING DATE"]),
