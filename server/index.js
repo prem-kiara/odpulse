@@ -181,6 +181,42 @@ loadJSON("notifications.json", []);
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 
+// ─── Read-only analytics/metrics response cache ──────────────────────────────
+// The /api/od/metrics/* and /api/od/analytics/* endpoints are pure reads over
+// data that only changes on upload. Several run multi-second full scans, and
+// because better-sqlite3 is synchronous, OD Insights' ~8 parallel calls queue
+// on the event loop so their times ADD UP. Cache each endpoint's JSON for 5 min
+// (same policy the disbursements endpoint already uses) and clear it after any
+// upload. Keyed by full URL, so each filter combination caches independently.
+// Responses are byte-identical within the TTL — no dashboard value changes.
+const _analyticsCache = new Map();
+const ANALYTICS_CACHE_TTL_MS = 5 * 60 * 1000;
+function invalidateAnalyticsCache() { _analyticsCache.clear(); }
+global.invalidateAnalyticsCache = invalidateAnalyticsCache;
+app.use((req, res, next) => {
+  // Any successful upload changes the underlying data — drop cached analytics.
+  if (req.method === "POST" && /\/upload$/.test(req.path)) {
+    res.on("finish", () => {
+      if (res.statusCode >= 200 && res.statusCode < 300) _analyticsCache.clear();
+    });
+    return next();
+  }
+  if (req.method !== "GET") return next();
+  if (!/^\/api\/od\/(metrics|analytics)\//.test(req.path)) return next();
+  const key = req.originalUrl;
+  const hit = _analyticsCache.get(key);
+  if (hit && (Date.now() - hit.at) < ANALYTICS_CACHE_TTL_MS) return res.json(hit.data);
+  const origJson = res.json.bind(res);
+  res.json = (body) => {
+    if (res.statusCode === 200) {
+      if (_analyticsCache.size > 1000) _analyticsCache.clear();
+      _analyticsCache.set(key, { at: Date.now(), data: body });
+    }
+    return origJson(body);
+  };
+  next();
+});
+
 // Per-request timing for /api/od/* endpoints. Logs path + duration +
 // response payload size when the response finishes. Lets us pinpoint
 // which endpoint is slow without sprinkling timers in every handler.
@@ -3055,6 +3091,11 @@ app.get("/api/od/disbursements", (req, res) => {
     // today's book. Respects branch / product / category only. The
     // drill-down feed (principalRecent) is built from the SAME set so the
     // card and the drill-down reconcile exactly.
+    // The drill-down rows (principalRecent) are large (~all outstanding
+    // loans). Only build/serialize them when the client actually opens the
+    // Principal Outstanding view (principal=1). The card VALUE
+    // (principalOutstandingTotal) is a cheap sum and is always computed.
+    const wantPrincipalRows = String(req.query.principal || "") === "1";
     let principalOutstandingTotal = 0;
     const principalRecent = [];
     for (const r of rows) {
@@ -3064,7 +3105,7 @@ app.get("/api/od/disbursements", (req, res) => {
       if (catIndividual && !r.isIndividual) continue;
       if (!(r.principalN > 0)) continue;
       principalOutstandingTotal += r.principalN;
-      if (principalRecent.length < limit) {
+      if (wantPrincipalRows && principalRecent.length < limit) {
         const pStatus = r.is_closed ? "Closed" : r.is_active ? "Active" : "Pending";
         principalRecent.push({
           loan_account_no: r.loan_account_no,

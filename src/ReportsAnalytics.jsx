@@ -577,6 +577,9 @@ export default function ReportsAnalytics({ user }) {
       // and its count reflect the complete filtered set. Pagination stays
       // client-side.
       p.set("limit", "0");
+      // Only pull the heavy Principal Outstanding drill-down feed when that
+      // view is open — keeps every other load light.
+      if (view === "principal") p.set("principal", "1");
       const res = await fetch(`/api/od/disbursements?${p.toString()}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
@@ -780,6 +783,7 @@ export default function ReportsAnalytics({ user }) {
     if (categoryFilter) p.set("category", categoryFilter);
     if (view === "active" || view === "closed" || view === "pending") p.set("status", view);
     p.set("limit", "0");   // 0 = all matching rows, no cap — matches the table
+    if (view === "principal") p.set("principal", "1");
     try {
       const res = await fetch(`/api/od/disbursements?${p.toString()}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
