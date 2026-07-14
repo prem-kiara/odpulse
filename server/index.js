@@ -3048,6 +3048,48 @@ app.get("/api/od/disbursements", (req, res) => {
     const wantProduct = products.size > 0;
     const catGroup = category === "group";
     const catIndividual = category === "individual";
+
+    // ── Principal Outstanding (current book, "till date") ──────────────
+    // Balance as of the latest snapshot. NOT gated by the disbursement date
+    // range — a loan disbursed years ago that is still unpaid is part of
+    // today's book. Respects branch / product / category only. The
+    // drill-down feed (principalRecent) is built from the SAME set so the
+    // card and the drill-down reconcile exactly.
+    let principalOutstandingTotal = 0;
+    const principalRecent = [];
+    for (const r of rows) {
+      if (wantBranch && !branches.has(r.branchLc)) continue;
+      if (wantProduct && !products.has(r.productLc)) continue;
+      if (catGroup && !r.isGroup) continue;
+      if (catIndividual && !r.isIndividual) continue;
+      if (!(r.principalN > 0)) continue;
+      principalOutstandingTotal += r.principalN;
+      if (principalRecent.length < limit) {
+        const pStatus = r.is_closed ? "Closed" : r.is_active ? "Active" : "Pending";
+        principalRecent.push({
+          loan_account_no: r.loan_account_no,
+          customer_number: r.customer_number,
+          customer_name: r.customer_name,
+          branch: r.branch,
+          product_name: r.product_name,
+          loan_category: r.loan_category,
+          disbursement_date_iso: r.iso,
+          loan_amount: r.amountN,
+          principal_outstanding: r.principalN,
+          principal_repaid: Math.max(0, r.amountN - r.principalN),
+          interest_outstanding: r.interestOutN,
+          arrear_amount: r.principalN + r.interestOutN,
+          principal_overdue: r.principalOverdueN,
+          interest_overdue: r.interestOverdueN,
+          overdue_amount: r.overdueN,
+          overdue_days: r.overdueDays,
+          account_dpd_classification: r.dpdClass,
+          portfolio_status: (String(r.dpdClass || "").toUpperCase() === "NPA") ? "NPA" : "Active",
+          status: pStatus,
+        });
+      }
+    }
+
     for (const r of rows) {
       if (from && r.iso < from) continue;
       if (to && r.iso > to) continue;
@@ -3134,7 +3176,8 @@ app.get("/api/od/disbursements", (req, res) => {
         pending: pendingCount,
         // Total current principal outstanding across the filtered set,
         // sourced from the latest pool_snapshots row per loan.
-        principalOutstanding: Math.round(totalPrincipalOutstanding * 100) / 100,
+        // Current book as of latest snapshot; NOT gated by disbursement date.
+        principalOutstanding: Math.round(principalOutstandingTotal * 100) / 100,
         // Overdue loans count and total overdue amount (principal + interest overdue)
         overdue: overdueCount,
         overdueAmount: Math.round(totalOverdueAmount * 100) / 100,
@@ -3148,6 +3191,7 @@ app.get("/api/od/disbursements", (req, res) => {
       byCategory: [...categoryAgg.values()].sort((a, b) => b.total - a.total),
       byMonth,
       recent,
+      principalRecent,
       filters: {
         from, to, category, status, limit,
         branches: [...branches],

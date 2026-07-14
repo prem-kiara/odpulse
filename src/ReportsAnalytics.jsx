@@ -680,6 +680,9 @@ export default function ReportsAnalytics({ user }) {
   const byCategory = data?.byCategory || [];
   const byMonth = data?.byMonth || [];
   const recent = data?.recent || [];
+  // All-date Principal Outstanding feed (drives the principal drill-down so
+  // it matches the date-independent Principal Outstanding card).
+  const principalRecent = data?.principalRecent || [];
 
   // KPI summary — server now filters by raw codes (bucket labels are
   // expanded to their underlying codes before the request), so apiSummary
@@ -712,7 +715,8 @@ export default function ReportsAnalytics({ user }) {
     // the selected statuses. Overdue is special — it's an attribute (not a
     // mutually-exclusive status), so selecting it requires overdue_amount > 0.
     const statusSet = new Set(tableStatusFilters);
-    let arr = recent.filter(r => {
+    const baseRows = view === "principal" ? principalRecent : recent;
+    let arr = baseRows.filter(r => {
       if (principalOnly && (Number(r.principal_outstanding) || 0) <= 0) return false;
       if (statusFilter && r.status !== statusFilter) return false;
       if (statusSet.size > 0) {
@@ -780,7 +784,7 @@ export default function ReportsAnalytics({ user }) {
       const res = await fetch(`/api/od/disbursements?${p.toString()}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
-      let arr = json.recent || [];
+      let arr = (view === "principal" && Array.isArray(json.principalRecent)) ? json.principalRecent : (json.recent || []);
       // Apply the same client-side filters (search, table-status, principal-only)
       const q = search.trim().toLowerCase();
       if (view === "principal") arr = arr.filter(r => (Number(r.principal_outstanding) || 0) > 0);
@@ -1389,7 +1393,7 @@ export default function ReportsAnalytics({ user }) {
         return (
           <SectionCard
             title="Principal Outstanding — current portfolio"
-            subtitle={`${formatINR(totalPrincipal)} across ${formatNum(positiveCount)} loans with positive principal (latest pool snapshot, ${recent.length} loans in current filter)`}
+            subtitle={`${formatINR(totalPrincipal)} across ${formatNum(positiveCount)} loans with positive principal (latest pool snapshot — current book, not filtered by disbursement date)`}
           >
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
               <div className="bg-rose-50 border border-rose-200 rounded-lg p-3">
