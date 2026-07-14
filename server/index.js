@@ -3091,6 +3091,8 @@ app.get("/api/od/disbursements", (req, res) => {
           disbursement_date_iso: r.iso,
           loan_amount: r.amountN,
           principal_outstanding: r.principalN,
+          // Principal Repaid = Disbursed - Principal Outstanding (never negative).
+          principal_repaid: Math.max(0, r.amountN - r.principalN),
           interest_outstanding: r.interestOutN,
           arrear_amount: r.principalN + r.interestOutN,
           principal_overdue: r.principalOverdueN,
@@ -3098,6 +3100,8 @@ app.get("/api/od/disbursements", (req, res) => {
           overdue_amount: r.overdueN,
           overdue_days: r.overdueDays,
           account_dpd_classification: r.dpdClass,
+          // Active / NPA per RBI classification (NPA = 90+ DPD bucket).
+          portfolio_status: (String(r.dpdClass || "").toUpperCase() === "NPA") ? "NPA" : "Active",
           status: rowStatus,
         });
       }

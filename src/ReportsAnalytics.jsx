@@ -824,6 +824,7 @@ export default function ReportsAnalytics({ user }) {
       DisbursementDate: r.disbursement_date_iso || "",
       LoanAmount: r.loan_amount || 0,
       PrincipalOutstanding: r.principal_outstanding || 0,
+      PrincipalRepaid: r.principal_repaid || 0,
       InterestOutstanding: r.interest_outstanding || 0,
       ForeclosureAmount: r.arrear_amount || 0,
       PrincipalOverdue: r.principal_overdue || 0,
@@ -832,6 +833,7 @@ export default function ReportsAnalytics({ user }) {
       DPDDays: r.overdue_days || 0,
       DPDClassification: r.account_dpd_classification || "",
       Status: r.status || "",
+      LoanStatus: r.portfolio_status || "",
     }));
 
   const handleExportCSV = async () => {
@@ -1363,8 +1365,16 @@ export default function ReportsAnalytics({ user }) {
           outstanding (closed) are hidden in the count/avg, but kept in
           the recent table since users may want to see them. */}
       {view === "principal" && (() => {
-        const positives = recent.filter(r => Number(r.principal_outstanding) > 0);
-        const totalPrincipal = Number(summary.principalOutstanding) || 0;
+        // Reconciliation: sum the Principal Outstanding column from the SAME
+        // rows shown in the table (filteredRecent), then compare to the card's
+        // server value. With only dashboard filters (date/branch/product/
+        // category) applied they are identical; a table search/status chip
+        // narrows the shown rows into a subset of the card.
+        const positives = filteredRecent.filter(r => Number(r.principal_outstanding) > 0);
+        const cardTotal = Number(summary.principalOutstanding) || 0;
+        const columnTotal = positives.reduce((s, r) => s + (Number(r.principal_outstanding) || 0), 0);
+        const reconciles = Math.round(columnTotal) === Math.round(cardTotal);
+        const totalPrincipal = columnTotal;
         const positiveCount = positives.length;
         const avgPrincipal = positiveCount > 0
           ? totalPrincipal / positiveCount
@@ -1399,6 +1409,11 @@ export default function ReportsAnalytics({ user }) {
                 <p className="text-sm font-bold text-indigo-700">{formatINR(minPrincipal)} – {formatINR(maxPrincipal)}</p>
               </div>
             </div>
+            <p className={`text-[11px] mb-2 font-medium ${reconciles ? "text-emerald-700" : "text-amber-700"}`}>
+              {reconciles
+                ? `✓ Drill-down column total ${formatINR(columnTotal)} reconciles exactly with the Principal Outstanding card.`
+                : `Showing ${formatINR(columnTotal)} of the card's ${formatINR(cardTotal)} — a table search / status filter is narrowing these rows; clear it to reconcile with the card.`}
+            </p>
             <p className="text-[11px] text-gray-500">
               Closed loans (those with a foreclosure record) contribute Rs. 0 here even when their disbursement appears below.
               The Recent Disbursements table is sorted by principal outstanding (descending) — click any column header to override.
@@ -1672,12 +1687,14 @@ export default function ReportsAnalytics({ user }) {
               <col style={{ width: "110px" }} /> {/* Category */}
               <col style={{ width: "110px" }} /> {/* Amount */}
               <col style={{ width: "120px" }} /> {/* Principal Out. */}
+              <col style={{ width: "120px" }} /> {/* Principal Repaid */}
               <col style={{ width: "120px" }} /> {/* Interest Out. */}
               <col style={{ width: "140px" }} /> {/* Foreclosure Amount */}
               <col style={{ width: "110px" }} /> {/* Overdue */}
               <col style={{ width: "80px" }} />  {/* DPD Days */}
               <col style={{ width: "90px" }} />  {/* DPD Class */}
               <col style={{ width: "90px" }} />  {/* Status */}
+              <col style={{ width: "90px" }} />  {/* Loan Status */}
             </colgroup>
             <thead>
               <tr>
@@ -1689,17 +1706,19 @@ export default function ReportsAnalytics({ user }) {
                 <SortHeader sortKey="loan_category" currentKey={sortKey} currentDir={sortDir} onSort={handleSort}>Category</SortHeader>
                 <SortHeader sortKey="loan_amount" currentKey={sortKey} currentDir={sortDir} onSort={handleSort} align="right">Amount</SortHeader>
                 <SortHeader sortKey="principal_outstanding" currentKey={sortKey} currentDir={sortDir} onSort={handleSort} align="right">Principal Out.</SortHeader>
+                <SortHeader sortKey="principal_repaid" currentKey={sortKey} currentDir={sortDir} onSort={handleSort} align="right">Principal Repaid</SortHeader>
                 <SortHeader sortKey="interest_outstanding" currentKey={sortKey} currentDir={sortDir} onSort={handleSort} align="right">Interest Out.</SortHeader>
                 <SortHeader sortKey="arrear_amount" currentKey={sortKey} currentDir={sortDir} onSort={handleSort} align="right">Foreclosure Amount</SortHeader>
                 <SortHeader sortKey="overdue_amount" currentKey={sortKey} currentDir={sortDir} onSort={handleSort} align="right">Overdue</SortHeader>
                 <SortHeader sortKey="overdue_days" currentKey={sortKey} currentDir={sortDir} onSort={handleSort} align="right">DPD Days</SortHeader>
                 <SortHeader sortKey="account_dpd_classification" currentKey={sortKey} currentDir={sortDir} onSort={handleSort}>DPD Class</SortHeader>
                 <SortHeader sortKey="status" currentKey={sortKey} currentDir={sortDir} onSort={handleSort}>Status</SortHeader>
+                <SortHeader sortKey="portfolio_status" currentKey={sortKey} currentDir={sortDir} onSort={handleSort}>Loan Status</SortHeader>
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-100">
               {filteredRecent.length === 0 ? (
-                <tr><td colSpan={14} className="px-3 py-6 text-center text-gray-400">No disbursements match the current filters.</td></tr>
+                <tr><td colSpan={16} className="px-3 py-6 text-center text-gray-400">No disbursements match the current filters.</td></tr>
               ) : (
                 recentPg.pageRows.map((r) => (
                   <tr key={r.loan_account_no} className="hover:bg-gray-50">
@@ -1741,6 +1760,10 @@ export default function ReportsAnalytics({ user }) {
                     <td className={`px-3 py-2 text-right font-medium ${(Number(r.principal_outstanding) || 0) > 0 ? "text-rose-700" : "text-gray-400"}`}>
                       {(Number(r.principal_outstanding) || 0) > 0 ? formatINR(r.principal_outstanding) : "—"}
                     </td>
+                    {/* Principal Repaid = Disbursed - Principal Outstanding. */}
+                    <td className={`px-3 py-2 text-right font-medium ${(Number(r.principal_repaid) || 0) > 0 ? "text-emerald-700" : "text-gray-400"}`}>
+                      {(Number(r.principal_repaid) || 0) > 0 ? formatINR(r.principal_repaid) : "—"}
+                    </td>
                     {/* Interest Outstanding — accumulated interest balance
                         from the latest pool snapshot. */}
                     <td className={`px-3 py-2 text-right font-medium ${(Number(r.interest_outstanding) || 0) > 0 ? "text-indigo-700" : "text-gray-400"}`}>
@@ -1776,6 +1799,12 @@ export default function ReportsAnalytics({ user }) {
                         : r.status === "Active" ? "bg-emerald-100 text-emerald-700"
                         : "bg-amber-100 text-amber-700"
                       }`}>{r.status}</span>
+                    </td>
+                    {/* Loan Status (Active / NPA) - NPA when RBI classification is NPA (90+ DPD). */}
+                    <td className="px-3 py-2">
+                      <span className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${
+                        r.portfolio_status === "NPA" ? "bg-red-100 text-red-700" : "bg-emerald-100 text-emerald-700"
+                      }`}>{r.portfolio_status || "—"}</span>
                     </td>
                   </tr>
                 ))
