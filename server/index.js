@@ -1440,6 +1440,74 @@ app.post("/api/od/client-period/upload", requireUploader, uploadField("file"), (
   }
 });
 
+// ───────────────────────────────────────────────────────────────────────────
+// Loan closure resolution — "is this loan ACTUALLY closed right now?"
+//
+// Root cause this solves: foreclosure_snapshots is an append-only log of
+// closure EVENTS, never of retractions. The old rule was "a foreclosure row
+// exists anywhere in history ⇒ Closed, forever". That breaks the moment the
+// core system reverses a closure — a cancelled foreclosure, a closure keyed to
+// the wrong account, a loan re-opened after a reversal. The core system never
+// sends us a retraction; the loan simply reappears in the next daily Pool
+// Report as a live, overdue account. OD Pulse kept calling it CLOSED off the
+// months-old foreclosure row (tell-tale signature: closing principal Rs 0 and
+// interest collected Rs 0, i.e. no money actually moved at "closure") while
+// the OD tiles kept quoting a live foreclosure amount from the pool snapshot —
+// the exact contradiction reported on loan 1523035753, an SMA-2/NPA account
+// with Rs 3,281 principal outstanding shown as CLOSED off a 15-May-2026 row.
+//
+// Correct rule — the latest Pool Report IS the live book, so it wins:
+//   1. no foreclosure row at all                  → not closed (unchanged)
+//   2. foreclosure newer than the pool we hold    → closed (upload lag: the
+//      closure happened after the pool report was generated)
+//   3. loan absent from the latest pool snapshot  → closed (it dropped out of
+//      the book, which is what a real closure looks like)
+//   4. loan present in the latest pool snapshot   → closed ONLY if the pool
+//      itself says so. A live 'Current'/overdue row means the closure was
+//      reversed and this loan is still recoverable.
+// ───────────────────────────────────────────────────────────────────────────
+const INACTIVE_LOAN_STATUSES = new Set([
+  "closed", "written off", "writtenoff", "write off", "writeoff",
+  "settled", "foreclosed", "pre closed", "preclosed",
+]);
+
+function poolStatusIsInactive(status) {
+  return INACTIVE_LOAN_STATUSES.has(String(status || "").trim().toLowerCase());
+}
+
+// All args optional except hasForeclosure. Missing dates degrade safely to the
+// old "foreclosure wins" behaviour, so a stale/absent pool upload can never
+// flip genuinely-closed loans back to active.
+function resolveIsClosed({
+  hasForeclosure,
+  foreclosureSnapshotDate = null,
+  latestPoolDate = null,
+  inLatestPool = false,
+  poolLoanStatus = "",
+}) {
+  if (!hasForeclosure) return false;                                   // (1)
+  if (foreclosureSnapshotDate && latestPoolDate &&
+      foreclosureSnapshotDate >= latestPoolDate) return true;          // (2)
+  if (!inLatestPool) return true;                                      // (3)
+  return poolStatusIsInactive(poolLoanStatus);                         // (4)
+}
+
+// Latest pool snapshot date. Every closure check needs it and it only changes
+// on upload, so memoise it briefly rather than re-running MAX() per request.
+let _latestPoolDateCache = null;
+let _latestPoolDateAt = 0;
+const LATEST_POOL_DATE_TTL_MS = 30_000;
+function latestPoolSnapshotDate() {
+  const now = Date.now();
+  if (_latestPoolDateCache !== null && now - _latestPoolDateAt < LATEST_POOL_DATE_TTL_MS) {
+    return _latestPoolDateCache;
+  }
+  _latestPoolDateCache =
+    db.prepare("SELECT MAX(snapshot_date) AS d FROM pool_snapshots").get()?.d || null;
+  _latestPoolDateAt = now;
+  return _latestPoolDateCache;
+}
+
 // GET /api/od/customer-lookup?loanAccountNo=...  (or customerId=...)
 app.get("/api/od/customer-lookup", (req, res) => {
   const loan = String(req.query.loanAccountNo || "").trim();
@@ -1460,15 +1528,26 @@ app.get("/api/od/customer-lookup", (req, res) => {
   const latestAccrued = db.prepare(
     "SELECT * FROM accrued_snapshots WHERE loan_account_no = ? ORDER BY snapshot_date DESC LIMIT 1"
   ).get(lookupLoan);
-  // Foreclosure / closed-loan record. Foreclosed-wins rule: if a row exists
-  // here, the loan is treated as Closed regardless of pool snapshot status.
+  // Foreclosure / closed-loan record. A row here is a closure EVENT, not proof
+  // the loan is closed today — see resolveIsClosed.
   const latestForeclosure = db.prepare(
     "SELECT * FROM foreclosure_snapshots WHERE loan_account_no = ? ORDER BY snapshot_date DESC LIMIT 1"
   ).get(lookupLoan);
 
   if (!customer && !latestPool && !latestAccrued && !latestForeclosure) return res.json({ found: false });
 
-  const isClosed = !!latestForeclosure;
+  const currentPoolDate = latestPoolSnapshotDate();
+  const isClosed = resolveIsClosed({
+    hasForeclosure: !!latestForeclosure,
+    foreclosureSnapshotDate: latestForeclosure?.snapshot_date || null,
+    latestPoolDate: currentPoolDate,
+    inLatestPool: !!latestPool && !!currentPoolDate && latestPool.snapshot_date === currentPoolDate,
+    poolLoanStatus: latestPool?.loan_status,
+  });
+  // Closure on record, but the loan is back in the live book → the closure was
+  // reversed/cancelled. Surfaced so the UI can explain the history instead of
+  // silently dropping it.
+  const closureSuperseded = !!latestForeclosure && !isClosed;
   const principalOutstanding = latestPool?.principal_outstanding ?? 0;
   const accruedInterest = latestAccrued?.accrued_interest ?? 0;
   const unpaidInterest = latestPool?.interest_overdue ?? 0; // "Interest OverDue" per user
@@ -1483,6 +1562,7 @@ app.get("/api/od/customer-lookup", (req, res) => {
     accrued: latestAccrued || null,
     foreclosure: latestForeclosure || null,
     isClosed,
+    closureSuperseded,
     loanStatus,
     principalOutstanding,
     accruedInterest,
@@ -3004,8 +3084,10 @@ app.get("/api/od/disbursements", (req, res) => {
           c.loan_account_no, c.customer_number, c.customer_name,
           c.branch, c.product_name, c.loan_category,
           c.disbursement_date, c.loan_amount,
-          EXISTS(SELECT 1 FROM foreclosure_snapshots f WHERE f.loan_account_no = c.loan_account_no) AS is_closed,
+          (SELECT MAX(f.snapshot_date) FROM foreclosure_snapshots f
+            WHERE f.loan_account_no = c.loan_account_no) AS fc_snapshot_date,
           CASE WHEN lp.loan_account_no IS NULL THEN 0 ELSE 1 END AS is_active,
+          COALESCE(lp.loan_status, '') AS loan_status,
           COALESCE(lp.principal_outstanding, 0) AS principal_outstanding,
           COALESCE(lp.interest_outstanding, 0) AS interest_outstanding,
           COALESCE(lp.principal_overdue, 0) AS principal_overdue,
@@ -3030,6 +3112,18 @@ app.get("/api/od/disbursements", (req, res) => {
         const cat = String(r.loan_category || "").toUpperCase();
         rows.push({
           ...r,
+          // Resolved here rather than in SQL: a historic foreclosure row does
+          // not make a loan closed if it is still in the latest pool snapshot
+          // as an active account (reversed closure). Was previously a bare
+          // EXISTS(), which permanently misfiled such loans as Closed and
+          // undercounted the active book.
+          is_closed: resolveIsClosed({
+            hasForeclosure: !!r.fc_snapshot_date,
+            foreclosureSnapshotDate: r.fc_snapshot_date || null,
+            latestPoolDate,
+            inLatestPool: !!r.is_active,
+            poolLoanStatus: r.loan_status,
+          }) ? 1 : 0,
           iso,
           ym: iso.slice(0, 7),
           branchLc: String(r.branch || "").toLowerCase(),
@@ -3452,7 +3546,10 @@ const POOL_JOIN = `
     f.total_interest_collected AS fc_total_interest_collected,
     f.interest_collected       AS fc_interest_collected,
     f.penalty_collected        AS fc_penalty_collected,
-    f.maturity_date            AS fc_maturity_date
+    f.maturity_date            AS fc_maturity_date,
+    -- Constant scalar subquery (evaluated once): lets mapPoolRow tell whether
+    -- p.snapshot_date IS the live book or a stale pre-closure snapshot.
+    (SELECT MAX(snapshot_date) FROM pool_snapshots) AS latest_pool_date
   FROM customers c
   LEFT JOIN pool_snapshots p
     ON p.loan_account_no = c.loan_account_no
@@ -3469,9 +3566,16 @@ const POOL_JOIN = `
 `;
 
 function mapPoolRow(r) {
-  // Foreclosed-wins rule: if a foreclosure snapshot exists for this loan, the
-  // loan is Closed regardless of whatever pool says.
-  const isClosed = !!r.fc_snapshot_date;
+  // A foreclosure snapshot is a closure EVENT; the latest pool snapshot is the
+  // live book. If the loan is still in that book as an active row, the closure
+  // was reversed and this loan is NOT closed. See resolveIsClosed.
+  const isClosed = resolveIsClosed({
+    hasForeclosure: !!r.fc_snapshot_date,
+    foreclosureSnapshotDate: r.fc_snapshot_date || null,
+    latestPoolDate: r.latest_pool_date || null,
+    inLatestPool: !!r.snapshot_date && !!r.latest_pool_date && r.snapshot_date === r.latest_pool_date,
+    poolLoanStatus: r.loan_status,
+  });
   return {
     loanNumber:             r.loan_account_no || "",
     customerNumber:         r.customer_number || "",
@@ -3492,6 +3596,8 @@ function mapPoolRow(r) {
     // Authoritative status — Closed wins over pool's loan_status.
     loanStatus:             isClosed ? "Closed" : (r.loan_status || ""),
     isClosed,
+    // Foreclosure on record but the loan is live again (reversed closure).
+    closureSuperseded:      !!r.fc_snapshot_date && !isClosed,
     accountDPD:             isClosed ? "" : (r.account_dpd_classification || ""),
     customerDPD:            isClosed ? 0 : (Number(r.customer_dpd) || 0),
     customerDPDClass:       isClosed ? "" : (r.customer_dpd_classification || ""),
@@ -3696,7 +3802,10 @@ app.get("/api/customers/loans", (req, res) => {
         f.penalty_collected        AS fc_penalty_collected,
         f.maturity_date            AS fc_maturity_date,
         f.center                   AS fc_center,
-        f.product_name             AS fc_product_name
+        f.product_name             AS fc_product_name,
+        -- Non-null only when the loan is in the LATEST pool snapshot, i.e. it
+        -- is still on the live book. Drives the reversed-closure check below.
+        p.loan_account_no          AS pool_loan_account_no
       FROM customers c
       LEFT JOIN pool_snapshots p
         ON p.loan_account_no = c.loan_account_no AND p.snapshot_date = ?
@@ -3711,18 +3820,25 @@ app.get("/api/customers/loans", (req, res) => {
       WHERE c.customer_number IN (${placeholders})
     `).all(latestPool || "", latestAccrued || "", ...customerNumbers);
 
-    const INACTIVE_STATUSES = new Set(["Closed", "Written Off", "Settled", "CLOSED", "WRITTEN OFF", "SETTLED"]);
     const loans = rows
-      // Foreclosed-wins: keep loans that have a foreclosure record (we'll
-      // surface them as Closed). Drop only legacy pool-marked-closed loans
+      // Keep loans that have a foreclosure record (we'll surface them with
+      // their resolved status). Drop only legacy pool-marked-closed loans
       // that have NO foreclosure record.
       .filter(r => {
-        const poolClosed = INACTIVE_STATUSES.has((r.loan_status || "").trim());
+        const poolClosed = poolStatusIsInactive(r.loan_status);
         const isForeclosed = !!r.fc_snapshot_date;
         return !poolClosed || isForeclosed;
       })
       .map(r => {
-        const isClosed = !!r.fc_snapshot_date;
+        // A foreclosure row alone is not closure — if the loan is still in the
+        // latest pool snapshot as an active account, the closure was reversed.
+        const isClosed = resolveIsClosed({
+          hasForeclosure: !!r.fc_snapshot_date,
+          foreclosureSnapshotDate: r.fc_snapshot_date || null,
+          latestPoolDate: latestPool || null,
+          inLatestPool: !!r.pool_loan_account_no,
+          poolLoanStatus: r.loan_status,
+        });
         const po = Number(r.principal_outstanding) || 0;
         const ai = Number(r.accrued_interest) || 0;
         const ui = Number(r.interest_overdue) || 0;
@@ -3748,6 +3864,8 @@ app.get("/api/customers/loans", (req, res) => {
           // Authoritative loan status — Closed wins over pool's loan_status.
           loanStatus: isClosed ? "Closed" : (r.loan_status || ""),
           isClosed,
+          // Foreclosure on record but the loan is live again (reversed closure).
+          closureSuperseded: !!r.fc_snapshot_date && !isClosed,
           dpdClassification: r.account_dpd_classification || "",
           accruedInterest: ai,
           foreclosureValue: po + ui + ai,

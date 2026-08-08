@@ -201,7 +201,7 @@ export function CustomerInfoPanel({ loanAccountNo, customerId, compact = false, 
 
   if (!data) return null;
 
-  const { customer, pool, accrued, foreclosure, isClosed, loanStatus, principalOutstanding, accruedInterest, unpaidInterest, foreclosureValue, poolSnapshotDate, accruedSnapshotDate, foreclosureSnapshotDate } = data;
+  const { customer, pool, accrued, foreclosure, isClosed, closureSuperseded, loanStatus, principalOutstanding, accruedInterest, unpaidInterest, foreclosureValue, poolSnapshotDate, accruedSnapshotDate, foreclosureSnapshotDate } = data;
 
   // ─── Track local recoveries (OD Pulse PTP / collection payments) ──────────
   // The pool / accrued / foreclosure snapshots above come from the bank's
@@ -253,6 +253,25 @@ export function CustomerInfoPanel({ loanAccountNo, customerId, compact = false, 
             : `Pool: ${poolSnapshotDate ? formatDateDMY(poolSnapshotDate) : "—"} · Accrued: ${accruedSnapshotDate ? formatDateDMY(accruedSnapshotDate) : "—"}`}
         </span>
       </div>
+
+      {/* Reversed / cancelled closure. The source system recorded a closure for
+          this loan, but the latest Pool Report still carries it as a live
+          account — so it is treated as OPEN and remains recoverable. Surfaced
+          rather than hidden so recovery staff can see the closure history and
+          don't assume the record is wrong. */}
+      {closureSuperseded && (
+        <div className="flex items-start gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2">
+          <span className="text-[10px] font-bold text-amber-900 bg-amber-200 px-1.5 py-0.5 rounded shrink-0 mt-px">
+            CLOSURE REVERSED
+          </span>
+          <span className="text-[11px] text-amber-900 leading-relaxed">
+            A closure was recorded on <b>{foreclosure?.closed_date || "—"}</b>
+            {foreclosure?.closure_type ? ` (${foreclosure.closure_type})` : ""}, but this loan is
+            still live in the {poolSnapshotDate ? formatDateDMY(poolSnapshotDate) : "latest"} Pool
+            Report. Treating it as <b>open and recoverable</b> — the outstanding below is current.
+          </span>
+        </div>
+      )}
 
       {/* 4 core values — can be hidden by caller if shown elsewhere as form fields.
           Closed loans get closure-relevant numbers instead of misleading zero
