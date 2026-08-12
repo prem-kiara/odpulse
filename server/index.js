@@ -1548,9 +1548,28 @@ app.get("/api/od/customer-lookup", (req, res) => {
   // reversed/cancelled. Surfaced so the UI can explain the history instead of
   // silently dropping it.
   const closureSuperseded = !!latestForeclosure && !isClosed;
-  const principalOutstanding = latestPool?.principal_outstanding ?? 0;
-  const accruedInterest = latestAccrued?.accrued_interest ?? 0;
-  const unpaidInterest = latestPool?.interest_overdue ?? 0; // "Interest OverDue" per user
+
+  // A closed loan owes nothing — its OD figures MUST be zero.
+  //
+  // These come from the loan's most recent pool/accrued snapshot, which for a
+  // closed loan is the LAST REPORT BEFORE IT CLOSED: the loan drops out of the
+  // book afterwards, so that stale row is frozen at the pre-closure balance and
+  // never updates again. Serving it raw made a settled loan quote a live
+  // foreclosure amount forever (loan 7306143576: closed 3-Aug-2026, but the
+  // 3-Aug pool row still showed Rs 2,064 principal / Rs 2,112 foreclosure —
+  // exactly the closing principal that was settled at closure).
+  //
+  // mapPoolRow has always applied this gate; this endpoint did not, so the two
+  // disagreed on the same screen — the group members table showed the loan as
+  // Closed with Rs 0 OD while the OD Snapshot tiles above it quoted Rs 2,112.
+  // Closure facts (closing principal, interest collected) stay available on the
+  // `foreclosure` object for the closed-loan panel to display.
+  const rawPrincipalOutstanding = latestPool?.principal_outstanding ?? 0;
+  const rawAccruedInterest = latestAccrued?.accrued_interest ?? 0;
+  const rawUnpaidInterest = latestPool?.interest_overdue ?? 0; // "Interest OverDue" per user
+  const principalOutstanding = isClosed ? 0 : rawPrincipalOutstanding;
+  const accruedInterest = isClosed ? 0 : rawAccruedInterest;
+  const unpaidInterest = isClosed ? 0 : rawUnpaidInterest;
   const foreclosureValue = principalOutstanding + accruedInterest + unpaidInterest;
   // Authoritative status: Closed wins over whatever pool says.
   const loanStatus = isClosed ? "Closed" : (latestPool?.loan_status || "");
@@ -3839,9 +3858,12 @@ app.get("/api/customers/loans", (req, res) => {
           inLatestPool: !!r.pool_loan_account_no,
           poolLoanStatus: r.loan_status,
         });
-        const po = Number(r.principal_outstanding) || 0;
-        const ai = Number(r.accrued_interest) || 0;
-        const ui = Number(r.interest_overdue) || 0;
+        // Closed loans owe nothing. Their pool/accrued rows are frozen at the
+        // last pre-closure snapshot, so serving them raw quotes a balance that
+        // was already settled. Mirrors mapPoolRow's long-standing gate.
+        const po = isClosed ? 0 : (Number(r.principal_outstanding) || 0);
+        const ai = isClosed ? 0 : (Number(r.accrued_interest) || 0);
+        const ui = isClosed ? 0 : (Number(r.interest_overdue) || 0);
         return {
           loanAccountNo: r.loan_account_no || "",
           customerNumber: r.customer_number || "",
@@ -3855,18 +3877,18 @@ app.get("/api/customers/loans", (req, res) => {
           disbursementDate: r.disbursement_date || "",
           lastPaymentDate: r.last_payment_date || "",
           principalOutstanding: po,
-          interestOutstanding: Number(r.interest_outstanding) || 0,
-          principalOverdue: Number(r.principal_overdue) || 0,
+          interestOutstanding: isClosed ? 0 : (Number(r.interest_outstanding) || 0),
+          principalOverdue: isClosed ? 0 : (Number(r.principal_overdue) || 0),
           interestOverdue: ui,
-          currentOD: Number(r.current_od) || 0,
-          overdueDays: Number(r.overdue_days) || 0,
-          customerDPD: Number(r.customer_dpd) || 0,
+          currentOD: isClosed ? 0 : (Number(r.current_od) || 0),
+          overdueDays: isClosed ? 0 : (Number(r.overdue_days) || 0),
+          customerDPD: isClosed ? 0 : (Number(r.customer_dpd) || 0),
           // Authoritative loan status — Closed wins over pool's loan_status.
           loanStatus: isClosed ? "Closed" : (r.loan_status || ""),
           isClosed,
           // Foreclosure on record but the loan is live again (reversed closure).
           closureSuperseded: !!r.fc_snapshot_date && !isClosed,
-          dpdClassification: r.account_dpd_classification || "",
+          dpdClassification: isClosed ? "" : (r.account_dpd_classification || ""),
           accruedInterest: ai,
           foreclosureValue: po + ui + ai,
           // Closure details (null/empty for active loans).

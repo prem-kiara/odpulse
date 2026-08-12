@@ -982,9 +982,35 @@ function EntryForm({ user, branches, entries, setEntries, setPage }) {
         <div className="flex items-center justify-between mb-4">
           <h3 className="text-sm font-semibold text-teal-700 uppercase tracking-wide">OD Snapshot (auto)</h3>
           <span className="text-[11px] text-gray-400">
-            {odSnap ? `As of ${odSnap.poolSnapshotDate || "—"}${odSnap.accruedSnapshotDate ? ` · Accrued ${odSnap.accruedSnapshotDate}` : ""}` : "Enter Loan A/C or Customer ID to look up"}
+            {!odSnap
+              ? "Enter Loan A/C or Customer ID to look up"
+              : odSnap.isClosed
+                /* For a closed loan the pool date is the last PRE-closure
+                   snapshot — showing it as "As of" implies a live balance. */
+                ? `Closed on: ${odSnap.foreclosure?.closed_date || "—"}`
+                : `As of ${odSnap.poolSnapshotDate || "—"}${odSnap.accruedSnapshotDate ? ` · Accrued ${odSnap.accruedSnapshotDate}` : ""}`}
           </span>
         </div>
+
+        {/* Loan is closed — nothing is outstanding. The tiles below read zero
+            (the server zeroes them), so state plainly why, and surface the
+            closure facts that DO matter instead of a misleading balance. */}
+        {odSnap?.isClosed && (
+          <div className="mb-4 rounded-lg border border-gray-300 bg-gray-50 px-3 py-2.5">
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="text-[10px] font-bold text-gray-700 bg-gray-200 px-1.5 py-0.5 rounded">LOAN CLOSED</span>
+              <span className="text-xs text-gray-700">
+                Settled on <b>{odSnap.foreclosure?.closed_date || "—"}</b>
+                {odSnap.foreclosure?.closure_type ? ` · ${odSnap.foreclosure.closure_type}` : ""}
+                {" "}— nothing outstanding, no foreclosure amount due.
+              </span>
+            </div>
+            <div className="text-[11px] text-gray-500 mt-1">
+              Closing principal {formatINR(odSnap.foreclosure?.closing_principal)} · Interest collected{" "}
+              {formatINR(odSnap.foreclosure?.total_interest_collected)}
+            </div>
+          </div>
+        )}
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Principal Outstanding</label>
@@ -2047,9 +2073,35 @@ function IndividualEntryForm({ user, branches, entries, setEntries, setPage }) {
         <div className="flex items-center justify-between mb-4">
           <h3 className="text-sm font-semibold text-indigo-700 uppercase tracking-wide">OD Snapshot (auto)</h3>
           <span className="text-[11px] text-gray-400">
-            {odSnap ? `As of ${odSnap.poolSnapshotDate || "—"}${odSnap.accruedSnapshotDate ? ` · Accrued ${odSnap.accruedSnapshotDate}` : ""}` : "Enter Loan A/C or Customer ID to look up"}
+            {!odSnap
+              ? "Enter Loan A/C or Customer ID to look up"
+              : odSnap.isClosed
+                /* For a closed loan the pool date is the last PRE-closure
+                   snapshot — showing it as "As of" implies a live balance. */
+                ? `Closed on: ${odSnap.foreclosure?.closed_date || "—"}`
+                : `As of ${odSnap.poolSnapshotDate || "—"}${odSnap.accruedSnapshotDate ? ` · Accrued ${odSnap.accruedSnapshotDate}` : ""}`}
           </span>
         </div>
+
+        {/* Loan is closed — nothing is outstanding. The tiles below read zero
+            (the server zeroes them), so state plainly why, and surface the
+            closure facts that DO matter instead of a misleading balance. */}
+        {odSnap?.isClosed && (
+          <div className="mb-4 rounded-lg border border-gray-300 bg-gray-50 px-3 py-2.5">
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="text-[10px] font-bold text-gray-700 bg-gray-200 px-1.5 py-0.5 rounded">LOAN CLOSED</span>
+              <span className="text-xs text-gray-700">
+                Settled on <b>{odSnap.foreclosure?.closed_date || "—"}</b>
+                {odSnap.foreclosure?.closure_type ? ` · ${odSnap.foreclosure.closure_type}` : ""}
+                {" "}— nothing outstanding, no foreclosure amount due.
+              </span>
+            </div>
+            <div className="text-[11px] text-gray-500 mt-1">
+              Closing principal {formatINR(odSnap.foreclosure?.closing_principal)} · Interest collected{" "}
+              {formatINR(odSnap.foreclosure?.total_interest_collected)}
+            </div>
+          </div>
+        )}
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">Principal Outstanding</label>

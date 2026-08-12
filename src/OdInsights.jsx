@@ -353,8 +353,11 @@ export function CustomerInfoPanel({ loanAccountNo, customerId, compact = false, 
         </div>
       )}
 
-      {/* DPD classification badges */}
-      {pool && (
+      {/* DPD classification badges. Hidden for closed loans: `pool` is the last
+          PRE-CLOSURE snapshot, so it still reads "Status: Current" with a live
+          DPD and bucket long after the loan was settled. The closure panel
+          above already carries the authoritative facts. */}
+      {pool && !isClosed && (
         <div className="flex flex-wrap items-center gap-2 text-xs">
           {pool.overdue_days != null && (
             <span className={`px-2 py-0.5 rounded-full font-medium ${pool.overdue_days > 90 ? "bg-red-100 text-red-700" : pool.overdue_days > 30 ? "bg-amber-100 text-amber-700" : pool.overdue_days > 0 ? "bg-yellow-100 text-yellow-700" : "bg-green-100 text-green-700"}`}>
