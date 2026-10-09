@@ -11,8 +11,12 @@ const db = require("./db");
 const { ingestPool, ingestAccrued, ingestOverdue, ingestCollections, ingestClientPeriod, ingestForeclosure, purgeOldSnapshots, rollupMonthlySnapshots } = require("./ingest");
 
 const app = express();
-const PORT = 3001;
-const DATA_DIR = path.join(__dirname, "data");
+// OD_PORT / OD_DATA_DIR exist so the auth test can start a throwaway instance
+// (its own port, its own data directory) instead of swapping the live
+// users.json. Deliberately NOT the usual "PORT", which some environments set
+// ambiently — nginx expects 3001 and that must not move by accident.
+const PORT = Number(process.env.OD_PORT) || 3001;
+const DATA_DIR = process.env.OD_DATA_DIR || path.join(__dirname, "data");
 const UPLOAD_TMP_DIR = path.join(__dirname, "uploads");
 const BRANCHES_FILE = path.join(DATA_DIR, "branches.json");
 const RETENTION_DAYS = 90;
@@ -34,17 +38,24 @@ const DEFAULT_BRANCHES = [
   "shiva guru"
 ];
 
+// First-boot seed ONLY (production's users.json already exists, so this is not
+// used there). These rows deliberately carry NO password: until 2026-10-09 they
+// shipped "admin123" and nine copies of "Dhanam@123" — the very passwords that
+// were stolen on 2026-10-08 — so a fresh install recreated accounts an intruder
+// could already open. An account with no credential cannot be signed into;
+// ensureAdminPassword below gives the admin one, and the admin creates the rest
+// (each gets a one-time temporary password).
 const DEFAULT_USERS = [
-  { id: "admin", username: "admin", password: "admin123", role: "admin", name: "Administrator", branch: "Head Office", active: true, mustChangePassword: false },
-  { id: "u_vijila", username: "vijila", password: "Dhanam@123", role: "staff", name: "Vijila", branch: "", active: true, mustChangePassword: true },
-  { id: "u_padmapriya", username: "padmapriya", password: "Dhanam@123", role: "staff", name: "Padmapriya", branch: "", active: true, mustChangePassword: true },
-  { id: "u_sasikala", username: "sasikala", password: "Dhanam@123", role: "staff", name: "Sasikala", branch: "", active: true, mustChangePassword: true },
-  { id: "u_kaviya", username: "kaviya", password: "Dhanam@123", role: "staff", name: "Kaviya", branch: "", active: true, mustChangePassword: true },
-  { id: "u_sandhiya", username: "sandhiya", password: "Dhanam@123", role: "staff", name: "Sandhiya", branch: "", active: true, mustChangePassword: true },
-  { id: "u_poongodi", username: "poongodi", password: "Dhanam@123", role: "staff", name: "Poongodi", branch: "", active: true, mustChangePassword: true },
-  { id: "u_kersiyal", username: "kersiyal", password: "Dhanam@123", role: "staff", name: "Kersiyal", branch: "", active: true, mustChangePassword: true },
-  { id: "u_maheshwari", username: "maheshwari", password: "Dhanam@123", role: "staff", name: "Maheshwari", branch: "", active: true, mustChangePassword: true },
-  { id: "u_dinesh", username: "dinesh", password: "Dhanam@123", role: "elevated_staff", name: "Dinesh", branch: "Head Office", active: true, mustChangePassword: true },
+  { id: "admin", username: "admin", role: "admin", name: "Administrator", branch: "Head Office", active: true, mustChangePassword: false },
+  { id: "u_vijila", username: "vijila", role: "staff", name: "Vijila", branch: "", active: true, mustChangePassword: true },
+  { id: "u_padmapriya", username: "padmapriya", role: "staff", name: "Padmapriya", branch: "", active: true, mustChangePassword: true },
+  { id: "u_sasikala", username: "sasikala", role: "staff", name: "Sasikala", branch: "", active: true, mustChangePassword: true },
+  { id: "u_kaviya", username: "kaviya", role: "staff", name: "Kaviya", branch: "", active: true, mustChangePassword: true },
+  { id: "u_sandhiya", username: "sandhiya", role: "staff", name: "Sandhiya", branch: "", active: true, mustChangePassword: true },
+  { id: "u_poongodi", username: "poongodi", role: "staff", name: "Poongodi", branch: "", active: true, mustChangePassword: true },
+  { id: "u_kersiyal", username: "kersiyal", role: "staff", name: "Kersiyal", branch: "", active: true, mustChangePassword: true },
+  { id: "u_maheshwari", username: "maheshwari", role: "staff", name: "Maheshwari", branch: "", active: true, mustChangePassword: true },
+  { id: "u_dinesh", username: "dinesh", role: "elevated_staff", name: "Dinesh", branch: "Head Office", active: true, mustChangePassword: true },
 ];
 
 const DEFAULT_CONFIG = { companyName: "OD Pulse - MFI Recovery Tracker", allowStaffEdit: false, allowStaffDelete: false, staffSeeAllBranches: false, odInsightsAccessUserIds: [], odUploadAccessUserIds: [] };
@@ -137,11 +148,11 @@ loadJSON("notifications.json", []);
 //     intentionally, and even then they should never lock everyone out).
 //   • If the admin user exists but role !== "admin" → restore role to admin.
 //   • Password is INTENTIONALLY NOT touched. If the admin changed their
-//     password legitimately, this preserves that change. If the password
-//     was forgotten, the only fix is to edit users.json directly on the
-//     server (e.g. `node -e 'const fs=require("fs"); const p="data/users.json";
-//     const u=JSON.parse(fs.readFileSync(p)); u.find(x=>x.id==="admin").password
-//     ="admin123"; fs.writeFileSync(p, JSON.stringify(u, null, 2));'`).
+//     password legitimately, this preserves that change. If the admin password
+//     is forgotten, set OD_ADMIN_PASSWORD in the environment and restart — the
+//     startup step below applies it. (Editing users.json by hand no longer
+//     works the way the old note said: sign-in reads the scrypt hash in
+//     passwordHash, so a plaintext `password` written back is ignored.)
 (function ensureAdminUser() {
   try {
     const current = loadJSON("users.json", DEFAULT_USERS);
@@ -180,6 +191,150 @@ loadJSON("notifications.json", []);
 // ─── Middleware ──────────────────────────────────────────────────────────────
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
+
+// ─── Authentication ─────────────────────────────────────────────────────────
+// Added 2026-10-09. Until today this API had NO authentication of any kind.
+// Anything that could reach port 3001 could read every OD entry and the whole
+// staff list WITH PLAINTEXT PASSWORDS, and could overwrite any collection. On
+// 2026-10-08 an outside address did exactly that.
+//
+// attachSession reads the signed cookie; requireSession then stands in front of
+// EVERY /api route in this file — including the generic /api/:collection
+// wildcard at the bottom, which is the door that was actually used.
+const auth = require("./auth");
+app.use(auth.attachSession);
+app.use("/api", auth.requireSession);
+
+// Who the caller is now comes from that signed cookie. It used to come from the
+// x-od-user / x-od-role REQUEST HEADERS, which the caller sets itself — so
+// a curl with a role header of "admin" was an administrator. Never trust those
+// headers again.
+function sessionRole(req) { return (req.session && req.session.role) || ""; }
+function sessionUserId(req) { return (req.session && req.session.uid) ? String(req.session.uid) : ""; }
+
+// One-time conversion of the plaintext passwords in users.json to scrypt
+// hashes, before the first request is served.
+auth.migrateUserPasswords(loadJSON, saveJSON, DEFAULT_USERS);
+
+// A fresh install (or a restored admin row) has no admin credential, because
+// the seed no longer carries one. Take OD_ADMIN_PASSWORD if it is set,
+// otherwise mint a random password and print it once — the installer reads it
+// out of the log and changes it at first sign-in. Never a known default again.
+(function ensureAdminPassword() {
+  try {
+    const users = loadJSON("users.json", DEFAULT_USERS);
+    const idx = users.findIndex((u) => u && u.id === "admin");
+    if (idx === -1) return;
+    if (users[idx].passwordHash) return;           // already has one
+    const supplied = process.env.OD_ADMIN_PASSWORD;
+    const pw = supplied || require("crypto").randomBytes(9).toString("base64url");
+    users[idx] = { ...users[idx], passwordHash: auth.hashPassword(pw), mustChangePassword: true };
+    delete users[idx].password;
+    saveJSON("users.json", users);
+    if (supplied) console.log("[auth] admin password set from OD_ADMIN_PASSWORD; it must be changed at first sign-in");
+    else console.log(`[auth] NO admin password was set — a temporary one has been generated: ${pw}\n[auth] sign in with it and change it immediately; it is not stored in the clear.`);
+  } catch (e) {
+    console.error("[auth] ensureAdminPassword failed:", e.message);
+  }
+})();
+
+// Refuse the passwords that leaked, and the obvious ones.
+const REFUSED_PASSWORDS = new Set(["dhanam@123", "admin123", "password", "password123", "12345678", "qwerty123"]);
+function passwordProblem(pw) {
+  if (!pw || pw.length < 8) return "Password must be at least 8 characters.";
+  if (REFUSED_PASSWORDS.has(String(pw).toLowerCase())) {
+    return "That password is not allowed — it is one of the passwords that leaked. Please choose one only you know.";
+  }
+  return null;
+}
+
+// ── Sign-in ─────────────────────────────────────────────────────────────────
+// Slows a password-guessing run to a crawl without locking a real user out for
+// long. In memory on purpose: a restart clearing it is not a security problem.
+const _loginFails = new Map();
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const LOGIN_MAX_FAILS = 8;
+function loginKey(req, username) { return `${req.ip}|${String(username).toLowerCase()}`; }
+function tooManyFailures(key) {
+  const f = _loginFails.get(key);
+  if (!f) return false;
+  if (Date.now() - f.first > LOGIN_WINDOW_MS) { _loginFails.delete(key); return false; }
+  return f.count >= LOGIN_MAX_FAILS;
+}
+function noteFailure(key) {
+  const f = _loginFails.get(key);
+  if (!f || Date.now() - f.first > LOGIN_WINDOW_MS) _loginFails.set(key, { first: Date.now(), count: 1 });
+  else f.count += 1;
+}
+
+app.post("/api/auth/login", (req, res) => {
+  const username = String((req.body && req.body.username) || "").trim();
+  const password = String((req.body && req.body.password) || "");
+  if (!username || !password) return res.status(400).json({ error: "Username and password are required." });
+  const key = loginKey(req, username);
+  if (tooManyFailures(key)) {
+    console.warn(`[auth] too many failed sign-ins for "${username}" from ${req.ip}`);
+    return res.status(429).json({ error: "Too many failed attempts. Please try again in a few minutes." });
+  }
+  const users = loadJSON("users.json", DEFAULT_USERS);
+  const user = users.find((u) => u && String(u.username || "").toLowerCase() === username.toLowerCase());
+  const ok = !!(user && user.active && auth.verifyPassword(password, user.passwordHash || user.password));
+  if (!ok) {
+    // One message for every kind of failure: a different answer for "no such
+    // user" would tell an outsider which usernames exist.
+    noteFailure(key);
+    console.warn(`[auth] failed sign-in for "${username}" from ${req.ip}`);
+    return res.status(401).json({ error: "Incorrect username or password." });
+  }
+  _loginFails.delete(key);
+  auth.setSessionCookie(res, auth.issueToken(user));
+  console.log(`[auth] ${user.id} (${user.username}) signed in from ${req.ip}`);
+  res.json({ ok: true, user: auth.publicUser(user), mustChangePassword: !!user.mustChangePassword });
+});
+
+app.post("/api/auth/logout", (req, res) => {
+  const who = sessionUserId(req);
+  auth.clearSessionCookie(res);
+  if (who) console.log(`[auth] ${who} signed out`);
+  res.json({ ok: true });
+});
+
+// Lets a reloaded page find out who it is from the cookie, so the browser need
+// not keep a user record — or a password — in localStorage.
+app.get("/api/auth/me", (req, res) => {
+  const users = loadJSON("users.json", DEFAULT_USERS);
+  const user = users.find((u) => u && String(u.id) === sessionUserId(req));
+  if (!user || !user.active) {
+    // Deactivated mid-session, or the file was edited underneath us.
+    auth.clearSessionCookie(res);
+    return res.status(401).json({ error: "Please sign in." });
+  }
+  res.json({ ok: true, user: auth.publicUser(user), mustChangePassword: !!user.mustChangePassword });
+});
+
+// Changing your OWN password. Distinct from the admin reset at
+// PATCH /api/users/:id/password because this one also lifts the must-change
+// lock on the live session, which is what lets a flagged user back in.
+app.post("/api/auth/change-password", (req, res) => {
+  const current = String((req.body && req.body.currentPassword) || "");
+  const next = String((req.body && req.body.newPassword) || "");
+  const users = loadJSON("users.json", DEFAULT_USERS);
+  const idx = users.findIndex((u) => u && String(u.id) === sessionUserId(req));
+  if (idx === -1) return res.status(401).json({ error: "Please sign in." });
+  const user = users[idx];
+  if (!auth.verifyPassword(current, user.passwordHash || user.password)) {
+    return res.status(400).json({ error: "Your current password is not correct." });
+  }
+  const problem = passwordProblem(next);
+  if (problem) return res.status(400).json({ error: problem });
+  const updated = { ...user, passwordHash: auth.hashPassword(next), mustChangePassword: false };
+  delete updated.password;
+  users[idx] = updated;
+  saveJSON("users.json", users);
+  auth.setSessionCookie(res, auth.issueToken(updated));
+  console.log(`[auth] ${user.id} changed their own password`);
+  res.json({ ok: true });
+});
 
 // ─── Read-only analytics/metrics response cache ──────────────────────────────
 // The /api/od/metrics/* and /api/od/analytics/* endpoints are pure reads over
@@ -259,6 +414,10 @@ const COLLECTIONS = {
 
 // Health check
 app.get("/api/health", (req, res) => {
+  // This is the ONE route that answers without a session, because the deploy
+  // script and nginx poll it — so without one it says only "up". The row counts
+  // and the data path are real information about the business.
+  if (!req.session) return res.json({ status: "ok" });
   const entries = loadJSON("entries.json", []);
   const ptpEntries = entries.filter(e => e.ptpDate);
   res.json({
@@ -645,7 +804,7 @@ app.get("/api/admin/duplicate-users", (req, res) => {
 // auditEntrySave: monthly rotation, hard-cap to prevent runaway growth.
 //
 // changes: array of { field, oldValue, newValue }
-// callerId: x-od-user header
+// callerId: the signed session cookie (NOT a request header)
 // reason: free-text reason captured from the client (optional)
 function auditUserChange(targetId, changes, callerId, reason, op) {
   try {
@@ -691,13 +850,14 @@ function auditUserChange(targetId, changes, callerId, reason, op) {
 // race once and for all — admin saves only touch the targeted fields on
 // the targeted user.
 //
-// Authorization: caller must be an admin (x-od-role === "admin"). Password
-// changes still go through /api/users/:id/password (which has its own
+// Authorization: the caller's SESSION must say admin. This used to read the
+// x-od-role header, which the caller supplies — so it was not a check at all.
+// Password changes still go through /api/users/:id/password (which has its own
 // self-or-admin authz).
 app.patch("/api/users/:id", (req, res) => {
   try {
     const targetId = String(req.params.id || "");
-    const callerRole = req.header("x-od-role") || "";
+    const callerRole = sessionRole(req);
     if (!targetId) return res.status(400).json({ error: "Missing user id" });
     if (callerRole !== "admin") {
       return res.status(403).json({ error: "Only Administrators can update user records." });
@@ -761,7 +921,7 @@ app.patch("/api/users/:id", (req, res) => {
     // (sent as _reason in the request body; sanitised to short string),
     // and how many historic entries were backfilled (so we have a record
     // of the rename's reach into past data).
-    const callerId = req.header("x-od-user") || "";
+    const callerId = sessionUserId(req);
     const reason = (req.body && typeof req.body._reason === "string") ? req.body._reason.slice(0, 500) : "";
     const auditChanges = changes.slice();
     if (nameChanged && entriesBackfilled > 0) {
@@ -783,7 +943,7 @@ app.patch("/api/users/:id", (req, res) => {
 app.delete("/api/users/:id", (req, res) => {
   try {
     const targetId = String(req.params.id || "");
-    const callerRole = req.header("x-od-role") || "";
+    const callerRole = sessionRole(req);
     if (!targetId) return res.status(400).json({ error: "Missing user id" });
     if (callerRole !== "admin") {
       return res.status(403).json({ error: "Only Administrators can delete users." });
@@ -798,8 +958,8 @@ app.delete("/api/users/:id", (req, res) => {
     saveJSON("users.json", users);
     auditUserChange(targetId, [
       { field: "_user", oldValue: { id: removed.id, username: removed.username, name: removed.name, role: removed.role }, newValue: null },
-    ], req.header("x-od-user") || "", "", "delete");
-    console.log(`[users/delete] ${targetId} (${removed.username || removed.name}) by ${req.header("x-od-user") || "(unknown)"}`);
+    ], sessionUserId(req), "", "delete");
+    console.log(`[users/delete] ${targetId} (${removed.username || removed.name}) by ${(sessionUserId(req) || "(unknown)")}`);
     res.json({ ok: true, userId: targetId });
   } catch (err) {
     console.error("[/api/users/:id DELETE] failed:", err);
@@ -811,7 +971,7 @@ app.delete("/api/users/:id", (req, res) => {
 // Adds a single user — won't clobber others. Admin-only.
 app.post("/api/users/add", (req, res) => {
   try {
-    const callerRole = req.header("x-od-role") || "";
+    const callerRole = sessionRole(req);
     if (callerRole !== "admin") {
       return res.status(403).json({ error: "Only Administrators can add users." });
     }
@@ -824,10 +984,17 @@ app.post("/api/users/add", (req, res) => {
     if (users.some(x => x && (x.id === u.id || x.username === u.username))) {
       return res.status(409).json({ error: "User with this id or username already exists" });
     }
+    // The initial password is hashed on the way in, and when the admin does not
+    // set one we mint a random temp password and hand it back in the response
+    // rather than reusing a shared default — "Dhanam@123" is one of the
+    // passwords that leaked, so it is refused here too.
+    const supplied = typeof u.password === "string" && u.password && !REFUSED_PASSWORDS.has(u.password.toLowerCase())
+      ? u.password : null;
+    const tempPassword = supplied || require("crypto").randomBytes(6).toString("base64url");
     const newUser = {
       id: String(u.id),
       username: String(u.username),
-      password: String(u.password || "Dhanam@123"),
+      passwordHash: auth.hashPassword(tempPassword),
       name: String(u.name),
       role: String(u.role || "staff"),
       branch: String(u.branch || ""),
@@ -838,9 +1005,11 @@ app.post("/api/users/add", (req, res) => {
     saveJSON("users.json", users);
     auditUserChange(newUser.id, [
       { field: "_user", oldValue: null, newValue: { username: newUser.username, name: newUser.name, role: newUser.role, branch: newUser.branch } },
-    ], req.header("x-od-user") || "", "", "create");
-    console.log(`[users/add] ${newUser.id} (${newUser.username}, role=${newUser.role}) by ${req.header("x-od-user") || "(unknown)"}`);
-    res.json({ ok: true, user: newUser });
+    ], sessionUserId(req), "", "create");
+    console.log(`[users/add] ${newUser.id} (${newUser.username}, role=${newUser.role}) by ${(sessionUserId(req) || "(unknown)")}`);
+    // tempPassword goes back ONCE, to the administrator who just created the
+    // account, so they can pass it on. It is not stored anywhere in the clear.
+    res.json({ ok: true, user: auth.publicUser(newUser), tempPassword: supplied ? null : tempPassword });
   } catch (err) {
     console.error("[/api/users/add POST] failed:", err);
     res.status(500).json({ error: "Failed to add user: " + (err.message || err) });
@@ -859,14 +1028,14 @@ app.post("/api/users/add", (req, res) => {
 //   • Preserves every other field (role, branch, active, name, etc.).
 //   • Audit-logs the action so we can trace who changed what.
 //
-// Authorization: the caller MUST be either the user themselves (header
-// x-od-user matches :id) or an admin (x-od-role === "admin"). MIS staff
-// cannot change other users' passwords.
+// Authorization: the caller MUST be either the user themselves (the session's
+// user id matches :id) or an admin, as stated by the signed session cookie —
+// never by a request header. MIS staff cannot change other users' passwords.
 app.patch("/api/users/:id/password", (req, res) => {
   try {
     const targetId = String(req.params.id || "");
-    const callerId = req.header("x-od-user") || "";
-    const callerRole = req.header("x-od-role") || "";
+    const callerId = sessionUserId(req);
+    const callerRole = sessionRole(req);
     if (!targetId) return res.status(400).json({ error: "Missing user id" });
     const isSelf = callerId && callerId === targetId;
     const isAdmin = callerRole === "admin";
@@ -874,17 +1043,19 @@ app.patch("/api/users/:id/password", (req, res) => {
       return res.status(403).json({ error: "You can only change your own password unless you are an Administrator." });
     }
     const password = req.body && typeof req.body.password === "string" ? req.body.password : "";
-    if (!password || password.length < 6) {
-      return res.status(400).json({ error: "Password must be at least 6 characters." });
-    }
-    if (password === "Dhanam@123") {
-      return res.status(400).json({ error: "Please choose a different password — the default password is not allowed." });
-    }
+    const problem = passwordProblem(password);
+    if (problem) return res.status(400).json({ error: problem });
     const users = loadJSON("users.json", []);
     const idx = users.findIndex(u => u && u.id === targetId);
     if (idx === -1) return res.status(404).json({ error: "User not found" });
-    users[idx] = { ...users[idx], password, mustChangePassword: false };
+    // Stored as a scrypt hash. An admin resetting SOMEBODY ELSE's password sets
+    // one that person did not choose, so they must replace it at next sign-in;
+    // changing your own (which this endpoint also allows) does not.
+    const updated = { ...users[idx], passwordHash: auth.hashPassword(password), mustChangePassword: !isSelf };
+    delete updated.password;
+    users[idx] = updated;
     saveJSON("users.json", users);
+    if (isSelf) auth.setSessionCookie(res, auth.issueToken(updated));
     console.log(`[users/password] ${targetId} updated by ${callerId || "(unknown)"} (role: ${callerRole || "n/a"})`);
     res.json({ ok: true, userId: targetId });
   } catch (err) {
@@ -1085,7 +1256,7 @@ app.get("/api/customers/lookup", (req, res) => {
 
 // ─── OD Recovery (Pool + Accrued Interest) ─────────────────────────────────
 // Gating: frontend only allows admin/elevated_staff to reach upload UI; the
-// server additionally honours an `x-od-role` header on uploads as a belt-and-
+// server additionally checks the caller's session role on uploads as a belt-and-
 // suspenders check. Read endpoints are unrestricted (same pattern as existing
 // /api/:collection routes).
 
@@ -1176,8 +1347,8 @@ function uploadField(fieldName) {
 }
 
 function requireUploader(req, res, next) {
-  const role = req.header("x-od-role") || "";
-  const userId = req.header("x-od-user") || "";
+  const role = sessionRole(req);
+  const userId = sessionUserId(req);
   // Admin + elevated_staff always allowed. Regular staff can also be granted
   // access via config.odUploadAccessUserIds (managed in the Admin panel).
   if (role === "admin" || role === "elevated_staff") return next();
@@ -1192,7 +1363,7 @@ function requireUploader(req, res, next) {
 // Notifications export RBAC: only Administrator + MIS Staff can download
 // notification reports. View access stays open to all roles.
 function requireAdminOrElevated(req, res, next) {
-  const role = req.header("x-od-role") || "";
+  const role = sessionRole(req);
   if (role === "admin" || role === "elevated_staff") return next();
   return res.status(403).json({
     error: "You do not have permission to export notifications. This feature is restricted to Administrator and MIS Staff roles.",
@@ -1223,7 +1394,7 @@ app.post("/api/od/pool/upload", requireUploader, uploadField("file"), (req, res)
     const dateCheck = validateSnapshotDate(req.body.snapshotDate);
     if (!dateCheck.ok) return res.status(400).json({ error: dateCheck.error });
     const snapshotDate = dateCheck.value;
-    const uploadedBy = req.header("x-od-user") || "unknown";
+    const uploadedBy = (sessionUserId(req) || "unknown");
     console.log(`[POOL UPLOAD] ${req.file.originalname} (${(req.file.size/1024/1024).toFixed(2)}MB) for ${snapshotDate}`);
     const text = readUploadAsUtf8(tmpPath);
     const result = ingestPool(text, {
@@ -1254,7 +1425,7 @@ app.post("/api/od/foreclosure/upload", requireUploader, uploadField("file"), (re
     const dateCheck = validateSnapshotDate(req.body.snapshotDate);
     if (!dateCheck.ok) return res.status(400).json({ error: dateCheck.error });
     const snapshotDate = dateCheck.value;
-    const uploadedBy = req.header("x-od-user") || "unknown";
+    const uploadedBy = (sessionUserId(req) || "unknown");
     console.log(`[FORECLOSURE UPLOAD] ${req.file.originalname} (${(req.file.size/1024/1024).toFixed(2)}MB) for ${snapshotDate}`);
     const text = readUploadAsUtf8(tmpPath);
     const result = ingestForeclosure(text, {
@@ -1283,7 +1454,7 @@ app.post("/api/od/accrued/upload", requireUploader, uploadField("file"), (req, r
     const dateCheck = validateSnapshotDate(req.body.snapshotDate);
     if (!dateCheck.ok) return res.status(400).json({ error: dateCheck.error });
     const snapshotDate = dateCheck.value;
-    const uploadedBy = req.header("x-od-user") || "unknown";
+    const uploadedBy = (sessionUserId(req) || "unknown");
     console.log(`[ACCRUED UPLOAD] ${req.file.originalname} (${(req.file.size/1024/1024).toFixed(2)}MB) for ${snapshotDate}`);
     const text = readUploadAsUtf8(tmpPath);
     const result = ingestAccrued(text, {
@@ -1309,7 +1480,7 @@ app.post("/api/od/overdue/upload", requireUploader, uploadField("file"), (req, r
   const tmpPath = req.file.path;
   try {
     const snapshotDate = (req.body.snapshotDate || todayIso()).slice(0, 10);
-    const uploadedBy = req.header("x-od-user") || "unknown";
+    const uploadedBy = (sessionUserId(req) || "unknown");
     console.log(`[OVERDUE UPLOAD] ${req.file.originalname} (${(req.file.size/1024/1024).toFixed(2)}MB) for ${snapshotDate}`);
     // Multer uses disk storage (see storage config) so req.file.buffer is
     // undefined — calling .toString() on it throws
@@ -1367,7 +1538,7 @@ app.post("/api/od/collections/upload", requireUploader, uploadField("file"), (re
   const t0 = Date.now();
   const tmpPath = req.file.path;
   try {
-    const uploadedBy = req.header("x-od-user") || "unknown";
+    const uploadedBy = (sessionUserId(req) || "unknown");
     console.log(`[COLLECTIONS UPLOAD] ${req.file.originalname} (${(req.file.size/1024/1024).toFixed(2)}MB)`);
     // Multer disk-storage fix: read the uploaded tmp file from req.file.path
     // rather than the (undefined) req.file.buffer. Same pattern as pool/accrued
@@ -1393,7 +1564,7 @@ app.post("/api/od/client-period/upload", requireUploader, uploadField("file"), (
   const t0 = Date.now();
   const tmpPath = req.file.path;
   try {
-    const uploadedBy = req.header("x-od-user") || "unknown";
+    const uploadedBy = (sessionUserId(req) || "unknown");
     let periodStart = (req.body.periodStart || "").slice(0, 10);
     let periodEnd = (req.body.periodEnd || "").slice(0, 10);
 
@@ -3998,9 +4169,10 @@ app.get("/api/pool/search", (req, res) => {
 // ── Generic CRUD (wildcard — must be LAST) ──
 
 // GET /api/:collection
-// RBAC: when collection === "entries" AND the caller is a regular staff
-// user (x-od-role header === "staff"), the response is filtered server-side
-// to only entries authored by that staff (enteredBy === x-od-user header).
+// RBAC: when collection === "entries" AND the caller is a regular staff user
+// (the SESSION says role "staff"), the response is filtered server-side to only
+// entries authored by them (enteredBy === the session's user id). Both values
+// used to come from request headers the caller set itself.
 // Admin + MIS staff see the full collection.
 // Defense-in-depth: matches client-side scoping so a direct curl /
 // DevTools fetch can't surface another staff member's collection rows.
@@ -4009,9 +4181,15 @@ app.get("/api/:collection", (req, res) => {
   if (!file) return res.status(404).json({ error: "Unknown collection" });
   const fallback = req.params.collection === "config" ? DEFAULT_CONFIG : [];
   let data = loadJSON(file, fallback);
+  // THE LEAK: this route served users.json verbatim, passwords and all, to
+  // anyone who asked, and it was taken three times on 2026-10-08. Passwords
+  // never leave the server now in any form — publicUser drops the hash too.
+  if (req.params.collection === "users") {
+    data = Array.isArray(data) ? data.map(auth.publicUser) : data;
+  }
   if (req.params.collection === "entries") {
-    const role = req.header("x-od-role") || "";
-    const userId = req.header("x-od-user") || "";
+    const role = sessionRole(req);
+    const userId = sessionUserId(req);
     if (role === "staff" && userId) {
       data = Array.isArray(data) ? data.filter(e => e && e.enteredBy === userId) : data;
     }
@@ -4020,9 +4198,36 @@ app.get("/api/:collection", (req, res) => {
 });
 
 // POST /api/:collection — full replace
+//
+// This is the route the 2026-10-08 intruder WROTE through: it accepted an
+// unauthenticated full replacement of any collection. It now needs a session
+// like everything else, and the two collections that decide who may do what —
+// users and config — are administrators only, because a full replace of
+// users.json can hand out a role or re-enable a disabled account.
 app.post("/api/:collection", (req, res) => {
   const file = COLLECTIONS[req.params.collection];
   if (!file) return res.status(404).json({ error: "Unknown collection" });
+  const collection = req.params.collection;
+  if ((collection === "users" || collection === "config") && sessionRole(req) !== "admin") {
+    return res.status(403).json({ error: `Only Administrators can replace the ${collection} list.` });
+  }
+  if (collection === "users") {
+    // A client sending back a list it read has no passwords to send (see
+    // above), so a blind replace would wipe every hash and lock the company
+    // out. Keep each stored credential and take only the other fields.
+    const existing = loadJSON("users.json", DEFAULT_USERS);
+    const credential = new Map(existing.map((u) => [String(u && u.id), u && (u.passwordHash || u.password)]));
+    req.body = Array.isArray(req.body) ? req.body.map((u) => {
+      if (!u || typeof u !== "object") return u;
+      const kept = credential.get(String(u.id));
+      const out = { ...u };
+      delete out.password;
+      if (kept) out.passwordHash = auth.isHashed(kept) ? kept : auth.hashPassword(kept);
+      else if (typeof u.password === "string" && u.password) out.passwordHash = auth.hashPassword(u.password);
+      return out;
+    }) : req.body;
+  }
+  console.log(`[collection/replace] ${collection} (${Array.isArray(req.body) ? req.body.length : 1} row(s)) by ${sessionUserId(req) || "(unknown)"}`);
   saveJSON(file, req.body);
   res.json({ ok: true, count: Array.isArray(req.body) ? req.body.length : 1 });
 });

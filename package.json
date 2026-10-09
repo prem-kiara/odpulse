@@ -9,7 +9,8 @@
     "dev:all": "concurrently -k -n web,api -c cyan,magenta \"npm:dev\" \"npm:dev:server\"",
     "build": "vite build",
     "preview": "vite preview",
-    "check": "bash scripts/check-repo-health.sh"
+    "check": "bash scripts/check-repo-health.sh",
+    "test:auth": "node server/test/auth.test.mjs"
   },
   "dependencies": {
     "lucide-react": "^0.383.0",

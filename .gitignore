@@ -20,6 +20,9 @@ server/data/entries.json
 server/data/notifications.json
 server/data/config.json
 server/data/audit-log.json
+# The HMAC key that signs session cookies. Committing it would let anyone
+# forge a session for any user, including the administrator.
+server/data/.session-secret
 server/uploads/
 
 # One-off local artifacts

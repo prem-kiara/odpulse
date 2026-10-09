@@ -647,9 +647,13 @@ export function DataUploadPage({ user, canUpload }) {
     }
     let res;
     try {
+      // The uploader's identity comes from the session cookie, which the
+      // browser attaches itself. These used to be headers — and the user one
+      // carried a NAME where the server compared ids, so the per-user upload
+      // grant in Settings could never match and only a role header (which the
+      // caller set itself) got anyone in.
       res = await fetch(`${API_BASE}/od/${item.kind}/upload`, {
         method: "POST",
-        headers: { "x-od-role": item.userRole || "", "x-od-user": item.userName || "" },
         body: fd,
       });
     } catch (networkErr) {
