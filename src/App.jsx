@@ -264,9 +264,22 @@ const saveData = (key, data) => {
   }
 };
 
+// A short random password for an account whose holder has not chosen one yet.
+// Shown to the administrator once, never stored in the clear.
+const randomTempPassword = () => {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+  const bytes = new Uint8Array(10);
+  (window.crypto || window.msCrypto).getRandomValues(bytes);
+  return Array.from(bytes, (b) => alphabet[b % alphabet.length]).join("");
+};
+
 const fetchAPI = async (collection, fallback) => {
   try {
     const res = await fetch(`${API_BASE}/${collection}`);
+    // 401 = no session (expired, signed out elsewhere, or account disabled).
+    // Tell the app so it returns to the login screen rather than silently
+    // serving stale localStorage data as though we were still signed in.
+    if (res.status === 401) window.dispatchEvent(new Event("od-signed-out"));
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     return await res.json();
   } catch (err) {
@@ -299,18 +312,12 @@ const DEFAULT_BRANCHES = [
 const BRANCHES_WITHOUT_DUE_REQUIRED = new Set(["mahashemam", "blaze trust", "shiva guru"]);
 const isBranchDueOptional = (branch) =>
   BRANCHES_WITHOUT_DUE_REQUIRED.has(String(branch || "").trim().toLowerCase());
-const DEFAULT_USERS = [
-  { id: "admin", username: "admin", password: "admin123", role: "admin", name: "Administrator", branch: "Head Office", active: true, mustChangePassword: false },
-  { id: "u_vijila", username: "vijila", password: "Dhanam@123", role: "staff", name: "Vijila", branch: "", active: true, mustChangePassword: true },
-  { id: "u_padmapriya", username: "padmapriya", password: "Dhanam@123", role: "staff", name: "Padmapriya", branch: "", active: true, mustChangePassword: true },
-  { id: "u_sasikala", username: "sasikala", password: "Dhanam@123", role: "staff", name: "Sasikala", branch: "", active: true, mustChangePassword: true },
-  { id: "u_kaviya", username: "kaviya", password: "Dhanam@123", role: "staff", name: "Kaviya", branch: "", active: true, mustChangePassword: true },
-  { id: "u_sandhiya", username: "sandhiya", password: "Dhanam@123", role: "staff", name: "Sandhiya", branch: "", active: true, mustChangePassword: true },
-  { id: "u_poongodi", username: "poongodi", password: "Dhanam@123", role: "staff", name: "Poongodi", branch: "", active: true, mustChangePassword: true },
-  { id: "u_kersiyal", username: "kersiyal", password: "Dhanam@123", role: "staff", name: "Kersiyal", branch: "", active: true, mustChangePassword: true },
-  { id: "u_maheshwari", username: "maheshwari", password: "Dhanam@123", role: "staff", name: "Maheshwari", branch: "", active: true, mustChangePassword: true },
-  { id: "u_dinesh", username: "dinesh", password: "Dhanam@123", role: "elevated_staff", name: "Dinesh", branch: "Head Office", active: true, mustChangePassword: true },
-];
+// DEFAULT_USERS used to live here: all ten staff accounts WITH THEIR
+// PLAINTEXT PASSWORDS, compiled into the browser bundle. Anyone who loaded the
+// page could read them from the served JavaScript without calling the API at
+// all, and the login below compared the typed password against this list in
+// the browser. Accounts now exist only in the server's users.json, as scrypt
+// hashes, and only the server ever checks a password.
 const DEFAULT_CONFIG = { companyName: "OD Pulse - MFI Recovery Tracker", allowStaffEdit: false, allowStaffDelete: false, staffSeeAllBranches: false };
 
 // ─── CSV Export Helper ──────────────────────────────────────────────────────
@@ -2520,7 +2527,7 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
     try {
       const res = await fetch(`${API_BASE}/entries/${encodeURIComponent(recordedByEdit.entryId)}`, {
         method: "PATCH",
-        headers: { "Content-Type": "application/json", "x-od-user": user.id, "x-od-role": user.role || "" },
+        headers: { "Content-Type": "application/json"},
         body: JSON.stringify({
           enteredBy: newUser.id,
           enteredByName: newUser.name,
@@ -2582,7 +2589,7 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
     try {
       const res = await fetch(`${API_BASE}/entries/${encodeURIComponent(paidAmountEdit.entryId)}`, {
         method: "PATCH",
-        headers: { "Content-Type": "application/json", "x-od-user": user.id, "x-od-role": user.role || "" },
+        headers: { "Content-Type": "application/json"},
         body: JSON.stringify(body),
       });
       if (!res.ok) {
@@ -2620,7 +2627,7 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
     try {
       const res = await fetch(`${API_BASE}/entries/${encodeURIComponent(dateEdit.entryId)}`, {
         method: "PATCH",
-        headers: { "Content-Type": "application/json", "x-od-user": user.id, "x-od-role": user.role || "" },
+        headers: { "Content-Type": "application/json"},
         body: JSON.stringify({
           date: dateEdit.newDate,
           _correctedBy: user.name || user.username || user.id,
@@ -2654,7 +2661,7 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
     try {
       const res = await fetch(`${API_BASE}/entries/${encodeURIComponent(pmEdit.entryId)}`, {
         method: "PATCH",
-        headers: { "Content-Type": "application/json", "x-od-user": user.id, "x-od-role": user.role || "" },
+        headers: { "Content-Type": "application/json"},
         // _correctedBy / _previousMode are audit-trail breadcrumbs the
         // server-side auditEntrySave will pick up. paymentMode itself is
         // the canonical write — this is what the rest of the app reads.
@@ -6096,9 +6103,8 @@ function DuplicateReviewModal({ type, newRows, dupRows, onConfirm, onCancel }) {
 // ─── Admin Panel ────────────────────────────────────────────────────────────
 function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig, entries, setEntries, notifications, setNotifications }) {
   const [tab, setTab] = useState("users");
-  const [newUser, setNewUser] = useState({ username: "", password: "Dhanam@123", name: "", role: "staff", branch: "" });
+  const [newUser, setNewUser] = useState({ username: "", password: "", name: "", role: "staff", branch: "" });
   const [newBranch, setNewBranch] = useState("");
-  const [showPassId, setShowPassId] = useState(null);
   const [editingBranch, setEditingBranch] = useState(null);
   const [lastBulkUpload, setLastBulkUpload] = useState(() => loadData(STORAGE_KEYS.lastBulkUpload, null));
   // Duplicate review modal state. Populated after CSV parse whenever any
@@ -6278,29 +6284,38 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
   const [editBranchName, setEditBranchName] = useState("");
 
   const handleAddUser = async () => {
-    if (!newUser.username || !newUser.password || !newUser.name) { alert("Fill in all fields."); return; }
+    if (!newUser.username || !newUser.name) { alert("Enter a username and a name."); return; }
     if (users.some(u => u.username === newUser.username)) { alert("Username already exists."); return; }
+    // The password is optional: left blank, the server mints a random one and
+    // returns it once so it can be handed over. The old code defaulted every
+    // new account to the same "Dhanam@123" — one of the passwords that leaked.
     const u = { ...newUser, id: generateId(), active: true, mustChangePassword: true };
+    let created = null;
     try {
       const res = await fetch(`${API_BASE}/users/add`, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-od-user": user.id, "x-od-role": user.role || "" },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(u),
       });
+      const j = await res.json().catch(() => ({}));
       if (!res.ok) {
-        const j = await res.json().catch(() => ({}));
         alert("Could not add user: " + (j.error || `HTTP ${res.status}`));
         return;
       }
+      created = j;
     } catch (err) {
       console.error("[handleAddUser] network error:", err);
       alert("Network error while adding user. Please try again.");
       return;
     }
-    const updated = [...users, u];
+    // Keep only what the server sent back, which never includes a password.
+    const updated = [...users, created.user || { ...u, password: undefined }];
     setUsers(updated);
     localStorage.setItem(STORAGE_KEYS.users, JSON.stringify(updated));
-    setNewUser({ username: "", password: "Dhanam@123", name: "", role: "staff", branch: "" });
+    setNewUser({ username: "", password: "", name: "", role: "staff", branch: "" });
+    if (created.tempPassword) {
+      alert(`User ${u.username} created.\n\nTemporary password: ${created.tempPassword}\n\nGive this to them directly. It is shown once and they must change it when they first sign in.`);
+    }
   };
 
   // Admin-only: in-progress staff name correction.
@@ -6316,7 +6331,7 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
     try {
       const res = await fetch(`${API_BASE}/users/${encodeURIComponent(userNameEdit.userId)}`, {
         method: "PATCH",
-        headers: { "Content-Type": "application/json", "x-od-user": user.id, "x-od-role": user.role || "" },
+        headers: { "Content-Type": "application/json"},
         body: JSON.stringify({
           name: trimmed,
           _previousName: userNameEdit.oldName || "",
@@ -6374,7 +6389,7 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
     try {
       const res = await fetch(`${API_BASE}/users/${encodeURIComponent(id)}`, {
         method: "PATCH",
-        headers: { "Content-Type": "application/json", "x-od-user": user.id, "x-od-role": user.role || "" },
+        headers: { "Content-Type": "application/json"},
         body: JSON.stringify({ active: next }),
       });
       if (!res.ok) {
@@ -6397,7 +6412,6 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
     try {
       const res = await fetch(`${API_BASE}/users/${encodeURIComponent(id)}`, {
         method: "DELETE",
-        headers: { "x-od-user": user.id, "x-od-role": user.role || "" },
       });
       if (!res.ok) {
         const j = await res.json().catch(() => ({}));
@@ -6510,19 +6524,26 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
       const rows = parseCSV(ev.target.result);
       let added = 0;
       const updated = [...users];
+      const issued = [];
       rows.forEach(r => {
         const username = (r.username || r.Username || "").trim();
         const name = (r.name || r.Name || r["Full Name"] || "").trim();
         const role = (r.role || r.Role || "staff").trim();
         const branch = (r.branch || r.Branch || "").trim();
-        const password = (r.password || r.Password || "Dhanam@123").trim();
+        // A random temporary password per person, not one shared default. The
+        // server hashes whatever arrives here; these are listed below so the
+        // admin can hand them over, and each holder must change it at first
+        // sign-in.
+        const password = (r.password || r.Password || "").trim() || randomTempPassword();
         if (!username || !name) return;
         if (updated.some(u => u.username === username)) return;
         updated.push({ id: generateId(), username, password, name, role, branch, active: true, mustChangePassword: true });
+        issued.push(`${username}: ${password}`);
         added++;
       });
       setUsers(updated); saveData(STORAGE_KEYS.users, updated);
-      alert(`Added ${added} new users. Total: ${updated.length}`);
+      alert(`Added ${added} new users. Total: ${updated.length}` +
+        (issued.length ? `\n\nTemporary passwords (shown once — each user must change it at first sign-in):\n${issued.join("\n")}` : ""));
     };
     reader.readAsText(file);
     e.target.value = "";
@@ -6804,7 +6825,7 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
             <h3 className="font-semibold text-gray-800 mb-3 flex items-center gap-2"><UserPlus size={18} /> Add New User</h3>
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
               <input type="text" placeholder="Username" value={newUser.username} onChange={e => setNewUser({ ...newUser, username: e.target.value })} className="px-3 py-2 border rounded-lg text-sm" />
-              <input type="text" placeholder="Password" value={newUser.password} onChange={e => setNewUser({ ...newUser, password: e.target.value })} className="px-3 py-2 border rounded-lg text-sm" />
+              <input type="password" placeholder="Password (optional)" value={newUser.password} onChange={e => setNewUser({ ...newUser, password: e.target.value })} className="px-3 py-2 border rounded-lg text-sm" />
               <input type="text" placeholder="Full Name" value={newUser.name} onChange={e => setNewUser({ ...newUser, name: e.target.value })} className="px-3 py-2 border rounded-lg text-sm" />
               <select value={newUser.role} onChange={e => setNewUser({ ...newUser, role: e.target.value })} className="px-3 py-2 border rounded-lg text-sm">
                 <option value="staff">Staff</option><option value="elevated_staff">MIS Staff (All Access)</option><option value="admin">Admin</option>
@@ -6823,7 +6844,6 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
                   <tr>
                     <th className="text-left px-4 py-3">{sort.header("name", "Name")}</th>
                     <th className="text-left px-4 py-3">{sort.header("username", "Username")}</th>
-                    <th className="text-left px-4 py-3">Password</th>
                     <th className="text-left px-4 py-3">{sort.header("role", "Role")}</th>
                     <th className="text-left px-4 py-3">{sort.header("branch", "Branch")}</th>
                     <th className="text-center px-4 py-3">{sort.header("active", "Status")}</th>
@@ -6866,14 +6886,6 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
                         )}
                       </td>
                       <td className="px-4 py-3">{u.username}</td>
-                      <td className="px-4 py-3">
-                        <div className="flex items-center gap-1">
-                          <span>{showPassId === u.id ? u.password : "••••••"}</span>
-                          <button onClick={() => setShowPassId(showPassId === u.id ? null : u.id)} className="p-1 hover:bg-gray-100 rounded">
-                            {showPassId === u.id ? <EyeOff size={12} /> : <Eye size={12} />}
-                          </button>
-                        </div>
-                      </td>
                       <td className="px-4 py-3"><span className={`px-2 py-0.5 rounded-full text-xs font-medium ${u.role === "admin" ? "bg-purple-100 text-purple-700" : u.role === "elevated_staff" ? "bg-amber-100 text-amber-700" : "bg-blue-100 text-blue-700"}`}>{u.role === "elevated_staff" ? "MIS Staff" : u.role}</span></td>
                       <td className="px-4 py-3">{u.branch || "—"}</td>
                       <td className="px-4 py-3 text-center">
@@ -7053,7 +7065,7 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
           {/* Bulk Upload Users */}
           <div className="bg-white rounded-xl border p-5">
             <h3 className="font-semibold text-gray-800 mb-2 flex items-center gap-2"><Users size={18} className="text-teal-600" /> Bulk Upload Users</h3>
-            <p className="text-sm text-gray-500 mb-3">Upload a CSV with columns: username, name, role (staff/elevated_staff/admin), branch, password (optional, defaults to Dhanam@123). Existing usernames are skipped.</p>
+            <p className="text-sm text-gray-500 mb-3">Upload a CSV with columns: username, name, role (staff/elevated_staff/admin), branch, password (optional — leave it out and each user gets their own random temporary password, listed once after the import). Existing usernames are skipped.</p>
             <label className="inline-flex items-center gap-2 px-4 py-2 bg-teal-600 text-white rounded-lg text-sm hover:bg-teal-700 cursor-pointer transition-colors">
               <Upload size={14} /> Choose CSV File
               <input type="file" accept=".csv" onChange={handleBulkUsers} className="hidden" />
@@ -7086,7 +7098,7 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
                 <Download size={14} /> Branches Template
               </button>
               <button onClick={() => {
-                const csv = "username,name,role,branch,password\njohn,John Doe,staff,Annur,Dhanam@123";
+                const csv = "username,name,role,branch\njohn,John Doe,staff,Annur";
                 const blob = new Blob([csv], { type: "text/csv" });
                 const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "users-template.csv"; a.click();
               }} className="px-3 py-2 bg-gray-100 text-gray-700 rounded-lg text-sm hover:bg-gray-200 transition-colors flex items-center gap-1">
@@ -7275,44 +7287,49 @@ function AdminPanel({ users, setUsers, branches, setBranches, config, setConfig,
 }
 
 // ─── Change Password Modal ──────────────────────────────────────────────────
-function ChangePasswordModal({ user, users, setUsers, onDone, isForced }) {
+// knownCurrent: the password the user typed a moment ago on the login screen,
+// so a forced change does not ask for it twice. Absent (a restored session that
+// still owes a change), the field is shown.
+function ChangePasswordModal({ user, onDone, isForced, knownCurrent }) {
+  const [currentPass, setCurrentPass] = useState("");
   const [newPass, setNewPass] = useState("");
   const [confirmPass, setConfirmPass] = useState("");
   const [error, setError] = useState("");
   const [showPass, setShowPass] = useState(false);
+  const [busy, setBusy] = useState(false);
 
   const handleChange = async () => {
-    if (!newPass || newPass.length < 6) { setError("Password must be at least 6 characters."); return; }
-    if (newPass === "Dhanam@123") { setError("Please choose a different password."); return; }
+    if (busy) return;
+    const current = knownCurrent || currentPass;
+    if (!current) { setError("Please enter your current password."); return; }
+    if (!newPass || newPass.length < 8) { setError("Password must be at least 8 characters."); return; }
     if (newPass !== confirmPass) { setError("Passwords do not match."); return; }
+    if (newPass === current) { setError("Please choose a password different from your current one."); return; }
+    setBusy(true);
     setError("");
-    // Use a focused endpoint that updates ONLY this user on the server.
-    // The old path POSTed the entire users array via saveData, which let
-    // any stale tab clobber the change with old data. The new endpoint
-    // does a server-side merge by id, so concurrent updates are safe.
+    // Goes to /api/auth/change-password, which checks the CURRENT password
+    // before accepting a new one, stores a scrypt hash, and re-issues the
+    // session cookie without the must-change lock. Nothing about the password
+    // is written to this browser — the old code mirrored it into localStorage.
     try {
-      const res = await fetch(`${API_BASE}/users/${encodeURIComponent(user.id)}/password`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json", "x-od-user": user.id, "x-od-role": user.role || "" },
-        body: JSON.stringify({ password: newPass }),
+      const res = await fetch(`${API_BASE}/auth/change-password`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ currentPassword: current, newPassword: newPass }),
       });
       if (!res.ok) {
         const j = await res.json().catch(() => ({}));
-        setError("Could not save password: " + (j.error || `HTTP ${res.status}`));
+        setError(j.error || `Could not save password (HTTP ${res.status}).`);
         return;
       }
     } catch (err) {
-      setError("Network error while saving password. Please try again.");
+      setError("Network error while saving your password. Please try again.");
       console.error("[ChangePassword] network error:", err);
       return;
+    } finally {
+      setBusy(false);
     }
-    // Mirror locally so the UI reflects the change without a refetch. We
-    // intentionally do NOT call saveData(users) here — that would POST the
-    // whole array and re-introduce the race.
-    const updated = users.map(u => u.id === user.id ? { ...u, password: newPass, mustChangePassword: false } : u);
-    setUsers(updated);
-    localStorage.setItem(STORAGE_KEYS.users, JSON.stringify(updated));
-    onDone({ ...user, password: newPass, mustChangePassword: false });
+    onDone({ ...user, mustChangePassword: false });
   };
 
   return (
@@ -7327,11 +7344,18 @@ function ChangePasswordModal({ user, users, setUsers, onDone, isForced }) {
         </div>
         {error && <div className="bg-red-50 text-red-700 text-sm p-3 rounded-lg mb-4 flex items-center gap-2"><AlertTriangle size={16} /> {error}</div>}
         <div className="space-y-3">
+          {!knownCurrent && (
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">Current Password *</label>
+              <input type="password" value={currentPass} onChange={e => setCurrentPass(e.target.value)}
+                className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500" placeholder="Your current password" />
+            </div>
+          )}
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-1">New Password *</label>
             <div className="relative">
               <input type={showPass ? "text" : "password"} value={newPass} onChange={e => setNewPass(e.target.value)}
-                className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500 pr-10" placeholder="Min 6 characters" />
+                className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-teal-500 pr-10" placeholder="At least 8 characters" />
               <button onClick={() => setShowPass(!showPass)} className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400">
                 {showPass ? <EyeOff size={16} /> : <Eye size={16} />}
               </button>
@@ -7345,8 +7369,9 @@ function ChangePasswordModal({ user, users, setUsers, onDone, isForced }) {
         </div>
         <div className="flex gap-3 mt-6">
           {!isForced && <button onClick={() => onDone(null)} className="flex-1 px-4 py-2 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50">Cancel</button>}
-          <button onClick={handleChange} className={`${isForced ? "w-full" : "flex-1"} px-4 py-2 bg-teal-600 text-white rounded-lg hover:bg-teal-700 font-medium`}>
-            Set Password
+          <button onClick={handleChange} disabled={busy}
+            className={`${isForced ? "w-full" : "flex-1"} px-4 py-2 rounded-lg font-medium ${busy ? "bg-teal-300 text-white" : "bg-teal-600 text-white hover:bg-teal-700"}`}>
+            {busy ? "Saving…" : "Set Password"}
           </button>
         </div>
       </div>
@@ -7355,22 +7380,44 @@ function ChangePasswordModal({ user, users, setUsers, onDone, isForced }) {
 }
 
 // ─── Login Screen ───────────────────────────────────────────────────────────
-function LoginScreen({ onLogin, users, setUsers }) {
+function LoginScreen({ onLogin }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [showPass, setShowPass] = useState(false);
+  const [busy, setBusy] = useState(false);
   const [pendingUser, setPendingUser] = useState(null); // user needing password change
 
-  const handleLogin = () => {
-    const user = users.find(u => u.username === username && u.password === password && u.active);
-    if (!user) { setError("Invalid credentials or account disabled."); return; }
-    if (user.mustChangePassword) {
-      setPendingUser(user);
-    } else {
-      onLogin(user);
-    }
+  // The password is checked ON THE SERVER, against a scrypt hash. This function
+  // used to be:
+  //     users.find(u => u.username === username && u.password === password)
+  // — a comparison in the browser, which is why the page had to download every
+  // account and its password before anyone could sign in.
+  const handleLogin = async () => {
+    if (busy) return;
+    setBusy(true);
     setError("");
+    try {
+      const res = await fetch(`${API_BASE}/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(body.error || `Sign-in failed (HTTP ${res.status}).`);
+        return;
+      }
+      // The session is now a signed httpOnly cookie the browser sends on every
+      // call and JavaScript cannot read.
+      if (body.mustChangePassword) setPendingUser(body.user);
+      else onLogin(body.user);
+    } catch (err) {
+      console.error("[login] network error:", err);
+      setError("Could not reach the server. Please check your connection and try again.");
+    } finally {
+      setBusy(false);
+    }
   };
 
   const handlePasswordChanged = (updatedUser) => {
@@ -7405,13 +7452,14 @@ function LoginScreen({ onLogin, users, setUsers }) {
               </button>
             </div>
           </div>
-          <button onClick={handleLogin} className="w-full py-2.5 bg-teal-600 text-white rounded-xl font-semibold hover:bg-teal-700 transition-colors shadow-lg shadow-teal-200">
-            Sign In
+          <button onClick={handleLogin} disabled={busy}
+            className={`w-full py-2.5 rounded-xl font-semibold transition-colors shadow-lg ${busy ? "bg-teal-300 text-white shadow-teal-100" : "bg-teal-600 text-white hover:bg-teal-700 shadow-teal-200"}`}>
+            {busy ? "Signing in…" : "Sign In"}
           </button>
         </div>
       </div>
       {pendingUser && (
-        <ChangePasswordModal user={pendingUser} users={users} setUsers={setUsers} onDone={handlePasswordChanged} isForced={true} />
+        <ChangePasswordModal user={pendingUser} knownCurrent={password} onDone={handlePasswordChanged} isForced={true} />
       )}
     </div>
   );
@@ -7450,6 +7498,9 @@ export default function App() {
   useEffect(() => {
     // Try to load from API first, fall back to localStorage
     const initData = async () => {
+      // Nothing is readable without a session now, so there is no point asking
+      // before the user has signed in — and the 401s would just be noise.
+      if (!user) return;
       // Fetch all collections from server in parallel
       const [apiEntries, apiUsers, apiBranches, apiConfig, apiNotifications] = await Promise.all([
         fetchAPI("entries", []),
@@ -7495,13 +7546,12 @@ export default function App() {
         if (Array.isArray(stored) && stored.length > 0) {
           finalUsers = stored;
         } else {
-          // True first-run on this device AND server unreachable. Seed
-          // DEFAULT_USERS into localStorage so the login screen has SOME
-          // accounts to authenticate against, but don't push to the server.
-          // When the API comes back up, the next bootstrap will overwrite
-          // local with authoritative server data.
-          finalUsers = DEFAULT_USERS;
-          localStorage.setItem(STORAGE_KEYS.users, JSON.stringify(DEFAULT_USERS));
+          // Nothing cached locally and the server is unreachable, so there is
+          // nothing to show. This used to seed the built-in account list —
+          // passwords and all — into localStorage so the browser could check a
+          // login by itself. Signing in now requires the server, which is the
+          // point: the password is checked where the hash is.
+          finalUsers = [];
           localStorage.setItem(STORAGE_KEYS.version, JSON.stringify(APP_VERSION));
         }
       }
@@ -7606,10 +7656,43 @@ export default function App() {
       window.removeEventListener("online", onOnline);
       window.removeEventListener("wheel", onWheel);
     };
-  }, []);
+  }, [user?.id]);
 
   const handleLogin = (u) => { setUser(u); setPage("dashboard"); };
-  const handleLogout = () => { setUser(null); setPage("dashboard"); setSidebarOpen(false); };
+  const handleLogout = async () => {
+    // Clear the session on the SERVER, not only in this tab — otherwise the
+    // cookie keeps working for anyone who reopens the browser.
+    try { await fetch(`${API_BASE}/auth/logout`, { method: "POST" }); } catch {}
+    setUser(null); setPage("dashboard"); setSidebarOpen(false);
+  };
+
+  // Who are we? The cookie survives a reload, so ask the server rather than
+  // trusting (or storing) anything in this browser. While the answer is in
+  // flight we show nothing, so the login screen does not flash for someone who
+  // is already signed in.
+  const [sessionChecked, setSessionChecked] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch(`${API_BASE}/auth/me`);
+        if (!cancelled && res.ok) {
+          const body = await res.json();
+          if (body && body.user) setUser({ ...body.user, mustChangePassword: !!body.mustChangePassword });
+        }
+      } catch { /* offline — the login screen will say so when they try */ }
+      finally { if (!cancelled) setSessionChecked(true); }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // A 401 from any call means the session ended (expired, signed out in another
+  // tab, or the account was disabled). Drop back to the login screen.
+  useEffect(() => {
+    const onSignedOut = () => setUser(null);
+    window.addEventListener("od-signed-out", onSignedOut);
+    return () => window.removeEventListener("od-signed-out", onSignedOut);
+  }, []);
 
   // refreshAllData — used by the manual refresh button + auto-refresh timer.
   // Re-fetches entries + notifications from the server, mirrors to
@@ -7640,7 +7723,24 @@ export default function App() {
     return () => clearInterval(id);
   }, [autoRefresh.enabled, autoRefresh.intervalSec, refreshAllData]);
 
-  if (!user) return <LoginScreen onLogin={handleLogin} users={users} setUsers={setUsers} />;
+  if (!sessionChecked) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-teal-50 via-white to-cyan-50 flex items-center justify-center">
+        <div className="text-sm text-gray-400">Loading…</div>
+      </div>
+    );
+  }
+  if (!user) return <LoginScreen onLogin={handleLogin} />;
+  // A restored session can still owe a password change — the server refuses
+  // everything else until it is done, so ask for it here too.
+  if (user.mustChangePassword) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-teal-50 via-white to-cyan-50">
+        <ChangePasswordModal user={user} isForced={true}
+          onDone={(u) => setUser({ ...u, mustChangePassword: false })} />
+      </div>
+    );
+  }
 
   const isAdmin = user.role === "admin";
   const isElevated = user.role === "elevated_staff";
