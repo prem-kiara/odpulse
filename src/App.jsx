@@ -78,6 +78,17 @@ const authorizedWaiverOf = (e) => isAuthorizedWaiver(e) ? (Number(e.waiver) || 0
 const paidOf = (e) =>
   Number(e?.totalPaidAmount ?? e?.paidAmount ?? e?.groupOdPaidAmount ?? e?.customerShare ?? 0) || 0;
 
+// The OD amount this entry was raised for. An Individual OD has no group, so
+// its figure lives in `amountDue`; a Group OD's lives in `groupOdAmount`.
+//
+// The records table rendered `groupOdAmount` for BOTH, so every one of the 1042
+// individual rows showed Rs. 0 — the field simply does not exist on them, while
+// `amountDue` held the real number on 928 of them. The CSV export had this
+// right all along (`isIndiv ? e.amountDue : e.groupOdAmount`), which is why a
+// download disagreed with the screen it came from.
+const odDueOf = (e) =>
+  Number((e?.odType === "Individual OD" ? e?.amountDue : (e?.groupOdAmount ?? e?.amountDue)) ?? 0) || 0;
+
 const generateId = () => Date.now().toString(36) + Math.random().toString(36).substr(2, 9);
 const nowDate = () => new Date().toISOString().split("T")[0];
 const nowTime = () => new Date().toTimeString().slice(0, 5);
@@ -2818,7 +2829,7 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
       if (sortField === "date") cmp = (a.date || "").localeCompare(b.date || "");
       else if (sortField === "paid") cmp = getPaid(a) - getPaid(b);
       else if (sortField === "waiver") cmp = (Number(a.waiver) || 0) - (Number(b.waiver) || 0);
-      else if (sortField === "groupod") cmp = (Number(a.groupOdAmount) || 0) - (Number(b.groupOdAmount) || 0);
+      else if (sortField === "groupod") cmp = odDueOf(a) - odDueOf(b);
       else if (sortField === "branch") cmp = (a.branch || "").localeCompare(b.branch || "");
       else if (sortField === "customer") cmp = (a.customerName || "").localeCompare(b.customerName || "");
       else if (sortField === "staff") cmp = (a.enteredByName || a.enteredBy || "").localeCompare(b.enteredByName || b.enteredBy || "");
@@ -2989,7 +3000,7 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
                   { key: "date", label: "Date", align: "left" },
                   { key: "branch", label: "Branch", align: "left" },
                   { key: "customer", label: "Customer", align: "left" },
-                  { key: "groupod", label: "Group OD", align: "right" },
+                  { key: "groupod", label: odTypeFilter === "Individual OD" ? "OD Due" : "Group OD", align: "right" },
                 ].map(col => (
                   <th key={col.key} className={`text-${col.align} px-4 py-3 font-semibold text-gray-600 cursor-pointer hover:text-teal-700 select-none`}
                     onClick={() => { if (sortField === col.key) setSortDir(sortDir === "desc" ? "asc" : "desc"); else { setSortField(col.key); setSortDir("desc"); } }}>
@@ -3059,7 +3070,7 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
                       <div className="font-medium">{e.customerName}</div>
                       <div className="text-xs text-gray-400">{e.customerId} | {e.loanAccountNo}</div>
                     </td>
-                    <td className="px-4 py-3 text-right font-medium">{formatINR(e.groupOdAmount)}</td>
+                    <td className="px-4 py-3 text-right font-medium">{formatINR(odDueOf(e))}</td>
                     {/* Group OD-only: Group Size and Customer Share */}
                     {odTypeFilter !== "Individual OD" && (
                       <>
@@ -3153,7 +3164,7 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
                             <p className="text-xs font-semibold text-indigo-700 mb-2 uppercase tracking-wide">Individual OD</p>
                             <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 text-sm">
                               <div><span className="text-gray-500">Amount Due:</span> <span className="font-medium">{formatINR(e.amountDue)}</span></div>
-                              <div><span className="text-gray-500">Paid:</span> <span className="font-medium text-indigo-700">{formatINR(e.paidAmount !== undefined ? e.paidAmount : e.totalPaidAmount)}</span></div>
+                              <div><span className="text-gray-500">Paid:</span> <span className="font-medium text-indigo-700">{formatINR(paidOf(e))}</span></div>
                               <div><span className="text-gray-500">Waiver:</span> <span className={`font-medium ${(e.waiver || 0) > 0 ? "text-amber-600" : "text-green-600"}`}>{formatINR(e.waiver || 0)}</span></div>
                               {e.smaBucket && <div><span className="text-gray-500">SMA Bucket:</span> <span className={`font-medium px-2 py-0.5 rounded-full text-xs ${e.smaBucket === "NPA" ? "bg-red-100 text-red-700" : e.smaBucket === "SMA-2" ? "bg-orange-100 text-orange-700" : e.smaBucket === "SMA-1" ? "bg-amber-100 text-amber-700" : "bg-yellow-100 text-yellow-700"}`}>{e.smaBucket}</span></div>}
                             </div>
@@ -3165,7 +3176,7 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
                               <div><span className="text-gray-500">Amount Due:</span> <span className="font-medium">{formatINR(e.groupOdAmount)}</span></div>
                               <div><span className="text-gray-500">No. of Customers:</span> <span className="font-medium">{e.numberOfCustomers}</span></div>
                               <div><span className="text-gray-500">Customer Share:</span> <span className="font-medium">{formatINR(e.customerShare || (e.numberOfCustomers > 0 ? Math.round(e.groupOdAmount / e.numberOfCustomers) : 0))}</span></div>
-                              <div><span className="text-gray-500">Paid:</span> <span className="font-medium text-teal-700">{formatINR(e.groupOdPaidAmount !== undefined ? e.groupOdPaidAmount : e.customerShare)}</span></div>
+                              <div><span className="text-gray-500">Paid:</span> <span className="font-medium text-teal-700">{formatINR(paidOf(e))}</span></div>
                               <div><span className="text-gray-500">Waiver:</span> <span className={`font-medium ${(e.groupOdWaiver || e.waiver) > 0 ? "text-amber-600" : "text-green-600"}`}>{formatINR(e.groupOdWaiver !== undefined ? e.groupOdWaiver : e.waiver)}</span></div>
                             </div>
                           </div>

@@ -85,5 +85,32 @@ ok('a bad row cannot poison a total', mixed.reduce((s, e) => s + paidOf(e), 0), 
 const copies = (src.match(/totalPaidAmount !== undefined \? e\.totalPaidAmount : \(Number\(e\.customerShare\)/g) || []).length;
 ok('no broken local copies remain', copies, 0);
 
+// ── odDueOf: which field holds the OD amount this entry was raised for ──────
+//
+// The records table rendered `groupOdAmount` for BOTH tables, so all 1042
+// Individual OD rows showed Rs. 0 — that field does not exist on them, while
+// `amountDue` held the real figure on 928. The CSV export had it right, which
+// is why a download disagreed with the screen it came from.
+const m2 = /const odDueOf = \(e\) =>\s*([\s\S]*?);\n/.exec(src);
+if (!m2) { console.error('FAIL: odDueOf not found in src/App.jsx'); process.exit(1); }
+const odDueOf = new Function('e', 'return ' + m2[1].trim());
+
+console.log('\nWhat the entry was raised for');
+ok('individual reads amountDue',            odDueOf({ odType: 'Individual OD', amountDue: 4500 }), 4500);
+ok('REGRESSION: individual ignores absent groupOdAmount',
+   odDueOf({ odType: 'Individual OD', amountDue: 7000, groupOdAmount: undefined }), 7000);
+ok('individual never borrows groupOdAmount',
+   odDueOf({ odType: 'Individual OD', amountDue: 500, groupOdAmount: 99999 }), 500);
+ok('group reads groupOdAmount',             odDueOf({ odType: 'Group OD', groupOdAmount: 60000 }), 60000);
+ok('group falls back to amountDue',         odDueOf({ odType: 'Group OD', amountDue: 2000 }), 2000);
+ok('group prefers groupOdAmount over amountDue',
+   odDueOf({ odType: 'Group OD', groupOdAmount: 100, amountDue: 999 }), 100);
+ok('a real zero stays zero',                odDueOf({ odType: 'Group OD', groupOdAmount: 0, amountDue: 5000 }), 0);
+ok('no fields -> 0',                        odDueOf({ odType: 'Individual OD' }), 0);
+ok('null entry -> 0',                       odDueOf(null), 0);
+ok('garbage -> 0',                          odDueOf({ odType: 'Individual OD', amountDue: 'abc' }), 0);
+ok('the table cell uses it, not the raw field',
+   /formatINR\(odDueOf\(e\)\)/.test(src) && !/formatINR\(e\.groupOdAmount\)}<\/td>/.test(src), true);
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
