@@ -62,6 +62,22 @@ const countAuthorizedWaiver = (arr) =>
 // and never count synthetic placeholders from older bulk imports.
 const authorizedWaiverOf = (e) => isAuthorizedWaiver(e) ? (Number(e.waiver) || 0) : 0;
 
+// What this entry recovered, whichever field the entry happens to carry.
+//
+// ONE definition, deliberately at module scope. There were four copies of this
+// helper and three of them fell back to `customerShare` without ever consulting
+// `paidAmount` — so an entry lacking `totalPaidAmount` displayed Rs. 0 while
+// still holding its real figure in `paidAmount`. On 2026-10-19 that hid
+// Rs. 11.76 lakh across 408 entries: in the table cells, the Total Recovered
+// tile, the CSV export and every per-branch / per-staff figure in Reports.
+//
+// `??` and not `||`: a genuine zero is a real value and must not fall through
+// to the next field. Order is most-specific first — totalPaidAmount is what the
+// app writes today, paidAmount / groupOdPaidAmount are the per-OD-type fields,
+// customerShare is the oldest legacy spelling.
+const paidOf = (e) =>
+  Number(e?.totalPaidAmount ?? e?.paidAmount ?? e?.groupOdPaidAmount ?? e?.customerShare ?? 0) || 0;
+
 const generateId = () => Date.now().toString(36) + Math.random().toString(36).substr(2, 9);
 const nowDate = () => new Date().toISOString().split("T")[0];
 const nowTime = () => new Date().toTimeString().slice(0, 5);
@@ -315,7 +331,7 @@ const DEFAULT_CONFIG = { companyName: "OD Pulse - MFI Recovery Tracker", allowSt
 
 // ─── CSV Export Helper ──────────────────────────────────────────────────────
 const exportToCSV = (entries, filename) => {
-  const getPaidCSV = (e) => e.totalPaidAmount !== undefined ? e.totalPaidAmount : (Number(e.customerShare) || 0);
+  const getPaidCSV = paidOf;   // was: totalPaidAmount ?? customerShare — never consulted paidAmount
   const rows = [[
     "Date", "Time", "Branch", "Customer Name", "Customer ID", "Loan Account No.", "Phone", "Aadhaar (Last 4)",
     "OD Type", "SMA Bucket",
@@ -2757,7 +2773,7 @@ function RecordsTable({ user, entries, setEntries, config, branches, notificatio
   };
 
   // Helper: backward compat — old entries used customerShare as paid, new entries have totalPaidAmount
-  const getPaid = (e) => e.totalPaidAmount !== undefined ? e.totalPaidAmount : (Number(e.customerShare) || 0);
+  const getPaid = paidOf;      // was: totalPaidAmount ?? customerShare — never consulted paidAmount
 
   const visibleEntries = useMemo(() => {
     let data = entries;
@@ -3941,7 +3957,7 @@ function Dashboard({ user, entries, branches, config }) {
   }, [allVisibleEntries, dashView]);
 
   // Helper: backward compat — old entries used customerShare as paid, new entries have totalPaidAmount
-  const getEntryPaid = (e) => e.totalPaidAmount !== undefined ? e.totalPaidAmount : (Number(e.customerShare) || 0);
+  const getEntryPaid = paidOf; // was: totalPaidAmount ?? customerShare — never consulted paidAmount
 
   // Helper: decide whether a waiver record is a real authorized waiver
   // (vs. a phantom from older buggy bulk imports). A real authorization has
@@ -4671,8 +4687,7 @@ function CollectionPerformanceWidget({ user, entries }) {
   // Only two modes survive normalisation; keep both colours distinct.
   const MODE_COLOR = { Cash: "#10b981", UPI: "#6366f1" };
 
-  const getPaid = (e) =>
-    Number(e.totalPaidAmount ?? e.paidAmount ?? e.groupOdPaidAmount ?? e.customerShare ?? 0) || 0;
+  const getPaid = paidOf;      // was correct already; share the one definition
   const validBucket = (e) => {
     const b = e && e.smaBucket;
     return (b === "SMA-0" || b === "SMA-1" || b === "SMA-2" || b === "NPA") ? b : null;
